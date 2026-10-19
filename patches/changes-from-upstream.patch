@@ -1,0 +1,926 @@
+diff --git a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,6 +1,7 @@
++# Modified for SWE-Residual; see the repository UPSTREAM.md.
+ [project]
+ name = "harbor"
+-version = "0.21.0"
++version = "0.21.0+residual.1"
+ description = "A framework for evaluating and optimizing agents and models using sandboxed environments."
+ readme = "README.md"
+ license = "Apache-2.0"
+diff --git a/src/harbor/agents/installed/mini_swe_agent.py b/src/harbor/agents/installed/mini_swe_agent.py
+--- a/src/harbor/agents/installed/mini_swe_agent.py
++++ b/src/harbor/agents/installed/mini_swe_agent.py
+@@ -1,4 +1,6 @@
++# Modified for SWE-Residual; see the repository UPSTREAM.md.
+ import json
++import re
+ import shlex
+ import uuid
+ from dataclasses import replace
+@@ -505,6 +507,7 @@
+         self,
+         reasoning_effort: str | None = None,
+         max_tokens: int | None = None,
++        command_user: str | None = None,
+         config_file: str | None = None,
+         config: dict[str, Any] | None = None,
+         litellm_model_registry_file: str | None = None,
+@@ -515,6 +518,13 @@
+         super().__init__(*args, **kwargs)
+         self._reasoning_effort = reasoning_effort
+         self._max_tokens = self._coerce_max_tokens(max_tokens)
++        if command_user is not None and not re.fullmatch(
++            r"[a-z_][a-z0-9_-]{0,31}", command_user
++        ):
++            raise ValueError(
++                "Invalid value for 'command_user': expected a safe Linux user name"
++            )
++        self._command_user = command_user
+         self._config_yaml: str | None = None
+         if config is not None and not isinstance(config, dict):
+             raise ValueError(
+@@ -527,6 +537,21 @@
+             self._config_yaml = yaml.safe_dump(config, sort_keys=False)
+         elif config_file:
+             self._config_yaml = Path(config_file).read_text()
++        self._command_cwd = "/testbed"
++        if self._command_user and self._config_yaml:
++            settings = yaml.safe_load(self._config_yaml)
++            if not isinstance(settings, dict):
++                raise ValueError("Privilege separation requires a mapping config")
++            self._command_cwd = settings.get("environment", {}).get("cwd", "/testbed")
++            if (
++                not isinstance(self._command_cwd, str)
++                or not PurePosixPath(self._command_cwd).is_absolute()
++                or self._command_cwd == "/"
++                or ".." in PurePosixPath(self._command_cwd).parts
++            ):
++                raise ValueError(
++                    "command_user requires an absolute non-root task directory"
++                )
+         # LiteLLM model registry entries (litellm.utils.register_model format),
+         # e.g. to mark a model missing from LiteLLM's bundled model map as
+         # supporting reasoning_effort so it isn't silently dropped under
+@@ -598,22 +623,58 @@
+             ("curl", "bash", "build_tools", "git", "python3", "python_pip"),
+         )
+         version_spec = f"=={self._version}" if self._version else ""
++        # Reuse executable pre-mounted tools before PATH initialization.
++        # Compatibility repair runs only after a new install, under its Python.
++        repair = shlex.quote(
++            Path(__file__).with_name("mini_swe_agent_compat.py").read_text()
++        )
+         await self.exec_as_agent(
+             environment,
+             command=(
+                 "set -euo pipefail; "
+-                "if ! command -v uv >/dev/null 2>&1; then"
+-                "  curl -LsSf https://astral.sh/uv/0.7.13/install.sh | sh;"
+-                " fi && "
+-                'if ! grep -q \'export PATH="$HOME/.local/bin:$PATH"\' "$HOME/.bashrc" 2>/dev/null; then'
+-                '  echo \'export PATH="$HOME/.local/bin:$PATH"\' >> "$HOME/.bashrc";'
+-                " fi && "
++                'if [ ! -x "$HOME/.local/bin/uv" ]; then '
++                "curl -LsSf https://astral.sh/uv/0.7.13/install.sh | sh; fi && "
++                'if ! grep -q \'export PATH="$HOME/.local/bin:$PATH"\' "$HOME/.bashrc" 2>/dev/null; then '
++                'echo \'export PATH="$HOME/.local/bin:$PATH"\' >> "$HOME/.bashrc"; fi && '
+                 'if [ -f "$HOME/.local/bin/env" ]; then source "$HOME/.local/bin/env"; fi && '
+                 'export PATH="$HOME/.local/bin:$PATH" && '
+-                f"uv tool install mini-swe-agent{version_spec} --with 'litellm[proxy]' && "
++                'if [ ! -x "$HOME/.local/bin/mini-swe-agent" ]; then '
++                f"uv tool install mini-swe-agent{version_spec} --with 'litellm'; "
++                f'"$HOME/.local/share/uv/tools/mini-swe-agent/bin/python" -c {repair} '
++                '"$HOME/.local/share/uv/tools/mini-swe-agent"; fi && '
+                 "mini-swe-agent --help"
+             ),
+         )
++
++        if self._command_user:
++            command_user = shlex.quote(self._command_user)
++            await self.exec_as_root(
++                environment,
++                command=(
++                    "set -euo pipefail; "
++                    "command -v setpriv >/dev/null; "
++                    f"if ! id -u {command_user} >/dev/null 2>&1; then "
++                    f"useradd --create-home --shell /bin/bash {command_user}; "
++                    "fi; "
++                    f'test "$(id -u {command_user})" -ne 0; '
++                    f"chown -R {command_user}:{command_user} {shlex.quote(self._command_cwd)}; "
++                    f"git config --global --add safe.directory {shlex.quote(self._command_cwd)}; "
++                    "chmod 700 /root; "
++                    "install -d -o root -g root -m 755 /installed-agent"
++                ),
++            )
++            helper_path = Path(__file__).with_name("mini_swe_agent_sandbox.py")
++            await environment.upload_file(
++                helper_path,
++                "/installed-agent/mini_swe_agent_sandbox.py",
++            )
++            await self.exec_as_root(
++                environment,
++                command=(
++                    "chown root:root /installed-agent/mini_swe_agent_sandbox.py && "
++                    "chmod 644 /installed-agent/mini_swe_agent_sandbox.py"
++                ),
++            )
+ 
+     @property
+     def _mini_swe_agent_trajectory_path(self) -> PurePosixPath:
+@@ -698,6 +759,8 @@
+             "MSWEA_CONFIGURED": "true",  # Disable interactive setup
+             "MSWEA_COST_TRACKING": "ignore_errors",  # Ignore unknown model costs
+         }
++        if self._command_user:
++            env["PYTHONPATH"] = "/installed-agent"
+ 
+         if access.api_key is None:
+             raise ValueError(
+@@ -732,11 +795,52 @@
+             )
+             await self.exec_as_agent(environment, command=write_registry_cmd, env=env)
+             config_flags += f"-c model.litellm_model_registry={registry_path} "
++        if self._command_user:
++            privilege_config_path = "/tmp/mswea-config/privilege-separated.yaml"
++            privilege_config = yaml.safe_dump(
++                {
++                    "environment": {
++                        "environment_class": (
++                            "mini_swe_agent_sandbox.PrivilegeSeparatedLocalEnvironment"
++                        ),
++                        "user": self._command_user,
++                        "env": {
++                            "HOME": f"/home/{self._command_user}",
++                            "USER": self._command_user,
++                            "LOGNAME": self._command_user,
++                        },
++                    }
++                },
++                sort_keys=False,
++            )
++            heredoc_marker = f"MSWEA_PRIVILEGE_EOF_{uuid.uuid4().hex[:8]}"
++            write_privilege_config_cmd = (
++                "mkdir -p /tmp/mswea-config\n"
++                f"cat > '{privilege_config_path}' << '{heredoc_marker}'\n"
++                f"{privilege_config}\n"
++                f"{heredoc_marker}\n"
++            )
++            await self.exec_as_agent(
++                environment,
++                command=write_privilege_config_cmd,
++                env=env,
++            )
++            config_flags += f"-c {privilege_config_path} "
+         if self.session_id:
+             session_header_config = (
+                 f"model.model_kwargs.extra_headers.X-Session-ID={self.session_id}"
+             )
+             config_flags += f"-c {shlex.quote(session_header_config)} "
++
++        if self._command_user and config_flags:
++            await self.exec_as_agent(
++                environment,
++                command=(
++                    "chmod 700 /tmp/mswea-config && "
++                    "find /tmp/mswea-config -maxdepth 1 -type f -exec chmod 600 {} +"
++                ),
++                env=env,
++            )
+ 
+         if self._reasoning_effort:
+             eff = shlex.quote(self._reasoning_effort)
+diff --git a/src/harbor/agents/installed/mini_swe_agent_compat.py b/src/harbor/agents/installed/mini_swe_agent_compat.py
+new file mode 100644
+--- /dev/null
++++ b/src/harbor/agents/installed/mini_swe_agent_compat.py
+@@ -0,0 +1,29 @@
++"""SWE-Residual modification: alias musl extensions only when Python needs it."""
++
++import sys
++from importlib.machinery import EXTENSION_SUFFIXES
++from pathlib import Path
++
++
++def repair_extensions(root: Path, suffixes: list[str] | None = None) -> None:
++    """Keep original modules and refuse to replace an existing alias.
++
++    Called by the newly installed tool's interpreter. Pre-mounted installs are
++    not modified. Interpreters that already accept the musl suffix need no fix.
++    """
++    suffixes = EXTENSION_SUFFIXES if suffixes is None else suffixes
++    if any("-linux-musl.so" in suffix for suffix in suffixes):
++        return
++    for source in root.rglob("*-linux-musl.so"):
++        target = source.with_name(
++            source.name.replace("-linux-musl.so", "-linux-gnu.so")
++        )
++        if not any(target.name.endswith(s) for s in suffixes if s != ".so"):
++            continue
++        if target.exists() or target.is_symlink():
++            continue
++        target.symlink_to(source.name)
++
++
++if __name__ == "__main__":
++    repair_extensions(Path(sys.argv[1]))
+diff --git a/src/harbor/agents/installed/mini_swe_agent_sandbox.py b/src/harbor/agents/installed/mini_swe_agent_sandbox.py
+new file mode 100644
+--- /dev/null
++++ b/src/harbor/agents/installed/mini_swe_agent_sandbox.py
+@@ -0,0 +1,94 @@
++# Added for SWE-Residual; see the repository UPSTREAM.md.
++"""Privilege-separated command environment for Mini-SWE-Agent.
++
++The Mini-SWE controller keeps its dependencies and credentials as root while
++every model-generated command is executed as a dedicated unprivileged user.
++"""
++
++from __future__ import annotations
++
++import os
++import shlex
++from typing import Any
++
++from minisweagent.environments.local import (  # ty: ignore[unresolved-import]
++    LocalEnvironment,
++    LocalEnvironmentConfig,
++    _run,
++)
++
++
++class PrivilegeSeparatedLocalEnvironmentConfig(LocalEnvironmentConfig):
++    """Configuration for an action environment that drops OS privileges."""
++
++    user: str
++
++
++class PrivilegeSeparatedLocalEnvironment(LocalEnvironment):
++    """Run each model-generated command under ``user`` with no new privileges."""
++
++    def __init__(
++        self,
++        *,
++        config_class: type[
++            PrivilegeSeparatedLocalEnvironmentConfig
++        ] = PrivilegeSeparatedLocalEnvironmentConfig,
++        **kwargs,
++    ) -> None:
++        super().__init__(config_class=config_class, **kwargs)
++        self.config: PrivilegeSeparatedLocalEnvironmentConfig
++
++    def execute(
++        self, action: dict[str, Any], cwd: str = "", *, timeout: int | None = None
++    ) -> dict[str, Any]:
++        command = action.get("command", "")
++        user = self.config.user
++        wrapped_command = shlex.join(
++            [
++                "/usr/bin/setpriv",
++                f"--reuid={user}",
++                f"--regid={user}",
++                "--init-groups",
++                "--no-new-privs",
++                "/bin/bash",
++                "-lc",
++                command,
++            ]
++        )
++        cwd = cwd or self.config.cwd or os.getcwd()
++
++        # Do not inherit the controller's API keys, proxy credentials, HOME, or
++        # PYTHONPATH. Only a small set of harmless process settings plus the
++        # task-specific environment configured for model actions is exposed.
++        safe_names = ("LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "TZ")
++        env = {name: os.environ[name] for name in safe_names if name in os.environ}
++        env.update(self.config.env)
++
++        try:
++            result = _run(
++                wrapped_command,
++                cwd,
++                env,
++                timeout or self.config.timeout,
++            )
++            output = {
++                "output": result.stdout,
++                "returncode": result.returncode,
++                "exception_info": "",
++            }
++        except Exception as exc:
++            raw_output = getattr(exc, "output", None)
++            raw_output = (
++                raw_output.decode("utf-8", errors="replace")
++                if isinstance(raw_output, bytes)
++                else (raw_output or "")
++            )
++            output = {
++                "output": raw_output,
++                "returncode": -1,
++                "exception_info": f"An error occurred while executing the command: {exc}",
++                "extra": {"exception_type": type(exc).__name__, "exception": str(exc)},
++            }
++
++        self._check_finished(output)
++        return output
+diff --git a/src/harbor/environments/docker/harbor-docker-egress-control-sidecar/gost.yaml b/src/harbor/environments/docker/harbor-docker-egress-control-sidecar/gost.yaml
+--- a/src/harbor/environments/docker/harbor-docker-egress-control-sidecar/gost.yaml
++++ b/src/harbor/environments/docker/harbor-docker-egress-control-sidecar/gost.yaml
+@@ -13,6 +13,8 @@
+         sniffing: true
+         sniffing.timeout: 5s
+         sniffing.fallback: true
++        # SWE-Residual modification: allow long non-streaming model responses.
++        readTimeout: 1200s
+     listener:
+       type: red
+ 
+diff --git a/src/harbor/models/trial/config.py b/src/harbor/models/trial/config.py
+--- a/src/harbor/models/trial/config.py
++++ b/src/harbor/models/trial/config.py
+@@ -1,5 +1,7 @@
++# Modified for SWE-Residual; see the repository UPSTREAM.md.
+ import hashlib
+ import json
++import re
+ import warnings
+ from enum import Enum
+ from pathlib import Path
+@@ -502,4 +504,9 @@
+     def generate_trial_name(self):
+         task_id = self.task.get_task_id()
+         task_name = task_id.get_name().split("/")[-1]
+-        return f"{task_name[:32].rstrip('_-')}__{ShortUUID().random(length=7)}"
++        # Trial names are reused as Docker Compose project/image repository names.
++        # Docker repositories must be lowercase, while ShortUUID emits mixed case.
++        prefix = re.sub(r"[^a-z0-9_.-]+", "-", task_name.lower()).strip("._-")
++        prefix = prefix[:32].rstrip("._-") or "trial"
++        suffix = ShortUUID().random(length=7).lower()
++        return f"{prefix}__{suffix}"
+diff --git a/src/harbor/trial/queue.py b/src/harbor/trial/queue.py
+--- a/src/harbor/trial/queue.py
++++ b/src/harbor/trial/queue.py
+@@ -1,5 +1,5 @@
++# Modified for SWE-Residual; see the repository UPSTREAM.md.
+ import asyncio
+-import shutil
+ from collections.abc import Coroutine
+ from dataclasses import dataclass
+ from typing import Any
+@@ -219,7 +219,18 @@
+                 )
+                 return result
+ 
+-            shutil.rmtree(trial.paths.trial_dir, ignore_errors=True)
++            # Preserve the previous attempt before allocating its replacement.
++            failed_dir = trial.paths.trial_dir.with_name(
++                trial.paths.trial_dir.name + f".failed-{attempt + 1}"
++            )
++            if failed_dir.exists() or failed_dir.is_symlink():
++                raise RuntimeError(f"Archived attempt already exists: {failed_dir}")
++            try:
++                trial.paths.trial_dir.rename(failed_dir)
++            except OSError as exc:
++                raise RuntimeError(
++                    "Cannot preserve failed attempt; retry aborted"
++                ) from exc
+ 
+             delay_sec = self._calculate_backoff_delay_sec(attempt)
+ 
+diff --git a/src/harbor/trial/trial.py b/src/harbor/trial/trial.py
+--- a/src/harbor/trial/trial.py
++++ b/src/harbor/trial/trial.py
+@@ -1,3 +1,4 @@
++# Modified for SWE-Residual; see the repository UPSTREAM.md.
+ from typing import Any, override
+ import asyncio
+ import contextlib
+@@ -63,6 +64,7 @@
+ )
+ from harbor.utils.logger import logger as global_logger
+ from harbor.utils.env import is_sensitive_env_key, resolve_env_vars
++from harbor.utils.redaction import scrub_directory, secrets_in
+ from harbor.utils.scripts import quote_shell_arg
+ from harbor.verifier.factory import VerifierFactory
+ 
+@@ -776,7 +778,7 @@
+         self._log_handler = None
+ 
+     def _scrub_jobs_dir(self) -> None:
+-        secrets: set[str] = set()
++        secrets = secrets_in(self.config.model_dump(mode="json"))
+         for env in (
+             self.agent.extra_env,
+             self.task.config.verifier.env,
+@@ -786,37 +788,11 @@
+                 if is_sensitive_env_key(key):
+                     try:
+                         value = resolve_env_vars({key: value})[key]
+-                        if value:
++                        if value and len(value) >= 12:
+                             secrets.add(value)
+                     except ValueError:
+                         continue
+-        if not secrets:
+-            return
+-
+-        for path in self.paths.trial_dir.rglob("*"):
+-            if not path.is_file() or path.is_symlink():
+-                continue
+-            try:
+-                with path.open("rb") as file:
+-                    sample = file.read(8192)
+-                if b"\0" in sample:
+-                    continue
+-                try:
+-                    sample.decode("utf-8")
+-                except UnicodeDecodeError:
+-                    continue
+-                text = path.read_text()
+-                scrubbed = text
+-                for secret in sorted(secrets, key=len, reverse=True):
+-                    scrubbed = scrubbed.replace(secret, "[REDACTED]")
+-                if scrubbed != text:
+-                    path.write_text(scrubbed)
+-            except (OSError, UnicodeDecodeError) as exc:
+-                # Leave unreadable/unscrubbable files alone; don't delete them.
+-                self.logger.debug(
+-                    "Skipping unscrubbable trial output %s: %s", path, exc
+-                )
+-                continue
++        scrub_directory(self.paths.trial_dir, secrets)
+ 
+     def _init_agent(self) -> None:
+         extra_kwargs: dict[str, Any] = {}
+diff --git a/src/harbor/utils/redaction.py b/src/harbor/utils/redaction.py
+new file mode 100644
+--- /dev/null
++++ b/src/harbor/utils/redaction.py
+@@ -0,0 +1,111 @@
++"""SWE-Residual modification: scrub credentials without damaging task artifacts."""
++
++import json
++from collections.abc import Iterable
++from pathlib import Path
++from typing import Any
++
++
++def sensitive(key: str) -> bool:
++    key = key.lower().replace("-", "_")
++    return key in {
++        "authorization",
++        "password",
++        "secret",
++        "token",
++        "api_key",
++        "credential",
++    } or key.endswith(("_api_key", "_token", "_secret", "_password"))
++
++
++def _credentials(values: Iterable[str]) -> list[str]:
++    return sorted(
++        {s for s in values if len(s) >= 12 and s != "[REDACTED]"},
++        key=len,
++        reverse=True,
++    )
++
++
++def redact(value: Any, credentials: Iterable[str] = ()) -> Any:
++    """Remove credential fields and known long secrets from structured logs."""
++    if isinstance(value, dict):
++        return {
++            k: "[REDACTED]"
++            if sensitive(k) and isinstance(v, str) and v
++            else redact(v, credentials)
++            for k, v in value.items()
++        }
++    if isinstance(value, list):
++        return [redact(v, credentials) for v in value]
++    if isinstance(value, str):
++        for secret in _credentials(credentials):
++            value = value.replace(secret, "[REDACTED]")
++    return value
++
++
++def secrets_in(value: Any) -> set[str]:
++    found: set[str] = set()
++    if isinstance(value, dict):
++        for key, child in value.items():
++            if sensitive(key) and isinstance(child, str):
++                found.update(_credentials([child]))
++            else:
++                found.update(secrets_in(child))
++    elif isinstance(value, list):
++        for child in value:
++            found.update(secrets_in(child))
++    return found
++
++
++def scrub_directory(root: Path, credentials: Iterable[str] = ()) -> None:
++    """Preserve patch bytes; redact JSON fields and known secrets in logs.
++
++    Short placeholders never act as substrings. Symlinks and unreadable files
++    are left alone. Raw artifacts still require an audit before publication.
++    """
++    credentials = _credentials(credentials)
++    for path in root.rglob("*"):
++        if not path.is_file() or path.is_symlink() or path.suffix == ".patch":
++            continue
++        if path.suffix not in {".json", ".jsonl", ".txt", ".log", ".yaml", ".yml"}:
++            continue
++        try:
++            text = path.read_text(encoding="utf-8")
++        except (OSError, UnicodeError):
++            continue
++        try:
++            if path.suffix == ".json":
++                original = json.loads(text)
++                clean = redact(original, credentials)
++                if clean != original:
++                    path.write_text(
++                        json.dumps(clean, ensure_ascii=False, indent=2) + "\n"
++                    )
++            elif path.suffix == ".jsonl":
++                rows = [json.loads(line) for line in text.splitlines() if line.strip()]
++                clean = [redact(row, credentials) for row in rows]
++                if clean != rows:
++                    path.write_text(
++                        "".join(
++                            json.dumps(row, ensure_ascii=False) + "\n" for row in clean
++                        )
++                    )
++            else:
++                clean = text
++                for secret in credentials:
++                    clean = clean.replace(secret, "[REDACTED]")
++                if clean != text:
++                    path.write_text(clean)
++        except json.JSONDecodeError:
++            # Interrupted writes can leave JSON-shaped files incomplete.
++            # Replace only known long secrets; never repair or parse the data.
++            clean = text
++            for secret in credentials:
++                clean = clean.replace(secret, "[REDACTED]")
++            if clean != text:
++                try:
++                    path.write_text(clean)
++                except (OSError, UnicodeError):
++                    continue
++        except (OSError, UnicodeError):
++            continue
+diff --git a/tests/unit/agents/installed/test_mini_swe_agent.py b/tests/unit/agents/installed/test_mini_swe_agent.py
+--- a/tests/unit/agents/installed/test_mini_swe_agent.py
++++ b/tests/unit/agents/installed/test_mini_swe_agent.py
+@@ -1,3 +1,4 @@
++# Modified for SWE-Residual; see the repository UPSTREAM.md.
+ """Tests for mini-swe-agent v2 trajectory conversion and agent configuration.
+ 
+ Tests cover:
+@@ -877,6 +878,39 @@
+ 
+ 
+ class TestCreateRunAgentCommands:
++    def test_command_user_must_be_safe_linux_name(self, temp_dir):
++        with pytest.raises(ValueError, match="command_user"):
++            MiniSweAgent(logs_dir=temp_dir, command_user="agent; id")
++
++    @pytest.mark.asyncio
++    async def test_command_user_configures_privilege_separated_environment(
++        self, temp_dir
++    ):
++        with patch.dict(os.environ, {"MSWEA_API_KEY": "test-key"}, clear=False):
++            agent = MiniSweAgent(
++                logs_dir=temp_dir,
++                model_name="openai/gpt-4o",
++                command_user="harboragent",
++            )
++            mock_env = AsyncMock()
++            mock_env.exec.return_value = AsyncMock(return_code=0, stdout="", stderr="")
++            await agent.run("task", mock_env, AsyncMock())
++
++        privilege_config_cmd = mock_env.exec.call_args_list[0].kwargs["command"]
++        assert "PrivilegeSeparatedLocalEnvironment" in privilege_config_cmd
++        assert "user: harboragent" in privilege_config_cmd
++        assert "HOME: /home/harboragent" in privilege_config_cmd
++
++        run_call = mock_env.exec.call_args_list[-1]
++        assert run_call.kwargs["env"]["PYTHONPATH"] == "/installed-agent"
++        assert "-c mini" in run_call.kwargs["command"]
++        assert (
++            "-c /tmp/mswea-config/privilege-separated.yaml"
++            in run_call.kwargs["command"]
++        )
++        chmod_call = mock_env.exec.call_args_list[-2]
++        assert "chmod 700 /tmp/mswea-config" in chmod_call.kwargs["command"]
++
+     @pytest.mark.asyncio
+     async def test_inline_config_is_written_and_layered_over_mini(self, temp_dir):
+         with patch.dict(os.environ, {"MSWEA_API_KEY": "test-key"}, clear=False):
+@@ -1259,3 +1293,27 @@
+         agent = MiniSweAgent(logs_dir=temp_dir)
+         assert hasattr(agent, "install")
+         assert callable(agent.install)
++
++    @pytest.mark.asyncio
++    async def test_command_user_install_prepares_user_and_uploads_helper(
++        self, temp_dir
++    ):
++        agent = MiniSweAgent(logs_dir=temp_dir, command_user="harboragent")
++        agent.ensure_system_dependencies = AsyncMock()
++        agent.exec_as_agent = AsyncMock()
++        agent.exec_as_root = AsyncMock()
++        environment = AsyncMock()
++
++        await agent.install(environment)
++
++        setup_command = agent.exec_as_root.call_args_list[0].kwargs["command"]
++        assert "useradd --create-home" in setup_command
++        assert 'test "$(id -u harboragent)" -ne 0' in setup_command
++        assert "chown -R harboragent:harboragent /testbed" in setup_command
++        assert "git config --global --add safe.directory /testbed" in setup_command
++        assert "chmod 700 /root" in setup_command
++        environment.upload_file.assert_awaited_once()
++        assert (
++            environment.upload_file.await_args.args[1]
++            == "/installed-agent/mini_swe_agent_sandbox.py"
++        )
+diff --git a/tests/unit/models/test_trial_name.py b/tests/unit/models/test_trial_name.py
+new file mode 100644
+--- /dev/null
++++ b/tests/unit/models/test_trial_name.py
+@@ -0,0 +1,17 @@
++# Added for SWE-Residual; see the repository UPSTREAM.md.
++import re
++from pathlib import Path
++
++from harbor.models.trial.config import TaskConfig, TrialConfig
++
++
++def test_generated_trial_name_is_docker_repository_safe() -> None:
++    config = TrialConfig(
++        task=TaskConfig(
++            path=Path("Lightning-AI__pytorch-lightning.126fa6f1.test_data.c8b292af.lv1")
++        )
++    )
++
++    assert config.trial_name == config.trial_name.lower()
++    assert re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", config.trial_name)
++    assert len(config.trial_name.split("__")[-1]) == 7
+diff --git a/tests/unit/test_residual_repairs.py b/tests/unit/test_residual_repairs.py
+new file mode 100644
+--- /dev/null
++++ b/tests/unit/test_residual_repairs.py
+@@ -0,0 +1,218 @@
++"""SWE-Residual regression tests for the modifications to vendored Harbor."""
++
++import json
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock, patch
++
++import pytest
++
++from harbor.agents.installed.mini_swe_agent import MiniSweAgent
++from harbor.agents.installed.mini_swe_agent_compat import repair_extensions
++from harbor.models.job.config import RetryConfig
++from harbor.models.trial.config import TrialConfig
++from harbor.trial.queue import TrialQueue
++from harbor.trial.trial import Trial
++
++
++def test_default_trial_scrubber_preserves_patch_and_short_placeholder(tmp_path):
++    patch_bytes = b"diff --git a/test.py b/test.py\n+import testing\n"
++    (tmp_path / "model.patch").write_bytes(patch_bytes)
++    secret = "fake-long-provider-key-for-unit-test"
++    data = {
++        "task_name": "testem-bail-on-test-failure",
++        "api_key": "test",
++        "messages": [{"content": "run the tests"}, {"content": secret}],
++    }
++    (tmp_path / "result.json").write_text(json.dumps(data))
++    (tmp_path / "agent.log").write_text("test " + secret)
++    (tmp_path / "incomplete.json").write_text('{"content": "' + secret)
++    trial = SimpleNamespace(
++        config=SimpleNamespace(
++            model_dump=lambda **kwargs: {"agent": {"kwargs": {"api_key": secret}}},
++            verifier=SimpleNamespace(env={}),
++        ),
++        agent=SimpleNamespace(extra_env={"MSWEA_API_KEY": "test"}),
++        task=SimpleNamespace(config=SimpleNamespace(verifier=SimpleNamespace(env={}))),
++        paths=SimpleNamespace(trial_dir=tmp_path),
++    )
++    Trial._scrub_jobs_dir(trial)
++    clean = json.loads((tmp_path / "result.json").read_text())
++    assert clean["api_key"] == "[REDACTED]"
++    assert clean["task_name"] == data["task_name"]
++    assert clean["messages"][0] == data["messages"][0]
++    assert clean["messages"][1]["content"] == "[REDACTED]"
++    assert (tmp_path / "agent.log").read_text() == "test [REDACTED]"
++    assert secret not in (tmp_path / "incomplete.json").read_text()
++    assert (tmp_path / "model.patch").read_bytes() == patch_bytes
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("collision", [False, True])
++async def test_retry_preserves_failed_attempt_and_refuses_collision(
++    tmp_path, collision
++):
++    directory = tmp_path / "trial"
++    archive = tmp_path / "trial.failed-1"
++    if collision:
++        archive.mkdir()
++        (archive / "existing.txt").write_text("keep")
++    calls = []
++
++    async def create(config):
++        directory.mkdir()
++        calls.append(config)
++        (directory / "agent.log").write_text("failed" if len(calls) == 1 else "success")
++        return SimpleNamespace(
++            paths=SimpleNamespace(trial_dir=directory),
++            run=AsyncMock(
++                return_value=SimpleNamespace(
++                    exception_info=SimpleNamespace(exception_type="TransientError")
++                    if len(calls) == 1
++                    else None
++                )
++            ),
++        )
++
++    queue = TrialQueue(1, RetryConfig(max_retries=1, min_wait_sec=0, max_wait_sec=0))
++    queue._setup_hooks = MagicMock()
++    config = TrialConfig(task={"path": tmp_path}, trial_name="trial")
++    with patch.object(Trial, "create", side_effect=create):
++        if collision:
++            with pytest.raises(RuntimeError, match="already exists"):
++                await queue._execute_trial_with_retries(config)
++            assert len(calls) == 1
++            assert (directory / "agent.log").read_text() == "failed"
++            assert (archive / "existing.txt").read_text() == "keep"
++        else:
++            result = await queue._execute_trial_with_retries(config)
++            assert result.exception_info is None
++            assert (archive / "agent.log").read_text() == "failed"
++            assert (directory / "agent.log").read_text() == "success"
++
++
++def test_extension_alias_is_conditional_and_preserves_original(tmp_path):
++    original = tmp_path / "module.cpython-313-x86_64-linux-musl.so"
++    alias = tmp_path / "module.cpython-313-x86_64-linux-gnu.so"
++    original.write_bytes(b"extension")
++    musl = [".cpython-313-x86_64-linux-musl.so", ".so"]
++    gnu = [".cpython-313-x86_64-linux-gnu.so", ".so"]
++    repair_extensions(tmp_path, musl)
++    assert not alias.exists()
++    repair_extensions(tmp_path, gnu)
++    assert alias.is_symlink() and alias.read_bytes() == original.read_bytes()
++    repair_extensions(tmp_path, gnu)
++    assert original.read_bytes() == b"extension"
++    protected = tmp_path / "other.cpython-313-x86_64-linux-gnu.so"
++    protected.write_bytes(b"keep")
++    (tmp_path / "other.cpython-313-x86_64-linux-musl.so").write_bytes(b"other")
++    repair_extensions(tmp_path, gnu)
++    assert protected.read_bytes() == b"keep"
++
++
++@pytest.mark.asyncio
++async def test_installer_reuses_preinstalled_tool_without_writes(tmp_path):
++    import subprocess
++
++    home = tmp_path / "home"
++    binary = home / ".local/bin"
++    binary.mkdir(parents=True)
++    (home / ".bashrc").write_text('export PATH="$HOME/.local/bin:$PATH"\n')
++    for name in ["uv", "mini-swe-agent"]:
++        target = binary / name
++        target.write_text(
++            "#!/bin/sh\nexit 0\n"
++            if name == "mini-swe-agent"
++            else "#!/bin/sh\nexit 99\n"
++        )
++        target.chmod(0o755)
++    agent = MiniSweAgent(logs_dir=tmp_path)
++    assert agent._command_user is None
++    agent.ensure_system_dependencies = AsyncMock()
++    agent.exec_as_agent = AsyncMock()
++    env = AsyncMock()
++    await agent.install(env)
++    command = agent.exec_as_agent.call_args.kwargs["command"]
++    result = subprocess.run(
++        ["bash", "-c", command],
++        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
++        capture_output=True,
++        text=True,
++    )
++    assert result.returncode == 0, result.stderr
++    assert (binary / "uv").read_text().endswith("exit 99\n")
++    assert "litellm[proxy]" not in command
++
++
++@pytest.mark.asyncio
++async def test_command_user_uses_configured_task_directory(tmp_path):
++    agent = MiniSweAgent(
++        logs_dir=tmp_path,
++        command_user="harboragent",
++        config={"environment": {"cwd": "/app"}},
++    )
++    agent.ensure_system_dependencies = AsyncMock()
++    agent.exec_as_agent = AsyncMock()
++    agent.exec_as_root = AsyncMock()
++    await agent.install(AsyncMock())
++    assert (
++        "chown -R harboragent:harboragent /app"
++        in agent.exec_as_root.call_args_list[0].kwargs["command"]
++    )
++    with pytest.raises(ValueError, match="task directory"):
++        MiniSweAgent(
++            logs_dir=tmp_path,
++            command_user="harboragent",
++            config={"environment": {"cwd": "/"}},
++        )
++
++
++def test_incomplete_log_that_cannot_be_written_does_not_abort_scrubbing(
++    tmp_path, monkeypatch
++):
++    from harbor.utils.redaction import scrub_directory
++
++    secret = "fake-long-provider-key-for-unit-test"
++    target = tmp_path / "incomplete.json"
++    target.write_text('{"key": "' + secret)
++    original_write = Path.write_text
++
++    def denied(path, text, *args, **kwargs):
++        if path == target:
++            raise PermissionError("read-only artifact")
++        return original_write(path, text, *args, **kwargs)
++
++    monkeypatch.setattr(Path, "write_text", denied)
++    scrub_directory(tmp_path, {secret})
++    assert target.read_text().endswith(secret)
++
++
++@pytest.mark.asyncio
++async def test_archive_failure_aborts_retry_without_deletion(tmp_path, monkeypatch):
++    directory = tmp_path / "trial"
++    directory.mkdir()
++    (directory / "agent.log").write_text("keep failed evidence")
++    trial = SimpleNamespace(
++        paths=SimpleNamespace(trial_dir=directory),
++        run=AsyncMock(
++            return_value=SimpleNamespace(
++                exception_info=SimpleNamespace(exception_type="TransientError")
++            )
++        ),
++    )
++    queue = TrialQueue(1, RetryConfig(max_retries=1))
++    queue._setup_hooks = MagicMock()
++    original_rename = Path.rename
++
++    def denied(path, target):
++        if path == directory:
++            raise PermissionError("archive unavailable")
++        return original_rename(path, target)
++
++    monkeypatch.setattr(Path, "rename", denied)
++    config = TrialConfig(task={"path": tmp_path}, trial_name="trial")
++    with patch.object(Trial, "create", return_value=trial) as create:
++        with pytest.raises(RuntimeError, match="retry aborted"):
++            await queue._execute_trial_with_retries(config)
++        create.assert_awaited_once()
++    assert (directory / "agent.log").read_text() == "keep failed evidence"
+diff --git a/tests/unit/test_single_step_trial.py b/tests/unit/test_single_step_trial.py
+--- a/tests/unit/test_single_step_trial.py
++++ b/tests/unit/test_single_step_trial.py
+@@ -1,3 +1,4 @@
++# Modified for SWE-Residual; see the repository UPSTREAM.md.
+ from pathlib import Path
+ from types import SimpleNamespace
+ from unittest.mock import AsyncMock, MagicMock
+@@ -179,6 +180,7 @@
+         install_only=False,
+         trial_name="t",
+         verifier=SimpleNamespace(env={"OVERRIDE_API_KEY": "override-secret"}),
++        model_dump=lambda **kwargs: {},
+     )
+     trial.agent = SimpleNamespace(extra_env={"AGENT_API_KEY": "agent-secret-value"})
+     trial.task.config.verifier.env = {"TASK_API_KEY": "task-secret-value"}
+diff --git a/uv.lock b/uv.lock
+--- a/uv.lock
++++ b/uv.lock
+@@ -1,3 +1,4 @@
++# Modified for SWE-Residual; local Harbor version matches pyproject.toml.
+ version = 1
+ revision = 3
+ requires-python = ">=3.12"
+@@ -1610,7 +1611,7 @@
+ 
+ [[package]]
+ name = "harbor"
+-version = "0.21.0"
++version = "0.21.0+residual.1"
+ source = { editable = "." }
+ dependencies = [
+     { name = "dirhash" },

